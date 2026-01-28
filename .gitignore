@@ -1,0 +1,10 @@
+/.env
+/chunk-b-g1.png
+/chunk-b-g2.png
+/chunk-s-g1.png
+/chunk-s-g2.png
+/chunk-s-g3.png
+/data
+/venv
+.venv/
+venv/

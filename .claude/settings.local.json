@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python llm/openAi_service.py:*)",
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(python -c:*)"
+    ]
+  }
+}
