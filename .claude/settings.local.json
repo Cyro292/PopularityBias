@@ -4,7 +4,8 @@
       "Bash(python llm/openAi_service.py:*)",
       "Bash(python3:*)",
       "Bash(source:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "WebFetch(domain:docs.langchain.com)"
     ]
   }
 }

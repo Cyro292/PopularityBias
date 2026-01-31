@@ -80,24 +80,101 @@ class nativeRagService(RagService):
         self._embeddings = build_embeddings(
             provider=self.config.embedding_provider,
             model=self.config.embedding_model,
+            trust_remote_code=self.config.trust_remote_code,
             rate_limiter=self.config.rate_limiter,
             requests_per_second=self.config.requests_per_second,
             check_interval=self.config.rate_limit_check_interval,
             bucket_size=self.config.rate_limit_bucket_size,
         )
 
+        # Load embedding prompt template
+        self._load_embedding_prompt()
+
+    def _load_embedding_prompt(self):
+        """Load embedding prompt templates from files.
+
+        The prompts are applied to document/query content before embedding to improve
+        retrieval quality. Some embedding models (like E5, BGE) benefit from
+        instructional prefixes.
+        """
+        from config import DATA_DIR
+
+        # Load passage prompt (for documents)
+        passage_prompt_file = Path(DATA_DIR) / "prompts" / "embeding_promt.txt"
+        if passage_prompt_file.exists():
+            self.embedding_prompt = passage_prompt_file.read_text().strip()
+            logger.info(f"Loaded embedding prompt: {self.embedding_prompt[:50]}...")
+        else:
+            # Default prompt if file doesn't exist
+            self.embedding_prompt = "passage: {passage}"
+            logger.warning(f"Embedding prompt file not found at {passage_prompt_file}, using default")
+
+        # Load query prompt (for retrieval)
+        query_prompt_file = Path(DATA_DIR) / "prompts" / "query_promt.txt"
+        if query_prompt_file.exists():
+            self.query_prompt = query_prompt_file.read_text().strip()
+            logger.info(f"Loaded query prompt: {self.query_prompt[:50]}...")
+        else:
+            # Default prompt if file doesn't exist
+            self.query_prompt = "query: {query}"
+            logger.warning(f"Query prompt file not found at {query_prompt_file}, using default")
+
+    def _apply_embedding_prompt(self, documents: list[Document]) -> list[Document]:
+        """Apply embedding prompt template to documents.
+
+        Wraps each document's content with the embedding prompt template.
+        This improves retrieval quality for models trained with instruction prefixes.
+
+        Args:
+            documents: Documents to apply prompt to.
+
+        Returns:
+            Documents with prompted content.
+        """
+        prompted_docs = []
+        for doc in documents:
+            # Apply prompt template
+            prompted_content = self.embedding_prompt.format(passage=doc.page_content)
+
+            # Create new document with prompted content
+            prompted_docs.append(Document(
+                page_content=prompted_content,
+                metadata=doc.metadata.copy()
+            ))
+
+        return prompted_docs
+
+    def _apply_query_prompt(self, query: str) -> str:
+        """Apply query prompt template to search query.
+
+        Wraps the query with the query prompt template.
+        This improves retrieval quality for models trained with instruction prefixes.
+
+        Args:
+            query: Query string to apply prompt to.
+
+        Returns:
+            Prompted query string.
+        """
+        return self.query_prompt.format(query=query)
+
     def _prepare_documents(self, documents: list[Document]) -> list[Document]:
-        """Apply chunking if configured.
+        """Apply chunking and embedding prompt if configured.
 
         Args:
             documents: Documents to prepare.
 
         Returns:
-            Chunked documents if chunk_size is set, otherwise original documents.
+            Processed documents (chunked + prompted).
         """
-        if not self.config.chunk_size:
-            return documents
-        return split_documents(documents, self.config.chunk_size, self.config.chunk_overlap)
+        # Step 1: Chunk documents if configured
+        if self.config.chunk_size:
+            documents = split_documents(documents, self.config.chunk_size, self.config.chunk_overlap)
+
+        # Step 2: Apply embedding prompt template
+        documents = self._apply_embedding_prompt(documents)
+
+        return documents
 
     def _build_index(
         self,
@@ -589,16 +666,19 @@ class nativeRagService(RagService):
         Raises:
             ValueError: If index is None or top_k <= 0.
         """
+        # Apply query prompt
+        prompted_text = self._apply_query_prompt(text)
+
         if distance_function:
             return [
                 doc
                 for doc, _ in self.retrieve_documents_with_scores(
-                    index, text, top_k=top_k, distance_function=distance_function, fetch_k=fetch_k
+                    index, prompted_text, top_k=top_k, distance_function=distance_function, fetch_k=fetch_k
                 )
             ]
         if not index or top_k <= 0:
             raise ValueError("Index required and top_k must be > 0")
-        return index.similarity_search(text, k=top_k)
+        return index.similarity_search(prompted_text, k=top_k)
 
     def retrieve_documents_with_scores(
         self,
@@ -630,8 +710,11 @@ class nativeRagService(RagService):
         # Ensure text is a valid string to prevent 'NoneType has no replace' errors
         text = str(text) if text is not None else ""
 
+        # Apply query prompt
+        prompted_text = self._apply_query_prompt(text)
+
         if not distance_function:
-            return index.similarity_search_with_score(text, k=top_k)
+            return index.similarity_search_with_score(prompted_text, k=top_k)
 
         metric_map = {"euclidean": "l2", "inner_product": "ip"}
         normalized = metric_map.get(distance_function, distance_function)
@@ -639,14 +722,14 @@ class nativeRagService(RagService):
         try:
             index_metric = index._collection.metadata.get("hnsw:space", "cosine")
             if normalized == index_metric:
-                return index.similarity_search_with_score(text, k=top_k)
+                return index.similarity_search_with_score(prompted_text, k=top_k)
         except (AttributeError, TypeError):
             pass
 
         return rerank_with_metric(
             index=index,
             embeddings=self._embeddings,
-            text=text,
+            text=prompted_text,
             top_k=top_k,
             metric=normalized,
             fetch_k=fetch_k or top_k * 3,
@@ -722,35 +805,4 @@ class nativeRagService(RagService):
             batch_size=batch_size,
         )
         return pd.DataFrame(results)
-
-    def evaluate_retrieval(
-        self,
-        index: VectorStoreLike | None,
-        questions: list[str],
-        expected_ids: list[str],
-        *,
-        top_k: int = 5,
-        metrics: list[str] | None = None,
-        batch_size: int = 64,
-    ) -> pd.DataFrame:
-        """Backward-compatible alias for retrieve_topk_by_metric (no evaluation).
-
-        Args:
-            index: Vector store to search.
-            questions: Query texts.
-            expected_ids: Expected document IDs for each query.
-            top_k: Number of results per query.
-            metrics: List of metrics to evaluate.
-            batch_size: Number of queries to process at once.
-
-        Returns:
-            DataFrame with retrieval results.
-        """
-        return self.retrieve_topk_by_metric(
-            index=index,
-            questions=questions,
-            expected_ids=expected_ids,
-            top_k=top_k,
-            metrics=metrics,
-            batch_size=batch_size,
-        )
+    

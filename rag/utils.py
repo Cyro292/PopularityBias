@@ -65,6 +65,7 @@ def get_embedding_class(provider: str):
     return _EMBEDDING_CLASSES[provider]
 
 
+
 class RateLimitedEmbeddings:
     """Wrapper that adds rate limiting to any embeddings instance."""
 
@@ -91,16 +92,18 @@ class RateLimitedEmbeddings:
 def build_embeddings(
     provider: str = "openai",
     model: str = "text-embedding-3-large",
+    trust_remote_code: bool = False,
     rate_limiter: BaseRateLimiter | None = None,
     requests_per_second: float | None = None,
     check_interval: float = 0.1,
     bucket_size: float = 1.0,
 ):
-    """Build embeddings instance with optional rate limiting.
+    """Build embeddings instance with optional rate limiting and E5 prefix handling.
 
     Args:
         provider: Embedding provider name ("openai", "google", "huggingface").
         model: Model name/identifier.
+        trust_remote_code: Allow custom HuggingFace model code execution.
         rate_limiter: Pre-configured rate limiter (takes precedence).
         requests_per_second: Auto-create rate limiter with this rate.
         check_interval: Rate limit check interval.
@@ -112,7 +115,10 @@ def build_embeddings(
     embedding_cls = get_embedding_class(provider)
 
     if provider.lower() == "huggingface":
-        base = embedding_cls(model_name=model)
+        base = embedding_cls(
+            model_name=model,
+            model_kwargs={"trust_remote_code": trust_remote_code},
+        )
     else:
         base = embedding_cls(model=model)
 
@@ -576,6 +582,7 @@ class IndexingConfig:
         chunk_overlap: Number of characters to overlap between chunks.
         embedding_provider: Which embedding service to use ("openai", "google", "huggingface").
         embedding_model: Specific model name (e.g., "text-embedding-3-large").
+        trust_remote_code: Allow custom HuggingFace model code execution.
         use_progress: Whether to show progress bars during indexing.
         rate_limiter: Custom rate limiter instance.
         requests_per_second: Automatic rate limiting (requests/sec).
@@ -588,9 +595,10 @@ class IndexingConfig:
     chunk_overlap: int = 200
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-large"
+    trust_remote_code: bool = False
     use_progress: bool = True
     rate_limiter: BaseRateLimiter | None = None
     requests_per_second: float | None = None
     rate_limit_check_interval: float = 0.1
     rate_limit_bucket_size: float = 1.0
-    distance_function: str = "cosine"
+    distance_function: str = "COSINE"
