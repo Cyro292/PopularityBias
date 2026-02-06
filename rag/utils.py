@@ -38,7 +38,7 @@ def get_embedding_class(provider: str):
     """Lazy-load embedding classes to avoid import overhead.
 
     Args:
-        provider: Name of the embedding provider ("openai", "google", "huggingface").
+        provider: Name of the embedding provider ("openai", "google", "huggingface", "modal").
 
     Returns:
         The embedding class for the specified provider.
@@ -60,6 +60,10 @@ def get_embedding_class(provider: str):
             from langchain_huggingface import HuggingFaceEmbeddings
 
             _EMBEDDING_CLASSES[provider] = HuggingFaceEmbeddings
+        elif provider == "modal":
+            from rag.ModalEmbedding import ModalEmbeddings
+
+            _EMBEDDING_CLASSES[provider] = ModalEmbeddings
         else:
             raise ValueError(f"Unsupported embedding provider: {provider}")
     return _EMBEDDING_CLASSES[provider]
@@ -97,17 +101,19 @@ def build_embeddings(
     requests_per_second: float | None = None,
     check_interval: float = 0.1,
     bucket_size: float = 1.0,
+    **kwargs,
 ):
     """Build embeddings instance with optional rate limiting and E5 prefix handling.
 
     Args:
-        provider: Embedding provider name ("openai", "google", "huggingface").
+        provider: Embedding provider name ("openai", "google", "huggingface", "modal").
         model: Model name/identifier.
         trust_remote_code: Allow custom HuggingFace model code execution.
         rate_limiter: Pre-configured rate limiter (takes precedence).
         requests_per_second: Auto-create rate limiter with this rate.
         check_interval: Rate limit check interval.
         bucket_size: Token bucket size.
+        **kwargs: Extra provider-specific options (e.g. modal_gpu_type).
 
     Returns:
         Embeddings instance, optionally wrapped with rate limiting.
@@ -118,6 +124,11 @@ def build_embeddings(
         base = embedding_cls(
             model_name=model,
             model_kwargs={"trust_remote_code": trust_remote_code},
+        )
+    elif provider.lower() == "modal":
+        base = embedding_cls(
+            model_name=model,
+            **kwargs
         )
     else:
         base = embedding_cls(model=model)
@@ -573,32 +584,39 @@ def retrieve_topk_by_metric(
 
 @dataclass
 class IndexingConfig:
-    """Configuration for document indexing and embedding generation.
+    """Central configuration for the entire indexing pipeline.
 
-    Used primarily by native_rag_service but can be adapted for other services.
+    All tunable hyperparameters live here so the notebook controls everything.
 
-    Attributes:
-        chunk_size: Maximum characters per document chunk.
-        chunk_overlap: Number of characters to overlap between chunks.
-        embedding_provider: Which embedding service to use ("openai", "google", "huggingface").
-        embedding_model: Specific model name (e.g., "text-embedding-3-large").
-        trust_remote_code: Allow custom HuggingFace model code execution.
-        use_progress: Whether to show progress bars during indexing.
-        rate_limiter: Custom rate limiter instance.
-        requests_per_second: Automatic rate limiting (requests/sec).
-        rate_limit_check_interval: How often to check rate limits (seconds).
-        rate_limit_bucket_size: Token bucket size for burst handling.
-        distance_function: Distance function for index storage ("cosine", "l2", "ip").
+    Groups:
+        Text processing:  chunk_size, chunk_overlap
+        ES bulk insert:   batch_size
+        GPU embedding:    gpu_batch_size
+        Embedding:        embedding_provider, embedding_model, distance_function
+        Rate limiting:    rate_limiter, requests_per_second, ...
     """
 
+    # ── Text processing ──────────────────────────────────────────────────
     chunk_size: int = 1000
     chunk_overlap: int = 200
+
+    # ── bulk insert (no GPU involved, just I/O) ──────────────────────
+    batch_size: int = 5000
+
+    # ── GPU embedding (runtime — no redeploy needed) ────────────────────
+    gpu_batch_size: int = 2048       # forward-pass batch on GPU
+
+    # ── Embedding provider ──────────────────────────────────────────────
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-large"
     trust_remote_code: bool = False
-    use_progress: bool = True
+    distance_function: str = "COSINE"
+
+    # ── Rate limiting ───────────────────────────────────────────────────
     rate_limiter: BaseRateLimiter | None = None
     requests_per_second: float | None = None
     rate_limit_check_interval: float = 0.1
     rate_limit_bucket_size: float = 1.0
-    distance_function: str = "COSINE"
+
+    # ── UI ───────────────────────────────────────────────────────────────
+    use_progress: bool = True

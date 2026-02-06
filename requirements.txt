@@ -25,3 +25,4 @@ langchain_google_genai>=2.1.12
 langchain_huggingface>=0.3.1
 rank_bm25>=0.2.2
 langchain_elasticsearch>=0.4.0
+modal>=1.2.6
