@@ -178,23 +178,47 @@ class ElasticsearchRagService(RagService):
         
         if not parquet_path.exists():
             raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
-        
+
+        import concurrent.futures
+        import pyarrow.parquet as pq
+
         store = self._create_store(collection_name)
         total_chunks = 0
         
-        pbar = tqdm(total=None, desc="Streaming parquet", unit="batch", disable=not progress_bar)
         parquet_file = pq.ParquetFile(parquet_path)
+        total_rows = parquet_file.metadata.num_rows
+        total_batches = (total_rows + batch_size - 1) // batch_size
         
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[text_field] + list(metadata_fields or [])):
-            df = batch.to_pandas()
-            documents = documents_from_dataframe(df, text_field, metadata_fields)
-
-            cleaned_documents = self._prepare_documents(documents)
+        pbar = tqdm(
+            total=total_batches, 
+            desc="Streaming & Indexing", 
+            unit="batch", 
+            disable=not progress_bar
+        )
+        
+        columns = [text_field] + list(metadata_fields or [])
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            upload_future = None
             
-            store.add_documents(cleaned_documents)
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+                df = batch.to_pandas()
+                documents = documents_from_dataframe(df, text_field, metadata_fields)
+                cleaned_documents = self._prepare_documents(documents)
 
-            total_chunks += len(documents)
-            pbar.update(1)
+                if upload_future:
+                    total_chunks += upload_future.result()
+                    pbar.update(1)
+
+                def _upload_and_count(docs):
+                    store.add_documents(docs)
+                    return len(docs)
+
+                upload_future = executor.submit(_upload_and_count, cleaned_documents)
+
+            if upload_future:
+                total_chunks += upload_future.result()
+                pbar.update(1)
         
         pbar.close()
         return store, total_chunks

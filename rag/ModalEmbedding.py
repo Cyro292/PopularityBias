@@ -16,11 +16,11 @@ except ImportError:
 # ── Configuration ─────────────────────────────────────────────────────────────
 APP_NAME = "PopularityBias_Thesis_Amon_Embedding_Service"
 MODEL_NAME = "intfloat/multilingual-e5-small"
-GPU_CONFIG = "T4"
-DEFAULT_BATCH_SIZE = 128
+GPU_CONFIG = "A10"
+DEFAULT_BATCH_SIZE = 1024
 MAX_CONTAINERS = 4         # Scaled up for index jobs
 CONTAINER_TIMEOUT = 300     # 5 min idle timeout to reduce cold starts during gaps
-FUNCTION_TIMEOUT = 3600     # 1 hour max execution time per call
+FUNCTION_TIMEOUT = 300     # 5 min max execution time per call
 
 def download_model():
     from sentence_transformers import SentenceTransformer
@@ -44,7 +44,7 @@ app = modal.App(APP_NAME)
     scaledown_window=CONTAINER_TIMEOUT, # Keep warm for 5 mins
 )
 class Model:
-    @modal.enter()  # <--- THIS DECORATOR IS MISSING
+    @modal.enter()  
     def enter(self):
         # This runs ONCE when container starts
         print(f"Loading model {MODEL_NAME}...")
