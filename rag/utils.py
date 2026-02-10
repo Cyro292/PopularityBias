@@ -128,7 +128,6 @@ def build_embeddings(
     elif provider.lower() == "modal":
         base = embedding_cls(
             model_name=model,
-            **kwargs
         )
     else:
         base = embedding_cls(model=model)

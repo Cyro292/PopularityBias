@@ -7,11 +7,14 @@ from typing import Any, Sequence
 import pandas as pd
 from bs4 import BeautifulSoup
 from langchain.schema import Document
+from tqdm import tqdm
 
 def documents_from_dataframe(
     df: pd.DataFrame,
     text_field: str,
     metadata_fields: Sequence[str] | None = None,
+    *,
+    progress_bar: bool = False,
 ) -> list[Document]:
     """Transform a DataFrame into LangChain documents.
     
@@ -37,7 +40,9 @@ def documents_from_dataframe(
         raise ValueError(f"metadata_fields {missing_fields} not found in DataFrame columns")
     
     documents = []
-    for _, row in df.iterrows():
+    rows_iter = tqdm(df.iterrows(), total=len(df), desc="Building docs",
+                     unit="row", disable=not progress_bar)
+    for _, row in rows_iter:
         metadata = {field: row[field] for field in metadata_fields}
         doc = Document(page_content=str(row[text_field]), metadata=metadata)
         documents.append(doc)

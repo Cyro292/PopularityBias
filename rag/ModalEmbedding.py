@@ -17,10 +17,11 @@ except ImportError:
 APP_NAME = "PopularityBias_Thesis_Amon_Embedding_Service"
 MODEL_NAME = "intfloat/multilingual-e5-small"
 GPU_CONFIG = "A10"
-DEFAULT_BATCH_SIZE = 1024
-MAX_CONTAINERS = 4         # Scaled up for index jobs
+DEFAULT_BATCH_SIZE = 2_048  # Max batch size for A10, can be tuned based on actual GPU memory and model requirements
+MAX_CONTAINERS = 6         # Scaled up for index jobs
 CONTAINER_TIMEOUT = 300     # 5 min idle timeout to reduce cold starts during gaps
 FUNCTION_TIMEOUT = 300     # 5 min max execution time per call
+MAX_RETRIES = 2           # Retry on failure
 
 def download_model():
     from sentence_transformers import SentenceTransformer
@@ -42,6 +43,7 @@ app = modal.App(APP_NAME)
     timeout=FUNCTION_TIMEOUT,
     max_containers=MAX_CONTAINERS,
     scaledown_window=CONTAINER_TIMEOUT, # Keep warm for 5 mins
+    retries=MAX_RETRIES
 )
 class Model:
     @modal.enter()  
@@ -49,7 +51,7 @@ class Model:
         # This runs ONCE when container starts
         print(f"Loading model {MODEL_NAME}...")
         from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(MODEL_NAME)
+        self.model = SentenceTransformer(MODEL_NAME, device="cuda")
         print("Model loaded!")
 
     @modal.method()
@@ -74,10 +76,9 @@ class ModalEmbeddings(_EmbeddingsBase):
     def __init__(
         self,
         model_name: str = MODEL_NAME,
-        gpu_batch_size: int = DEFAULT_BATCH_SIZE,
     ):
         self.model_name = model_name
-        self.gpu_batch_size = gpu_batch_size
+        self.gpu_batch_size =  DEFAULT_BATCH_SIZE
         ModelService = modal.Cls.from_name(APP_NAME, "Model")
         self.service_instance = ModelService()
         self.embed_function = self.service_instance.embed
