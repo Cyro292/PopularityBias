@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from langchain.schema import Document
 from langchain_elasticsearch import ElasticsearchStore
-from langchain_elasticsearch.vectorstores import BM25RetrievalStrategy, DenseVectorStrategy
+from langchain_elasticsearch.vectorstores import BM25RetrievalStrategy, DenseVectorStrategy, DenseVectorScriptScoreStrategy
 from tqdm import tqdm
 
 from .base import RagService, VectorStoreLike
@@ -40,7 +40,7 @@ class ElasticsearchRagService(RagService):
         es_url: str = "http://localhost:9200",
         es_user: str | None = None,
         es_password: str | None = None,
-        strategy: Literal["vector", "bm25", "hybrid"] = "vector",
+        strategy: Literal["vector", "approximation", "bm25", "hybrid"] = "vector",
         distance_function: Literal["COSINE", "DOT_PRODUCT", "EUCLIDEAN_DISTANCE"] | None = None,
     ):
         self.es_url = es_url
@@ -73,7 +73,16 @@ class ElasticsearchRagService(RagService):
             if dist and dist not in _VALID_DISTANCES:
                 raise ValueError(f"Invalid distance: {dist}. Use one of {_VALID_DISTANCES}")
             self.distance_strategy = dist
-            self._retrieval_strategy = DenseVectorStrategy(hybrid=(strategy == "hybrid"))
+
+            if strategy == "vector":
+                # Exact brute-force vector search (script_score over all docs)
+                self._retrieval_strategy = DenseVectorScriptScoreStrategy()
+            elif strategy == "approximation":
+                # Approximate kNN via HNSW graph (fast, use num_candidates to tune recall)
+                self._retrieval_strategy = DenseVectorStrategy()
+            elif strategy == "hybrid":
+                # Approximate kNN + BM25 combined scoring
+                self._retrieval_strategy = DenseVectorStrategy(hybrid=True)
 
         logger.info(f"Elasticsearch {strategy} strategy ready")
 
@@ -203,6 +212,7 @@ class ElasticsearchRagService(RagService):
         collection_name: str = None,
         progress_bar: bool | None = None,
         batch_size: int,
+        skip_rows: int = 0,
     ) -> tuple[ElasticsearchStore, int]:
         """
         Three-stage pipeline with sub-batching and bounded queues:
@@ -224,14 +234,18 @@ class ElasticsearchRagService(RagService):
 
         store = self._create_store(collection_name)
         total_chunks = 0
+        rows_processed = 0
 
         parquet_file = pq.ParquetFile(parquet_path)
         total_rows = parquet_file.metadata.num_rows
+        rows_to_index = total_rows - skip_rows
 
         # Pipeline tuning ─────────────────────────────────────────────────
         columns = [text_field] + list(metadata_fields or [])
+        if skip_rows > 0:
+            logger.info(f"Skipping first {skip_rows:,} rows")
         logger.info(
-            f"Indexing {total_rows:,} rows | parquet_batch={batch_size:,}"
+            f"Indexing {rows_to_index:,} rows (of {total_rows:,} total) | parquet_batch={batch_size:,}"
         )
 
         # ── Shared state ─────────────────────────────────────────────────
@@ -260,18 +274,32 @@ class ElasticsearchRagService(RagService):
         # ── Stage 1 – Producer thread: read → chunk → sub-batch ──────────
         def producer():
             try:
+                rows_seen = 0
                 for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
                     if cancel.is_set():
                         break
+                    batch_len = batch.num_rows
+                    # ── Skip logic ────────────────────────────────────────
+                    if rows_seen + batch_len <= skip_rows:
+                        rows_seen += batch_len
+                        logger.debug(f"[Prepare] Skipped batch ({rows_seen:,}/{skip_rows:,})")
+                        continue
                     df = batch.to_pandas()
+                    if rows_seen < skip_rows:
+                        drop = skip_rows - rows_seen
+                        df = df.iloc[drop:]
+                        logger.info(f"[Prepare] Partial skip: dropped first {drop:,} rows of batch")
+                    rows_seen += batch_len
+                    # ──────────────────────────────────────────────────────
                     logger.info(f"[Prepare] {len(df):,} rows from parquet")
 
+                    n_rows_in_batch = len(df)
                     documents = documents_from_dataframe(df, text_field, metadata_fields)
                     chunks = self._prepare_documents(documents, log_details=False)
-                    logger.info(f"[Prepare] {len(chunks):,} chunks (from {len(df):,} rows)")
+                    logger.info(f"[Prepare] {len(chunks):,} chunks (from {n_rows_in_batch:,} rows)")
                     del documents, df
 
-                    if not _safe_put(prepare_queue, chunks):
+                    if not _safe_put(prepare_queue, (chunks, n_rows_in_batch)):
                         break
 
                     del chunks
@@ -284,26 +312,34 @@ class ElasticsearchRagService(RagService):
 
         # ── Stage 3 – Upload thread: ES bulk insert ──────────────────────
         def uploader():
-            nonlocal total_chunks
+            nonlocal total_chunks, rows_processed
             try:
                 while True:
                     item, ok = _safe_get(upload_queue)
                     if not ok or item is None:
                         break
 
-                    texts, embeddings, metadatas = item
+                    texts, embeddings, metadatas, batch_rows = item
                     n = len(texts)
                     logger.info(f"[Upload] {n:,} docs → ES")
 
-                    store.add_embeddings(
-                        text_embeddings=list(zip(texts, embeddings)),
-                        metadatas=metadatas,
-                        refresh_indices=False,
-                    )
+                    ES_CHUNK_SIZE = 5000
+
+                    for i in range(0, n, ES_CHUNK_SIZE):
+                        sub_texts = texts[i:i+ES_CHUNK_SIZE]
+                        sub_embs  = embeddings[i:i+ES_CHUNK_SIZE]
+                        sub_meta  = metadatas[i:i+ES_CHUNK_SIZE]
+
+                        store.add_embeddings(
+                            text_embeddings=list(zip(sub_texts, sub_embs)),
+                            metadatas=sub_meta,
+                            refresh_indices=False,
+                        )
 
                     total_chunks += n
-                    pbar.update(n)
-                    logger.info(f"[Upload] ✓ +{n:,} (cumulative: {total_chunks:,})")
+                    rows_processed += batch_rows
+                    pbar.update(batch_rows)
+                    logger.info(f"[Upload] ✓ +{n:,} chunks / {batch_rows:,} rows (cumulative: {total_chunks:,} chunks, {rows_processed:,} rows)")
 
                     del texts, embeddings, metadatas
                     gc.collect()
@@ -317,9 +353,9 @@ class ElasticsearchRagService(RagService):
         upload_thread   = threading.Thread(target=uploader, name="Upload")
 
         pbar = tqdm(
-            total=total_rows,
+            total=rows_to_index,
             desc="Indexing",
-            unit="chunk",
+            unit="row",
             disable=not progress_bar,
         )
 
@@ -329,19 +365,21 @@ class ElasticsearchRagService(RagService):
         # ── Stage 2 – Main thread: embed (GPU-bound) ────────────────────
         try:
             while True:
-                chunk_batch, ok = _safe_get(prepare_queue)
-                if not ok or chunk_batch is None:
+                item, ok = _safe_get(prepare_queue)
+                if not ok or item is None:
                     break
 
+                chunk_batch, chunk_batch_rows = item
                 texts     = [doc.page_content for doc in chunk_batch]
                 metadatas = [doc.metadata     for doc in chunk_batch]
                 del chunk_batch
 
+                n_rows = chunk_batch_rows
                 logger.info(f"[Embed] {len(texts):,} chunks...")
                 embeddings = self._embeddings.embed_documents(texts)
 
                 # Hand off to upload thread (non-blocking unless queue full)
-                if not _safe_put(upload_queue, (texts, embeddings, metadatas)):
+                if not _safe_put(upload_queue, (texts, embeddings, metadatas, n_rows)):
                     break
 
         except Exception as e:
@@ -416,43 +454,59 @@ class ElasticsearchRagService(RagService):
             if strategy == "bm25":
                 self._retrieval_strategy = BM25RetrievalStrategy()
                 self._embeddings = None
-            elif strategy in ["vector", "hybrid"]:
+            elif strategy in ["vector", "approximation", "hybrid"]:
                 if self._embeddings is None:
                     raise ValueError(f"Embeddings required for '{strategy}' strategy")
-                    
-                self._retrieval_strategy = DenseVectorStrategy(
-                    hybrid=(strategy == "hybrid")
-                )
+
+                if strategy == "vector":
+                    self._retrieval_strategy = DenseVectorScriptScoreStrategy()
+                elif strategy == "approximation":
+                    self._retrieval_strategy = DenseVectorStrategy()
+                elif strategy == "hybrid":
+                    self._retrieval_strategy = DenseVectorStrategy(hybrid=True)
             yield strategy
         finally:
             self.strategy = original_strategy
             self._retrieval_strategy = original_retrieval_obj
             self._embeddings = original_embeddings
 
+    @staticmethod
+    def _make_num_candidates_query(num_candidates: int):
+        """Return a custom_query callback that overrides kNN num_candidates."""
+        def _custom_query(query_body: dict, query_str: str | None) -> dict:
+            if "knn" in query_body:
+                query_body["knn"]["num_candidates"] = num_candidates
+            return query_body
+        return _custom_query
+
     def retrieve_documents(
         self,
         text: str,
         top_k: int = 5,
         strategy: str | None = None,
+        num_candidates: int | None = None,
     ) -> list[Document]:
         """Retrieve documents using the configured strategy."""
 
         with self._strategy_context(strategy):
             index = self._create_store(self._current_index_name)
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
 
-            return index.similarity_search(self._prepare_query(text), top_k)
+            return index.similarity_search(self._prepare_query(text), top_k, custom_query=custom_query)
 
     def retrieve_documents_with_scores(
         self,
         text: str,
         top_k: int = 5,
         strategy: str | None = None,
+        num_candidates: int | None = None,
     ) -> list[tuple[Document, float]]:
         """Retrieve documents with relevance scores."""
         with self._strategy_context(strategy):
             index = self._create_store(self._current_index_name)
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
 
-            return index.similarity_search_with_score(self._prepare_query(text), top_k)
+            return index.similarity_search_with_score(self._prepare_query(text), top_k, custom_query=custom_query)
 
     def batch_retrieve(
         self,
@@ -460,18 +514,20 @@ class ElasticsearchRagService(RagService):
         *,
         top_k: int = 5,
         strategy: str | None = None,
+        num_candidates: int | None = None,
         progress_bar: bool = True,
     ) -> list[list[tuple[Document, float]]]:
         """Retrieve for multiple queries, optionally switching strategy."""
 
         with self._strategy_context(strategy) as strat:
             store = self._create_store(self._current_index_name)
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
             results = []
             pdbar = tqdm(total=len(questions), desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar)
             
             for question in questions:
                 prepared = self._prepare_query(question)
-                answer = store.similarity_search_with_score(prepared, top_k=top_k)
+                answer = store.similarity_search_with_score(prepared, top_k=top_k, custom_query=custom_query)
                 results.append(answer)
                 pdbar.update(1)
 
