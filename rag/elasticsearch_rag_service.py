@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from langchain.schema import Document
 from langchain_elasticsearch import ElasticsearchStore
-from langchain_elasticsearch.vectorstores import BM25RetrievalStrategy, DenseVectorStrategy, DenseVectorScriptScoreStrategy
+from langchain_elasticsearch.vectorstores import BM25Strategy, DenseVectorStrategy, DenseVectorScriptScoreStrategy
 from tqdm import tqdm
 
 from .base import RagService, VectorStoreLike
@@ -452,7 +452,7 @@ class ElasticsearchRagService(RagService):
         try:
             self.strategy = strategy
             if strategy == "bm25":
-                self._retrieval_strategy = BM25RetrievalStrategy()
+                self._retrieval_strategy = BM25Strategy()
                 self._embeddings = None
             elif strategy in ["vector", "approximation", "hybrid"]:
                 if self._embeddings is None:

@@ -1,615 +1,571 @@
-"""Prepare QA datasets for RAG evaluation: load, merge, enrich, balance, generate.
-
-This script handles the full QA preparation pipeline:
-  1. Load QA datasets from HuggingFace
-  2. Merge into a single DataFrame
-  3. Enrich with popularity deciles
-  4. Balance across popularity deciles
-  5. (Optional) Generate synthetic questions from a corpus
-
-Usage examples:
-
-    # Load, enrich, and balance QA datasets (no synthetic generation):
-    python scripts/prepare_qa_dataset.py \
-        --qa-datasets natural_questions triviaqa \
-        --popularity-dataset Cyro1/enwiki_pageviews_m \
-        --output data/wiki_1m_balanced_qa_b_nqtr/train_questions.parquet \
-        --balance
-
-    # Same + generate synthetic to fill under-represented deciles:
-    python scripts/prepare_qa_dataset.py \
-        --qa-datasets natural_questions triviaqa \
-        --popularity-dataset Cyro1/enwiki_pageviews_m \
-        --corpus data/wiki_1m_balanced_qa_b_nqtr/wiki_corpus.parquet \
-        --output data/wiki_1m_balanced_qa_b_nqtr/train_questions.parquet \
-        --balance --generate-synthetic --questions-per-decile 200
-
-    # Generate synthetic only (from existing parquet + corpus):
-    python scripts/prepare_qa_dataset.py \
-        --existing-qa data/.../train_questions.parquet \
-        --corpus data/.../wiki_corpus.parquet \
-        --output data/.../train_questions_augmented.parquet \
-        --generate-synthetic --questions-per-decile 500
-"""
+"""Prepare QA datasets: load, filter to corpus, enrich with deciles, balance."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import gc
 import logging
 import sys
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-# Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import DATA_DIR, CACHE_DIR, SYTHETNIC_QA_PROMPT_PATH
 
-from config import DATA_DIR, CACHE_DIR
+
+DEFAULT_HF_QA_REPO = "Cyro1/popularity-enriched-qa-datasets"
+DEFAULT_POPULARITY_DATASET = "Cyro1/enwiki_pageviews_m"
 
 import dotenv
-
 dotenv.load_dotenv()
+
+# Setup logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s - %(message)s"
+)
 
 logger = logging.getLogger(__name__)
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
-DEFAULT_HF_QA_REPO = "Cyro1/popularity-enriched-qa-datasets"
-DEFAULT_POPULARITY_DATASET = "Cyro1/enwiki_pageviews_m"
-DEFAULT_PROMPT_PATH = Path(DATA_DIR) / "prompts" / "synthentic_question_generation_promt.txt"
-DEFAULT_PROMPT = (
-    "Given this context/document passage, generate one or more relevant questions "
-    "that a user might ask based on the passage.\n\nDocument: {passage}"
-)
-DEFAULT_MODEL = "gpt-4.1-nano"
-DEFAULT_QUESTIONS_PER_DECILE = 200
-DEFAULT_BATCH_SIZE = 500
-DEFAULT_TEXT_FIELD = "text"
-DEFAULT_MAX_PASSAGE_CHARS = 2000
 
-
-# ============================================================================
-# 1. LOAD & MERGE
-# ============================================================================
-
-
-def load_qa_datasets(
-    dataset_names: Sequence[str],
-    *,
-    hf_repo: str = DEFAULT_HF_QA_REPO,
-    cache_dir: Path | str | None = None,
-) -> pd.DataFrame:
-    """Load one or more QA datasets from HuggingFace and merge them.
-
-    Args:
-        dataset_names: HuggingFace config names (e.g. ["natural_questions", "triviaqa"]).
-        hf_repo: HuggingFace dataset repository.
-        cache_dir: Directory for HuggingFace cache.
-
-    Returns:
-        Merged DataFrame with a ``dataset`` column identifying the source.
-    """
+def load_qa_datasets(dataset_names: list[str], hf_repo: str, cache_dir: str | None) -> pd.DataFrame:
+    """Load QA datasets from HuggingFace."""
     from datasets import load_dataset
-
-    cache = str(cache_dir) if cache_dir else None
-    dfs: list[pd.DataFrame] = []
-
+    
+    dfs = []
     for name in dataset_names:
-        ds = load_dataset(hf_repo, name, split="train+test", cache_dir=cache)
+        logger.info(f"Loading {name}...")
+        ds = load_dataset(hf_repo, name, split="train+test", cache_dir=cache_dir)
         df = ds.to_pandas()
         df["dataset"] = name
         dfs.append(df)
-        print(f"  {name}: {len(df):,} questions")
-
+        logger.info(f"  ✓ {len(df):,} questions")
+        del ds
+        gc.collect()
+    
     merged = pd.concat(dfs, ignore_index=True)
-
-    # Normalize column names
-    if "rank_avg" in merged.columns:
-        if "popularity_rank" in merged.columns:
-            merged["popularity_rank"] = merged["popularity_rank"].combine_first(
-                merged["rank_avg"]
-            )
-            merged = merged.drop(columns=["rank_avg"])
-        else:
-            merged = merged.rename(columns={"rank_avg": "popularity_rank"})
-
-    # Clean IDs
     merged = merged.dropna(subset=["wikipedia_id"])
     merged["wikipedia_id"] = merged["wikipedia_id"].astype(int)
-
-    if "is_synthetic" not in merged.columns:
-        merged["is_synthetic"] = False
-
-    print(f"✓ Merged QA: {len(merged):,} questions from {len(dataset_names)} dataset(s)")
     return merged
 
 
-def load_existing_qa(path: Path) -> pd.DataFrame:
-    """Load an existing QA parquet file, normalizing columns."""
-    df = pd.read_parquet(path)
-    if "question_text" not in df.columns and "question" in df.columns:
-        df = df.rename(columns={"question": "question_text"})
-    df["wikipedia_id"] = pd.to_numeric(df["wikipedia_id"], errors="coerce").astype(int)
-    if "is_synthetic" not in df.columns:
-        df["is_synthetic"] = False
-    print(f"✓ Loaded existing QA: {len(df):,} questions from {path}")
-    return df
-
-
-# ============================================================================
-# 2. ENRICH WITH POPULARITY DECILES
-# ============================================================================
-
-
-def enrich_with_deciles(
-    qa_df: pd.DataFrame,
-    popularity_dataset: str = DEFAULT_POPULARITY_DATASET,
-    *,
-    cache_dir: Path | str | None = None,
-) -> pd.DataFrame:
-    """Add global popularity deciles to a QA DataFrame.
-
-    Loads the full popularity dataset, computes global deciles, and maps them
-    onto ``qa_df`` via ``wikipedia_id``. Rows with unknown deciles are dropped.
-
-    Args:
-        qa_df: DataFrame with a ``wikipedia_id`` column.
-        popularity_dataset: HuggingFace dataset for popularity scores.
-        cache_dir: HuggingFace cache directory.
-
-    Returns:
-        Enriched DataFrame (rows with unknown decile are removed).
-    """
-    from datasets import load_dataset
-
-    print("Loading popularity data for decile calculation...")
-    cache = str(cache_dir) if cache_dir else None
-    pop_ds = load_dataset(popularity_dataset, split="train+test", cache_dir=cache)
-
-    cols = pop_ds.column_names
-    id_col = "wikipedia_id" if "wikipedia_id" in cols else "id"
-
-    pop_df = pop_ds.select_columns([id_col, "popularity_avg"]).to_pandas()
-    pop_df[id_col] = pd.to_numeric(pop_df[id_col], errors="coerce").fillna(-1).astype(int)
-
-    print("  Calculating global deciles...")
-    pop_df["decile"] = pd.qcut(
-        pop_df["popularity_avg"].rank(method="first"),
-        10,
-        labels=False,
-    )
-
-    decile_lookup = pop_df.set_index(id_col)["decile"].to_dict()
-    pop_lookup = pop_df.set_index(id_col)["popularity_avg"].to_dict()
-
-    del pop_ds, pop_df
-    gc.collect()
-
-    qa_df = qa_df.copy()
-    qa_df["decile"] = qa_df["wikipedia_id"].map(decile_lookup).fillna(-1).astype(int)
-
-    # Fill popularity_avg if missing
-    if "popularity_avg" not in qa_df.columns:
-        qa_df["popularity_avg"] = qa_df["wikipedia_id"].map(pop_lookup)
-    else:
-        qa_df["popularity_avg"] = qa_df["popularity_avg"].combine_first(
-            qa_df["wikipedia_id"].map(pop_lookup)
-        )
-
-    invalid = (qa_df["decile"] == -1).sum()
-    if invalid:
-        print(f"  Dropped {invalid} questions with unknown decile")
-    qa_df = qa_df[qa_df["decile"] != -1].copy()
-
-    print(f"✓ Enriched: {len(qa_df):,} questions with deciles")
+def filter_to_corpus(qa_df: pd.DataFrame, corpus_path: Path) -> pd.DataFrame:
+    """Keep only questions whose wikipedia_id exists in the corpus."""
+    import pyarrow.parquet as pq
+    
+    logger.info("Loading corpus IDs...")
+    pf = pq.ParquetFile(corpus_path)
+    
+    corpus_ids = set()
+    for batch in pf.iter_batches(batch_size=100_000, columns=["wikipedia_id"]):
+        batch_df = batch.to_pandas()
+        batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(int)
+        corpus_ids.update(batch_df["wikipedia_id"])
+    
+    before = len(qa_df)
+    qa_df = qa_df[qa_df["wikipedia_id"].isin(corpus_ids)].copy()
+    logger.info(f"Kept {len(qa_df):,} / {before:,} questions (in corpus)")
+    
     return qa_df
 
 
-# ============================================================================
-# 3. BALANCE
-# ============================================================================
-
-
-def balance_by_decile(
-    qa_df: pd.DataFrame,
-    *,
-    target_per_decile: int | None = None,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    """Balance a QA DataFrame so each popularity decile has equal representation.
-
+def calculate_corpus_decile_boundaries(
+    corpus_path: Path,
+    batch_size: int = 100_000,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 100,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Calculate both unweighted and chunk-weighted decile boundaries from corpus.
+    
+    Memory-efficient streaming implementation.
+    
     Args:
-        qa_df: DataFrame with a ``decile`` column (0-9).
-        target_per_decile: Explicit target count. If ``None``, uses the minimum
-            decile count (i.e. downsample to the smallest decile).
-        random_state: Seed for reproducible sampling.
-
+        corpus_path: Path to corpus parquet file
+        batch_size: Batch size for streaming
+        chunk_size: Chunk size for text splitting
+        chunk_overlap: Chunk overlap for text splitting
+    
     Returns:
-        Balanced DataFrame.
+        Tuple of (boundaries_unweighted, boundaries_weighted, stats_dict, id_to_pop)
+        Both boundaries are arrays of length 11 (0th, 10th, ..., 100th percentiles)
+    
+    Never loads the full corpus into memory.
     """
-    counts = qa_df["decile"].value_counts().sort_index()
-    target = target_per_decile or int(counts.min())
-    print(f"  Balancing to {target} questions per decile...")
+    import pyarrow.parquet as pq
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    
+    pf = pq.ParquetFile(corpus_path)
+    total_rows = pf.metadata.num_rows
+    
+    logger.info(f"Calculating decile boundaries from {total_rows:,} corpus documents...")
+    
+    # Use lists for memory efficiency (avoid repeated array creation)
+    id_to_pop: dict[int, float] = {}
+    pops_unweighted = []  # Collect popularity values directly
+    pops_weighted = []    # Collect chunk-weighted popularity values
+    docs_processed = 0
+    total_chunks = 0
+    
+    for batch in tqdm(
+        pf.iter_batches(batch_size=batch_size, columns=["wikipedia_id", "popularity_avg", "text"]),
+        total=(total_rows + batch_size - 1) // batch_size,
+        desc="Reading corpus",
+    ):
+        batch_df = batch.to_pandas()
+        batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(int)
+        
+        # Drop rows without popularity
+        valid = batch_df.dropna(subset=["popularity_avg"])
+        valid = valid[valid["popularity_avg"] >= 0]
+        
+        if len(valid) == 0:
+            del batch_df, valid
+            gc.collect()
+            continue
+        
+        # Process each row
+        for _, row in valid.iterrows():
+            wid = int(row["wikipedia_id"])
+            pop = float(row["popularity_avg"])
+            
+            # Skip duplicates (keep first occurrence)
+            if wid in id_to_pop:
+                continue
+            
+            # Count chunks
+            text_str = str(row.get("text") or "")
+            if text_str:
+                chunks = len(splitter.split_text(text_str))
+                chunks = max(1, chunks)
+            else:
+                chunks = 1
+            
+            # Store mapping
+            id_to_pop[wid] = pop
+            
+            # Append to lists (more efficient than np.repeat later)
+            pops_unweighted.append(pop)
+            pops_weighted.extend([pop] * chunks)
+            total_chunks += chunks
+        
+        docs_processed += len(batch_df)
+        del batch_df, valid
+        gc.collect()
+    
+    unique_docs = len(id_to_pop)
+    
+    logger.info(f"Processed {docs_processed:,} rows → {unique_docs:,} unique docs with popularity")
+    logger.info(f"Total chunks (after splitting): {total_chunks:,}")
+    
+    # Convert to numpy arrays (use float32 to save memory)
+    pops_unweighted = np.array(pops_unweighted, dtype=np.float32)
+    pops_weighted = np.array(pops_weighted, dtype=np.float32)
+    
+    # Calculate boundaries
+    boundaries_unweighted = np.percentile(pops_unweighted, np.linspace(0, 100, 11))
+    boundaries_weighted = np.percentile(pops_weighted, np.linspace(0, 100, 11))
+    
+    logger.info("Decile boundaries (unweighted - 1 doc = 1 count):")
+    for i in range(10):
+        logger.info(f"  Decile {i}: [{boundaries_unweighted[i]:.4f}, {boundaries_unweighted[i+1]:.4f})")
+    
+    logger.info(f"Decile boundaries (chunk-weighted - chunk_size={chunk_size}, overlap={chunk_overlap}):")
+    for i in range(10):
+        logger.info(f"  Decile {i}: [{boundaries_weighted[i]:.4f}, {boundaries_weighted[i+1]:.4f})")
+    
+    stats = {
+        "total_documents": docs_processed,
+        "unique_documents_with_popularity": unique_docs,
+        "total_chunks_after_splitting": total_chunks,
+    }
+    
+    # Clean up arrays
+    del pops_unweighted, pops_weighted
+    gc.collect()
+    
+    return boundaries_unweighted, boundaries_weighted, stats, id_to_pop
 
+
+def calculate_deciles(
+    qa_df: pd.DataFrame,
+    corpus_path: Path,
+    batch_size: int = 100_000,
+    weight_by_chunks: bool = False,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> pd.DataFrame:
+    """Calculate deciles by streaming through the corpus parquet file in batches.
+    
+    Args:
+        weight_by_chunks: If True, use chunk-weighted boundaries.
+            If False, use unweighted boundaries (1 doc = 1 count).
+        chunk_size: Chunk size for text splitting.
+        chunk_overlap: Chunk overlap for text splitting.
+    
+    Never loads the full corpus into memory.
+    """
+    if chunk_size is None:
+        chunk_size = 1000
+    if chunk_overlap is None:
+        chunk_overlap = 100
+    
+    # Calculate boundaries using the shared function
+    boundaries_unweighted, boundaries_weighted, stats, id_to_pop = calculate_corpus_decile_boundaries(
+        corpus_path=corpus_path,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    
+    # Choose which boundaries to use
+    boundaries = boundaries_weighted if weight_by_chunks else boundaries_unweighted
+    weight_label = "chunk-weighted" if weight_by_chunks else "unweighted"
+    
+    # Assign deciles via boundaries
+    decile_lookup = {}
+    for wid, pop in id_to_pop.items():
+        d = int(np.searchsorted(boundaries[1:-1], pop, side="right"))  # 0-9
+        decile_lookup[wid] = d
+    
+    del id_to_pop
+    gc.collect()
+    
+    # Map to QA dataframe
+    logger.info("Mapping deciles to QA...")
+    qa_df = qa_df.copy()
+    qa_df["decile"] = qa_df["wikipedia_id"].map(decile_lookup)
+    
+    # Also add popularity_avg if not already present
+    if "popularity_avg" not in qa_df.columns:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(corpus_path)
+        pop_lookup = {}
+        for batch in pf.iter_batches(batch_size=batch_size, columns=["wikipedia_id", "popularity_avg"]):
+            batch_df = batch.to_pandas()
+            batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(int)
+            valid = batch_df.dropna(subset=["popularity_avg"])
+            pop_lookup.update(dict(zip(valid["wikipedia_id"], valid["popularity_avg"])))
+        qa_df["popularity_avg"] = qa_df["wikipedia_id"].map(pop_lookup)
+    
+    unmapped = qa_df["decile"].isna().sum()
+    if unmapped:
+        logger.warning(f"{unmapped:,} questions not in corpus (dropping)")
+        qa_df = qa_df.dropna(subset=["decile"])
+    
+    qa_df["decile"] = qa_df["decile"].astype(int)
+    
+    dist = qa_df["decile"].value_counts().sort_index().to_dict()
+    logger.info(f"QA decile distribution ({weight_label}): {dist}")
+    logger.info(f"Total corpus docs: {stats['total_documents']:,} | Unique: {stats['unique_documents_with_popularity']:,}")
+    
+    return qa_df
+
+
+def balance_by_decile(qa_df: pd.DataFrame, target: int | None = None) -> pd.DataFrame:
+    """Downsample each decile to target count."""
+    counts = qa_df["decile"].value_counts().sort_index()
+    target = target or int(counts.min())
+    
+    logger.info(f"Balancing to {target} per decile...")
+    
     balanced = []
     for decile in range(10):
         subset = qa_df[qa_df["decile"] == decile]
-        if len(subset) > target:
-            subset = subset.sample(n=target, random_state=random_state)
+        n = len(subset)
+        if n > target:
+            subset = subset.sample(n=target, random_state=42)
+            logger.debug(f"Decile {decile}: {n:,} → {target}")
+        elif n < target:
+            logger.warning(f"Decile {decile}: {n:,} (short by {target - n})")
         balanced.append(subset)
-
+    
     result = pd.concat(balanced, ignore_index=True)
-    print(f"✓ Balanced: {len(result):,} questions ({target} × 10 deciles)")
-    print(f"  Distribution:\n{result['decile'].value_counts().sort_index()}")
+    logger.info(f"Balanced to {len(result):,} questions ({target} x 10)")
     return result
 
 
-# ============================================================================
-# 4. SYNTHETIC QUESTION GENERATION
-# ============================================================================
-
-
-def load_prompt(prompt_path: Path | None = None) -> str:
-    """Load the question generation prompt template."""
-    path = prompt_path or DEFAULT_PROMPT_PATH
-    if path.exists():
-        return path.read_text().strip()
-    logger.warning(f"Prompt {path} not found, using default")
-    return DEFAULT_PROMPT
-
-
-def load_corpus(corpus_path: Path, text_field: str = DEFAULT_TEXT_FIELD) -> pd.DataFrame:
-    """Load a corpus parquet and validate required columns."""
-    df = pd.read_parquet(corpus_path)
-    required = {text_field, "wikipedia_id", "decile"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Corpus missing columns: {missing}. Available: {list(df.columns)}")
-    df["wikipedia_id"] = pd.to_numeric(df["wikipedia_id"], errors="coerce").astype(int)
-    df["decile"] = pd.to_numeric(df["decile"], errors="coerce").fillna(-1).astype(int)
-    return df
-
-
-async def _generate_for_decile(
-    corpus_df: pd.DataFrame,
-    decile: int,
-    needed: int,
-    *,
-    llm,
-    prompt_template: str,
-    text_field: str,
-    max_passage_chars: int,
-    batch_size: int,
+def sample_corpus_by_decile(
+    corpus_path: Path,
+    samples_per_decile: dict[int, int],
+    columns: list[str] = ["wikipedia_id", "wikipedia_title", "text"],
+    text_limit: int = 2000,
+    seed: int = 42,
 ) -> list[dict]:
-    """Generate synthetic questions for one decile."""
-    decile_docs = corpus_df[corpus_df["decile"] == decile]
-    if decile_docs.empty:
-        return []
+    """Sample documents from corpus using reservoir sampling on filtered batches.
+    
+    Never loads more than needed into RAM - uses streaming with early termination.
+    """
+    import pyarrow.parquet as pq
+    import random
+    
+    random.seed(seed)
+    sampled_docs = []
+    
+    for decile, needed in tqdm(samples_per_decile.items(), desc="Sampling corpus"):
+        pf = pq.ParquetFile(corpus_path)
+        
+        # Reservoir sampling: maintain exactly 'needed' samples
+        reservoir = []
+        count = 0
+        
+        # Stream batches
+        for batch in pf.iter_batches(batch_size=50_000, columns=columns + ["decile"]):
+            batch_df = batch.to_pandas()
+            
+            # Filter to this decile
+            batch_df = batch_df[batch_df["decile"] == decile]
+            
+            for _, row in batch_df.iterrows():
+                count += 1
+                
+                if len(reservoir) < needed:
+                    # Fill reservoir
+                    doc = {col: row[col] for col in columns}
+                    doc["decile"] = decile
+                    if "text" in doc and doc["text"]:
+                        doc["text"] = doc["text"][:text_limit]
+                    reservoir.append(doc)
+                else:
+                    # Reservoir sampling: replace with probability needed/count
+                    j = random.randint(0, count - 1)
+                    if j < needed:
+                        doc = {col: row[col] for col in columns}
+                        doc["decile"] = decile
+                        if "text" in doc and doc["text"]:
+                            doc["text"] = doc["text"][:text_limit]
+                        reservoir[j] = doc
+            
+            del batch_df
+            
+            # Early termination: if reservoir is full and we've seen enough samples
+            if len(reservoir) >= needed and count > needed * 10:
+                break
+        
+        if len(reservoir) == 0:
+            logger.warning(f"Decile {decile}: no documents found")
+        else:
+            sampled_docs.extend(reservoir)
+            logger.info(f"Decile {decile}: sampled {len(reservoir)} / {count}")
+        
+        del pf
+    
+    gc.collect()
+    return sampled_docs
 
-    sampled = decile_docs.sample(
-        n=needed, replace=(needed > len(decile_docs)), random_state=42 + decile
-    )
 
-    async def _gen_one(row):
-        text = str(row[text_field])[:max_passage_chars]
-        prompt = prompt_template.format(passage=text)
+def generate_questions_from_docs(
+    docs: list[dict],
+    prompt_template: str,
+    model_name: str = "gpt-4.1-nano",
+) -> list[dict]:
+    """Generate synthetic questions from sampled documents."""
+    from llm.openAi_service import OpenAIService
+    
+    service = OpenAIService(model_name=model_name)
+    questions = []
+    
+    for doc in tqdm(docs, desc="Generating questions"):
         try:
-            response = await llm.ainvoke(prompt)
-            question = response.strip()
-            if not question:
-                return None
-            return {
-                "question_text": question,
+            prompt = prompt_template.format(passage=doc.get("text", ""))
+            question_text = service.invoke(prompt)
+            
+            questions.append({
+                "question_id": f"syn_{doc['decile']}_{len(questions)}",
+                "question_text": question_text.strip(),
                 "answer_texts": [],
-                "wikipedia_id": int(row["wikipedia_id"]),
-                "wikipedia_title": row.get("wikipedia_title"),
+                "wikipedia_id": doc["wikipedia_id"],
+                "wikipedia_title": doc.get("wikipedia_title", ""),
+                "decile": doc["decile"],
                 "dataset": "synthetic",
-                "decile": decile,
-                "is_synthetic": True,
-                "popularity_avg": row.get("popularity_avg"),
-                "popularity_rank": row.get("popularity_rank"),
-            }
+            })
         except Exception as e:
-            logger.debug(f"Generation failed for doc {row['wikipedia_id']}: {e}")
-            return None
-
-    tasks = [_gen_one(row) for _, row in sampled.iterrows()]
-    results = []
-    for start in range(0, len(tasks), batch_size):
-        batch = tasks[start : start + batch_size]
-        for coro in tqdm(
-            asyncio.as_completed(batch),
-            total=len(batch),
-            desc=f"Decile {decile}",
-            leave=False,
-        ):
-            result = await coro
-            if result:
-                results.append(result)
-    return results
-
-
-def _run_async(coro):
-    """Run async coroutine, handling Jupyter / nested event loops."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    else:
-        import nest_asyncio
-        nest_asyncio.apply()
-        return loop.run_until_complete(coro)
+            logger.warning(f"Failed: {e}")
+    
+    return questions
 
 
 def generate_synthetic(
     qa_df: pd.DataFrame,
     corpus_path: Path,
-    *,
-    questions_per_decile: int = DEFAULT_QUESTIONS_PER_DECILE,
-    model_name: str = DEFAULT_MODEL,
+    questions_per_decile: int = 100,
+    model_name: str = "gpt-4.1-nano",
     prompt_path: Path | None = None,
-    text_field: str = DEFAULT_TEXT_FIELD,
-    max_passage_chars: int = DEFAULT_MAX_PASSAGE_CHARS,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    temperature: float = 0.7,
+    **kwargs,
 ) -> pd.DataFrame:
-    """Augment a QA DataFrame with synthetic questions to reach target per decile.
-
-    Only generates for deciles that have fewer than ``questions_per_decile``.
-
-    Args:
-        qa_df: Existing QA with ``decile`` column.
-        corpus_path: Path to the wiki corpus parquet.
-        questions_per_decile: Target count per decile.
-        model_name: OpenAI model to use.
-        prompt_path: Custom prompt template file.
-        text_field: Text column name in corpus.
-        max_passage_chars: Max passage characters in prompt.
-        batch_size: Concurrent generation batch size.
-        temperature: LLM temperature.
-
-    Returns:
-        Augmented QA DataFrame (existing + new synthetic rows).
-    """
-    from llm.openAi_service import OpenAIService
-
-    prompt_template = load_prompt(prompt_path)
-    corpus_df = load_corpus(corpus_path, text_field=text_field)
-    llm = OpenAIService(temperature=temperature, request_timeout=None, model_name=model_name)
-    print(f"  LLM initialized: {model_name}")
-
-    all_dfs = []
+    """Generate synthetic questions for underrepresented deciles."""
+    
+    # Load prompt
+    prompt_path = prompt_path or SYTHETNIC_QA_PROMPT_PATH
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Prompt not found: {prompt_path}")
+    
+    prompt_template = prompt_path.read_text().strip()
+    logger.info(f"Loaded prompt from {prompt_path}")
+    
+    # Determine what's needed per decile
+    existing = qa_df["decile"].value_counts().to_dict() if len(qa_df) > 0 else {}
+    samples_needed = {}
+    
     for decile in range(10):
-        existing = qa_df[qa_df["decile"] == decile] if "decile" in qa_df.columns else pd.DataFrame()
-        current = len(existing)
-
-        if current >= questions_per_decile:
-            all_dfs.append(existing)
-            print(f"  Decile {decile}: {current} existing (>= {questions_per_decile}) — kept")
-            continue
-
-        all_dfs.append(existing)
+        current = existing.get(decile, 0)
         needed = questions_per_decile - current
-        print(f"  Decile {decile}: {current} existing → generating {needed}...")
-
-        new_qs = _run_async(
-            _generate_for_decile(
-                corpus_df, decile, needed,
-                llm=llm,
-                prompt_template=prompt_template,
-                text_field=text_field,
-                max_passage_chars=max_passage_chars,
-                batch_size=batch_size,
-            )
-        )
-        if new_qs:
-            all_dfs.append(pd.DataFrame(new_qs))
-            print(f"    Generated {len(new_qs)}")
-        if len(new_qs) < needed:
-            print(f"    Shortfall: {needed - len(new_qs)}")
-
-    result = pd.concat(all_dfs, ignore_index=True)
-    result["wikipedia_id"] = result["wikipedia_id"].astype(int)
-    print(f"✓ Augmented: {len(result):,} total questions")
-    return result
-
-
-# ============================================================================
-# 5. FULL PIPELINE
-# ============================================================================
-
-
-def prepare_qa_dataset(
-    *,
-    qa_datasets: Sequence[str] | None = None,
-    existing_qa_path: Path | None = None,
-    popularity_dataset: str = DEFAULT_POPULARITY_DATASET,
-    output_path: Path,
-    balance: bool = False,
-    target_per_decile: int | None = None,
-    generate_synthetic_flag: bool = False,
-    corpus_path: Path | None = None,
-    questions_per_decile: int = DEFAULT_QUESTIONS_PER_DECILE,
-    model_name: str = DEFAULT_MODEL,
-    prompt_path: Path | None = None,
-    text_field: str = DEFAULT_TEXT_FIELD,
-    max_passage_chars: int = DEFAULT_MAX_PASSAGE_CHARS,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    temperature: float = 0.7,
-    hf_repo: str = DEFAULT_HF_QA_REPO,
-    cache_dir: Path | str | None = None,
-) -> pd.DataFrame:
-    """End-to-end QA preparation: load → filter → enrich → generate → balance → save.
-
-    At least one of ``qa_datasets`` or ``existing_qa_path`` must be provided
-    (unless using pure synthetic mode with ``generate_synthetic_flag=True``).
-
-    If ``corpus_path`` is provided, filters QA to only include questions whose
-    ``wikipedia_id`` exists in the corpus (ensures all questions are answerable).
-
-    Returns:
-        Final QA DataFrame.
-    """
-    # ── Load ─────────────────────────────────────────────────────────────
-    dfs: list[pd.DataFrame] = []
-
-    if qa_datasets:
-        print(f"\n📥 Loading QA datasets: {qa_datasets}")
-        dfs.append(load_qa_datasets(qa_datasets, hf_repo=hf_repo, cache_dir=cache_dir))
-
-    if existing_qa_path and existing_qa_path.exists():
-        dfs.append(load_existing_qa(existing_qa_path))
-
-    if not dfs and not generate_synthetic_flag:
-        raise ValueError("Provide --qa-datasets and/or --existing-qa (or use --generate-synthetic)")
-
-    if dfs:
-        qa_df = pd.concat(dfs, ignore_index=True)
-
-        # Deduplicate by (wikipedia_id, question_text) if merging
-        if len(dfs) > 1 and "question_text" in qa_df.columns:
-            before = len(qa_df)
-            qa_df = qa_df.drop_duplicates(subset=["wikipedia_id", "question_text"], keep="first")
-            dupes = before - len(qa_df)
-            if dupes:
-                print(f"  Removed {dupes:,} duplicate questions")
-
-        print(f"\n📊 Combined QA: {len(qa_df):,} questions")
-
-        # ── Filter to corpus ─────────────────────────────────────────────
-        if corpus_path and corpus_path.exists():
-            print(f"\n🔍 Filtering QA to match corpus...")
-            corpus_ids = set(
-                pd.read_parquet(corpus_path, columns=["wikipedia_id"])["wikipedia_id"].astype(int)
-            )
-            before = len(qa_df)
-            qa_df = qa_df[qa_df["wikipedia_id"].isin(corpus_ids)].copy()
-            removed = before - len(qa_df)
-            if removed:
-                print(f"  Removed {removed:,} questions not in corpus ({before:,} → {len(qa_df):,})")
-            else:
-                print(f"  ✓ All {len(qa_df):,} questions exist in corpus")
-
-        # ── Enrich ───────────────────────────────────────────────────────
-        if "decile" not in qa_df.columns or (qa_df["decile"] == -1).any():
-            print(f"\n📈 Enriching with popularity deciles...")
-            qa_df = enrich_with_deciles(qa_df, popularity_dataset, cache_dir=cache_dir)
-        else:
-            print(f"\n✓ Deciles already present")
-    else:
-        # Pure synthetic mode — start from empty DataFrame
-        print("\n📊 No existing QA provided — generating all questions synthetically")
-        qa_df = pd.DataFrame(columns=[
-            "question_text", "answer_texts", "wikipedia_id", "wikipedia_title",
-            "dataset", "decile", "is_synthetic", "popularity_avg", "popularity_rank",
-        ])
-
-    # ── Generate synthetic ───────────────────────────────────────────────
-    if generate_synthetic_flag:
-        if corpus_path is None or not corpus_path.exists():
-            raise ValueError("--corpus required for synthetic generation")
-        print(f"\n🤖 Generating synthetic questions (target: {questions_per_decile}/decile)...")
-        qa_df = generate_synthetic(
-            qa_df,
-            corpus_path,
-            questions_per_decile=questions_per_decile,
-            model_name=model_name,
-            prompt_path=prompt_path,
-            text_field=text_field,
-            max_passage_chars=max_passage_chars,
-            batch_size=batch_size,
-            temperature=temperature,
-        )
-
-    # ── Balance ──────────────────────────────────────────────────────────
-    if balance:
-        print(f"\n⚖️ Balancing...")
-        qa_df = balance_by_decile(qa_df, target_per_decile=target_per_decile)
-
-    # ── Save ─────────────────────────────────────────────────────────────
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    qa_df.to_parquet(output_path, index=False, engine="pyarrow")
-
-    print(f"\n✅ Done: {len(qa_df):,} questions saved to {output_path}")
-    if "decile" in qa_df.columns:
-        print(f"Distribution:\n{qa_df['decile'].value_counts().sort_index()}")
-    if "dataset" in qa_df.columns:
-        print(f"Sources:\n{qa_df['dataset'].value_counts()}")
-
+        if needed > 0:
+            samples_needed[decile] = needed
+            logger.info(f"Decile {decile}: need {needed} ({current} existing)")
+    
+    if not samples_needed:
+        logger.info("All deciles have sufficient questions")
+        return qa_df
+    
+    # Sample documents
+    docs = sample_corpus_by_decile(corpus_path, samples_needed)
+    
+    # Generate questions
+    new_questions = generate_questions_from_docs(docs, prompt_template, model_name)
+    
+    if new_questions:
+        qa_df = pd.concat([qa_df, pd.DataFrame(new_questions)], ignore_index=True)
+        logger.info(f"Added {len(new_questions)} synthetic questions")
+    
     return qa_df
 
 
-# ============================================================================
-# CLI
-# ============================================================================
+def prepare_qa_dataset(
+    qa_datasets: list[str] | None = None,
+    existing_qa_path: Path | None = None,
+    corpus_path: Path | None = None,
+    popularity_dataset: str = DEFAULT_POPULARITY_DATASET,
+    output_path: Path = None,
+    balance: bool = False,
+    target_per_decile: int | None = None,
+    generate_synthetic: bool = False,
+    questions_per_decile: int | None = None,
+    model_name: str = "gpt-4.1-nano",
+    hf_repo: str = DEFAULT_HF_QA_REPO,
+    cache_dir: str | None = None,
+    **kwargs,
+) -> pd.DataFrame:
+    """Main pipeline: load → filter → enrich → [synthetic] → balance → save."""
+    
+    logger.info("PREPARE QA DATASET")
+    
+    # Load
+    logger.info("[1/4] LOAD")
+    dfs = []
+    if qa_datasets:
+        dfs.append(load_qa_datasets(qa_datasets, hf_repo, cache_dir))
+    if existing_qa_path and existing_qa_path.exists():
+        df = pd.read_parquet(existing_qa_path)
+        df["wikipedia_id"] = df["wikipedia_id"].astype(int)
+        logger.info(f"Loaded {len(df):,} from {existing_qa_path.name}")
+        dfs.append(df)
+    
+    if not dfs:
+        if generate_synthetic:
+            # Synthetic-only mode: start with empty dataframe
+            if not corpus_path or not corpus_path.exists():
+                raise ValueError("--corpus required for synthetic-only generation")
+            logger.info("Synthetic-only mode: starting with empty QA set")
+            qa_df = pd.DataFrame(columns=["question_id", "question_text", "answer_texts", "wikipedia_id", "wikipedia_title", "decile", "dataset"])
+        else:
+            raise ValueError("Provide --qa-datasets or --existing-qa (or use --generate-synthetic with --corpus)")
+    else:
+        qa_df = pd.concat(dfs, ignore_index=True)
+    logger.info(f"Total: {len(qa_df):,} questions")
+    
+    # Filter
+    logger.info("[2/4] FILTER TO CORPUS")
+    if len(qa_df) == 0:
+        logger.info("(empty QA, skipping filter)")
+    elif corpus_path and corpus_path.exists():
+        qa_df = filter_to_corpus(qa_df, corpus_path)
+    else:
+        logger.info("(no corpus filter)")
+    
+    # Enrich
+    logger.info("[3/4] ASSIGN DECILES")
+    if len(qa_df) == 0:
+        logger.info("(empty QA, skipping decile assignment)")
+    else:
+        logger.info("Calculating deciles from corpus...")
+        if not corpus_path or not corpus_path.exists():
+            raise ValueError("--corpus required to calculate deciles")
+        qa_df = calculate_deciles(qa_df, corpus_path)
+    
+    # Synthetic generation
+    if generate_synthetic:
+        logger.info("[4/5] SYNTHETIC GENERATION")
+        if not corpus_path or not corpus_path.exists():
+            raise ValueError("--corpus required for synthetic generation")
+        target = questions_per_decile or target_per_decile or 100
+        qa_df = generate_synthetic_fn(
+            qa_df,
+            corpus_path=corpus_path,
+            questions_per_decile=target,
+            model_name=model_name,
+        )
+    
+    # Balance
+    logger.info("[5/5] BALANCE" if generate_synthetic else "[4/4] BALANCE")
+    if balance:
+        qa_df = balance_by_decile(qa_df, target_per_decile)
+    else:
+        logger.info("(skipped)")
+    
+    # Save
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_df.to_parquet(output_path, index=False)
+    
+    logger.info(f"Saved {len(qa_df):,} questions to {output_path}")
+    logger.info(f"Distribution: {qa_df['decile'].value_counts().sort_index().to_dict()}")
+    
+    return qa_df
+
+
+# Alias for internal use (avoid name collision with parameter)
+generate_synthetic_fn = generate_synthetic
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Prepare QA datasets: load, enrich, balance, generate.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument("--qa-datasets", nargs="*", default=None,
-                   help="HuggingFace QA config names (e.g. natural_questions triviaqa).")
-    p.add_argument("--existing-qa", type=Path, default=None,
-                   help="Existing QA parquet to load/merge.")
-    p.add_argument("--popularity-dataset", default=DEFAULT_POPULARITY_DATASET,
-                   help="HuggingFace popularity dataset.")
-    p.add_argument("--output", type=Path, required=True,
-                   help="Output parquet path.")
-    p.add_argument("--balance", action="store_true",
-                   help="Balance deciles (downsample to smallest).")
-    p.add_argument("--target-per-decile", type=int, default=None,
-                   help="Explicit per-decile target for balancing.")
-    p.add_argument("--generate-synthetic", action="store_true",
-                   help="Generate synthetic questions for under-represented deciles.")
-    p.add_argument("--corpus", type=Path, default=None,
-                   help="Corpus parquet (required if --generate-synthetic).")
-    p.add_argument("--questions-per-decile", type=int, default=DEFAULT_QUESTIONS_PER_DECILE,
-                   help=f"Synthetic target per decile (default: {DEFAULT_QUESTIONS_PER_DECILE}).")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"OpenAI model for generation (default: {DEFAULT_MODEL}).")
-    p.add_argument("--prompt", type=Path, default=None,
-                   help="Custom prompt template file.")
-    p.add_argument("--text-field", default=DEFAULT_TEXT_FIELD,
-                   help=f"Corpus text column (default: {DEFAULT_TEXT_FIELD}).")
-    p.add_argument("--max-chars", type=int, default=DEFAULT_MAX_PASSAGE_CHARS,
-                   help=f"Max passage chars (default: {DEFAULT_MAX_PASSAGE_CHARS}).")
-    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                   help=f"LLM batch size (default: {DEFAULT_BATCH_SIZE}).")
-    p.add_argument("--temperature", type=float, default=0.7,
-                   help="LLM temperature (default: 0.7).")
-    p.add_argument("--hf-repo", default=DEFAULT_HF_QA_REPO,
-                   help=f"HuggingFace QA repo (default: {DEFAULT_HF_QA_REPO}).")
-    p.add_argument("--cache-dir", type=Path, default=None,
-                   help="HuggingFace cache directory.")
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--qa-datasets", nargs="*")
+    p.add_argument("--existing-qa", type=Path)
+    p.add_argument("--corpus", type=Path)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--popularity-dataset", default=DEFAULT_POPULARITY_DATASET)
+    p.add_argument("--balance", action="store_true")
+    p.add_argument("--target-per-decile", type=int)
+    p.add_argument("--generate-synthetic", action="store_true", help="Generate synthetic questions for underrepresented deciles")
+    p.add_argument("--questions-per-decile", type=int, help="Target questions per decile for synthetic generation")
+    p.add_argument("--model-name", default="gpt-4.1-nano", help="OpenAI model for synthetic generation")
+    p.add_argument("--hf-repo", default=DEFAULT_HF_QA_REPO)
+    p.add_argument("--cache-dir", type=Path)
+    
     args = p.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
+    logging.basicConfig(level=logging.INFO)
+    
     prepare_qa_dataset(
         qa_datasets=args.qa_datasets,
         existing_qa_path=args.existing_qa,
+        corpus_path=args.corpus,
         popularity_dataset=args.popularity_dataset,
         output_path=args.output,
         balance=args.balance,
         target_per_decile=args.target_per_decile,
-        generate_synthetic_flag=args.generate_synthetic,
-        corpus_path=args.corpus,
+        generate_synthetic=args.generate_synthetic,
         questions_per_decile=args.questions_per_decile,
-        model_name=args.model,
-        prompt_path=args.prompt,
-        text_field=args.text_field,
-        max_passage_chars=args.max_chars,
-        batch_size=args.batch_size,
-        temperature=args.temperature,
+        model_name=args.model_name,
         hf_repo=args.hf_repo,
-        cache_dir=args.cache_dir,
+        cache_dir=str(args.cache_dir) if args.cache_dir else None,
     )
 
 
