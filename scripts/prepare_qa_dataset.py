@@ -14,6 +14,16 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import DATA_DIR, CACHE_DIR, SYTHETNIC_QA_PROMPT_PATH
+from helpers.decile_utils import (
+    compute_corpus_boundaries as _compute_corpus_boundaries,
+    assign_decile,
+    assign_both_deciles,
+    boundaries_to_metadata,
+    COL_DECILE_UNWEIGHTED,
+    COL_DECILE_CHUNK_WEIGHTED,
+    COL_POPULARITY,
+    NUM_DECILES,
+)
 
 
 DEFAULT_HF_QA_REPO = "Cyro1/popularity-enriched-qa-datasets"
@@ -78,121 +88,18 @@ def calculate_corpus_decile_boundaries(
     batch_size: int = 100_000,
     chunk_size: int = 1000,
     chunk_overlap: int = 100,
-) -> tuple[np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, dict, dict[int, float]]:
     """Calculate both unweighted and chunk-weighted decile boundaries from corpus.
-    
-    Memory-efficient streaming implementation.
-    
-    Args:
-        corpus_path: Path to corpus parquet file
-        batch_size: Batch size for streaming
-        chunk_size: Chunk size for text splitting
-        chunk_overlap: Chunk overlap for text splitting
-    
-    Returns:
-        Tuple of (boundaries_unweighted, boundaries_weighted, stats_dict, id_to_pop)
-        Both boundaries are arrays of length 11 (0th, 10th, ..., 100th percentiles)
-    
-    Never loads the full corpus into memory.
+
+    Delegates to ``rag.decile_utils.compute_corpus_boundaries`` — kept here
+    for backward compatibility with callers that import from this module.
     """
-    import pyarrow.parquet as pq
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    
-    splitter = RecursiveCharacterTextSplitter(
+    return _compute_corpus_boundaries(
+        corpus_path=corpus_path,
+        batch_size=batch_size,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    
-    pf = pq.ParquetFile(corpus_path)
-    total_rows = pf.metadata.num_rows
-    
-    logger.info(f"Calculating decile boundaries from {total_rows:,} corpus documents...")
-    
-    # Use lists for memory efficiency (avoid repeated array creation)
-    id_to_pop: dict[int, float] = {}
-    pops_unweighted = []  # Collect popularity values directly
-    pops_weighted = []    # Collect chunk-weighted popularity values
-    docs_processed = 0
-    total_chunks = 0
-    
-    for batch in tqdm(
-        pf.iter_batches(batch_size=batch_size, columns=["wikipedia_id", "popularity_avg", "text"]),
-        total=(total_rows + batch_size - 1) // batch_size,
-        desc="Reading corpus",
-    ):
-        batch_df = batch.to_pandas()
-        batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(int)
-        
-        # Drop rows without popularity
-        valid = batch_df.dropna(subset=["popularity_avg"])
-        valid = valid[valid["popularity_avg"] >= 0]
-        
-        if len(valid) == 0:
-            del batch_df, valid
-            gc.collect()
-            continue
-        
-        # Process each row
-        for _, row in valid.iterrows():
-            wid = int(row["wikipedia_id"])
-            pop = float(row["popularity_avg"])
-            
-            # Skip duplicates (keep first occurrence)
-            if wid in id_to_pop:
-                continue
-            
-            # Count chunks
-            text_str = str(row.get("text") or "")
-            if text_str:
-                chunks = len(splitter.split_text(text_str))
-                chunks = max(1, chunks)
-            else:
-                chunks = 1
-            
-            # Store mapping
-            id_to_pop[wid] = pop
-            
-            # Append to lists (more efficient than np.repeat later)
-            pops_unweighted.append(pop)
-            pops_weighted.extend([pop] * chunks)
-            total_chunks += chunks
-        
-        docs_processed += len(batch_df)
-        del batch_df, valid
-        gc.collect()
-    
-    unique_docs = len(id_to_pop)
-    
-    logger.info(f"Processed {docs_processed:,} rows → {unique_docs:,} unique docs with popularity")
-    logger.info(f"Total chunks (after splitting): {total_chunks:,}")
-    
-    # Convert to numpy arrays (use float32 to save memory)
-    pops_unweighted = np.array(pops_unweighted, dtype=np.float32)
-    pops_weighted = np.array(pops_weighted, dtype=np.float32)
-    
-    # Calculate boundaries
-    boundaries_unweighted = np.percentile(pops_unweighted, np.linspace(0, 100, 11))
-    boundaries_weighted = np.percentile(pops_weighted, np.linspace(0, 100, 11))
-    
-    logger.info("Decile boundaries (unweighted - 1 doc = 1 count):")
-    for i in range(10):
-        logger.info(f"  Decile {i}: [{boundaries_unweighted[i]:.4f}, {boundaries_unweighted[i+1]:.4f})")
-    
-    logger.info(f"Decile boundaries (chunk-weighted - chunk_size={chunk_size}, overlap={chunk_overlap}):")
-    for i in range(10):
-        logger.info(f"  Decile {i}: [{boundaries_weighted[i]:.4f}, {boundaries_weighted[i+1]:.4f})")
-    
-    stats = {
-        "total_documents": docs_processed,
-        "unique_documents_with_popularity": unique_docs,
-        "total_chunks_after_splitting": total_chunks,
-    }
-    
-    # Clean up arrays
-    del pops_unweighted, pops_weighted
-    gc.collect()
-    
-    return boundaries_unweighted, boundaries_weighted, stats, id_to_pop
 
 
 def calculate_deciles(
@@ -203,71 +110,107 @@ def calculate_deciles(
     chunk_size: int | None = None,
     chunk_overlap: int | None = None,
 ) -> pd.DataFrame:
-    """Calculate deciles by streaming through the corpus parquet file in batches.
-    
-    Args:
-        weight_by_chunks: If True, use chunk-weighted boundaries.
-            If False, use unweighted boundaries (1 doc = 1 count).
-        chunk_size: Chunk size for text splitting.
-        chunk_overlap: Chunk overlap for text splitting.
-    
-    Never loads the full corpus into memory.
+    """Assign **both** decile columns to the QA dataframe.
+
+    Uses ``rag.decile_utils`` for all boundary computation and bin
+    assignment so that retrieval and evaluation notebooks produce
+    identical labels.
+
+    The legacy ``decile`` column is kept for backward compatibility
+    and mirrors whichever mode *weight_by_chunks* selects.
     """
-    if chunk_size is None:
-        chunk_size = 1000
-    if chunk_overlap is None:
-        chunk_overlap = 100
-    
-    # Calculate boundaries using the shared function
-    boundaries_unweighted, boundaries_weighted, stats, id_to_pop = calculate_corpus_decile_boundaries(
+    chunk_size = chunk_size or 1000
+    chunk_overlap = chunk_overlap or 100
+
+    # 1. Boundaries
+    boundaries_uw, boundaries_cw, stats, id_to_pop = calculate_corpus_decile_boundaries(
         corpus_path=corpus_path,
         batch_size=batch_size,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    
-    # Choose which boundaries to use
-    boundaries = boundaries_weighted if weight_by_chunks else boundaries_unweighted
-    weight_label = "chunk-weighted" if weight_by_chunks else "unweighted"
-    
-    # Assign deciles via boundaries
-    decile_lookup = {}
-    for wid, pop in id_to_pop.items():
-        d = int(np.searchsorted(boundaries[1:-1], pop, side="right"))  # 0-9
-        decile_lookup[wid] = d
-    
+
+    # 2. Build a tiny lookup DataFrame so we can use assign_both_deciles
+    pop_df = pd.DataFrame([
+        {"wikipedia_id": wid, COL_POPULARITY: pop}
+        for wid, pop in id_to_pop.items()
+    ])
+    pop_df = assign_both_deciles(pop_df, boundaries_uw, boundaries_cw,
+                                 popularity_col=COL_POPULARITY, drop_missing=False)
+
     del id_to_pop
     gc.collect()
-    
-    # Map to QA dataframe
-    logger.info("Mapping deciles to QA...")
+
+    # 3. Map both decile columns onto the QA frame
     qa_df = qa_df.copy()
-    qa_df["decile"] = qa_df["wikipedia_id"].map(decile_lookup)
-    
-    # Also add popularity_avg if not already present
-    if "popularity_avg" not in qa_df.columns:
-        import pyarrow.parquet as pq
-        pf = pq.ParquetFile(corpus_path)
-        pop_lookup = {}
-        for batch in pf.iter_batches(batch_size=batch_size, columns=["wikipedia_id", "popularity_avg"]):
-            batch_df = batch.to_pandas()
-            batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(int)
-            valid = batch_df.dropna(subset=["popularity_avg"])
-            pop_lookup.update(dict(zip(valid["wikipedia_id"], valid["popularity_avg"])))
-        qa_df["popularity_avg"] = qa_df["wikipedia_id"].map(pop_lookup)
-    
-    unmapped = qa_df["decile"].isna().sum()
+    lookup_uw = pop_df.set_index("wikipedia_id")[COL_DECILE_UNWEIGHTED]
+    lookup_cw = pop_df.set_index("wikipedia_id")[COL_DECILE_CHUNK_WEIGHTED]
+
+    qa_df[COL_DECILE_UNWEIGHTED] = qa_df["wikipedia_id"].map(lookup_uw)
+    qa_df[COL_DECILE_CHUNK_WEIGHTED] = qa_df["wikipedia_id"].map(lookup_cw)
+
+    # Legacy column — mirrors the chosen mode
+    legacy_col = COL_DECILE_CHUNK_WEIGHTED if weight_by_chunks else COL_DECILE_UNWEIGHTED
+    qa_df["decile"] = qa_df[legacy_col]
+
+    unmapped = qa_df[COL_DECILE_UNWEIGHTED].isna().sum()
     if unmapped:
-        logger.warning(f"{unmapped:,} questions not in corpus (dropping)")
-        qa_df = qa_df.dropna(subset=["decile"])
-    
-    qa_df["decile"] = qa_df["decile"].astype(int)
-    
+        logger.warning("%s questions not in corpus (dropping)", f"{unmapped:,}")
+        qa_df = qa_df.dropna(subset=[COL_DECILE_UNWEIGHTED, COL_DECILE_CHUNK_WEIGHTED])
+
+    for col in (COL_DECILE_UNWEIGHTED, COL_DECILE_CHUNK_WEIGHTED, "decile"):
+        qa_df[col] = qa_df[col].astype(int)
+
+    weight_label = "chunk-weighted" if weight_by_chunks else "unweighted"
     dist = qa_df["decile"].value_counts().sort_index().to_dict()
-    logger.info(f"QA decile distribution ({weight_label}): {dist}")
-    logger.info(f"Total corpus docs: {stats['total_documents']:,} | Unique: {stats['unique_documents_with_popularity']:,}")
-    
+    logger.info("QA decile distribution (%s): %s", weight_label, dist)
+    logger.info("Total corpus docs: %s | Unique: %s",
+                f"{stats['total_documents']:,}",
+                f"{stats['unique_documents_with_popularity']:,}")
+
     return qa_df
+
+
+def balance_per_dataset(qa_df: pd.DataFrame, total_target: int | None = None) -> pd.DataFrame:
+    """Equalise question count across datasets using a fill-from-bottom approach.
+
+    Distributes *total_target* questions evenly across datasets.  Datasets that
+    have fewer samples than their equal share contribute everything they have;
+    their unused quota is redistributed proportionally to the remaining datasets.
+
+    Examples (total_target=5000, 2 datasets):
+      ds_x=120k, ds_y=10k  →  2500 + 2500  (equal split)
+      ds_x=120k, ds_y=5    →  4995 + 5     (ds_y exhausted; remainder to ds_x)
+
+    If *total_target* is None, defaults to min(dataset_sizes) × n_datasets.
+    """
+    if "dataset" not in qa_df.columns:
+        logger.warning("No 'dataset' column — skipping per-dataset balancing")
+        return qa_df
+
+    groups = {d: qa_df[qa_df["dataset"] == d] for d in qa_df["dataset"].unique()}
+    # Sort smallest first so underflows are resolved before larger datasets
+    datasets_sorted = sorted(groups, key=lambda d: len(groups[d]))
+    n = len(datasets_sorted)
+
+    if total_target is None:
+        total_target = len(groups[datasets_sorted[0]]) * n  # min × n
+
+    remaining_quota = total_target
+    result_parts = []
+    for i, ds in enumerate(datasets_sorted):
+        remaining_n = n - i
+        per_ds = remaining_quota // remaining_n
+        available = len(groups[ds])
+        take = min(available, per_ds)
+        part = groups[ds].sample(n=take, random_state=42) if take < available else groups[ds]
+        result_parts.append(part)
+        remaining_quota -= take
+        logger.info(f"  Per-dataset [{ds}]: {available:,} available → {take:,} taken")
+
+    result = pd.concat(result_parts, ignore_index=True)
+    logger.info(f"After per-dataset balance: {len(result):,} questions total")
+    return result
 
 
 def balance_by_decile(qa_df: pd.DataFrame, target: int | None = None) -> pd.DataFrame:
@@ -446,12 +389,16 @@ def prepare_qa_dataset(
     popularity_dataset: str = DEFAULT_POPULARITY_DATASET,
     output_path: Path = None,
     balance: bool = False,
+    balance_datasets: bool = False,
     target_per_decile: int | None = None,
     generate_synthetic: bool = False,
     questions_per_decile: int | None = None,
     model_name: str = "gpt-4.1-nano",
     hf_repo: str = DEFAULT_HF_QA_REPO,
     cache_dir: str | None = None,
+    weight_by_chunks: bool = False,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 100,
     **kwargs,
 ) -> pd.DataFrame:
     """Main pipeline: load → filter → enrich → [synthetic] → balance → save."""
@@ -499,7 +446,16 @@ def prepare_qa_dataset(
         logger.info("Calculating deciles from corpus...")
         if not corpus_path or not corpus_path.exists():
             raise ValueError("--corpus required to calculate deciles")
-        qa_df = calculate_deciles(qa_df, corpus_path)
+        
+        if weight_by_chunks:
+            if chunk_size is None or chunk_overlap is None:
+                raise ValueError("chunk_size and chunk_overlap must be provided when weight_by_chunks is True")
+
+            logger.info(f"Using chunk-weighted deciles (chunk_size={chunk_size}, chunk_overlap={chunk_overlap})")
+            qa_df = calculate_deciles(qa_df, corpus_path, weight_by_chunks=weight_by_chunks, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        else:
+            logger.info("Using unweighted deciles (1 doc = 1 count)")
+            qa_df = calculate_deciles(qa_df, corpus_path)
     
     # Synthetic generation
     if generate_synthetic:
@@ -514,6 +470,13 @@ def prepare_qa_dataset(
             model_name=model_name,
         )
     
+    # Per-dataset equalisation (before decile balance so each decile sees an
+    # even dataset mix; uses fill-from-bottom so tiny datasets aren't wasted)
+    if balance_datasets and len(qa_df) > 0 and "dataset" in qa_df.columns:
+        logger.info("[%s] BALANCE PER DATASET" % ("5.5/6" if generate_synthetic else "4.5/5"))
+        ds_total_target = (target_per_decile * 10) if (balance and target_per_decile) else None
+        qa_df = balance_per_dataset(qa_df, total_target=ds_total_target)
+
     # Balance
     logger.info("[5/5] BALANCE" if generate_synthetic else "[4/4] BALANCE")
     if balance:

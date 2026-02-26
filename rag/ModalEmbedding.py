@@ -15,10 +15,13 @@ except ImportError:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 APP_NAME = "PopularityBias_Thesis_Amon_Embedding_Service"
-MODEL_NAME = "intfloat/multilingual-e5-small"
+# MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME = "intfloat/multilingual-e5-large"
+# MODEL_NAME = "intfloat/multilingual-e5-small"
 GPU_CONFIG = "A10"
-DEFAULT_BATCH_SIZE = 2_048  # Max batch size for A10, can be tuned based on actual GPU memory and model requirements
-MAX_CONTAINERS = 6         # Scaled up for index jobs
+DEFAULT_BATCH_SIZE = 512  # Max batch size for A10, can be tuned based on actual GPU memory and model requirements
+MAX_CONTAINERS = 10         # Scaled up for index jobs
+MAX_INPUT_CONCURRENCY = 4
 CONTAINER_TIMEOUT = 300     # 5 min idle timeout to reduce cold starts during gaps
 FUNCTION_TIMEOUT = 300     # 5 min max execution time per call
 MAX_RETRIES = 2           # Retry on failure
@@ -45,6 +48,7 @@ app = modal.App(APP_NAME)
     scaledown_window=CONTAINER_TIMEOUT, # Keep warm for 5 mins
     retries=MAX_RETRIES
 )
+@modal.concurrent(max_inputs=MAX_INPUT_CONCURRENCY)  # Allow concurrent calls to embed()
 class Model:
     @modal.enter()  
     def enter(self):
