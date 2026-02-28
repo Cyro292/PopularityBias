@@ -46,6 +46,10 @@ def get_embedding_class(provider: str):
     Raises:
         ValueError: If the provider is not supported.
     """
+
+    if not provider:
+        raise ValueError("Provider Required")
+
     provider = provider.lower()
     if provider not in _EMBEDDING_CLASSES:
         if provider == "openai":
@@ -94,8 +98,11 @@ class RateLimitedEmbeddings:
 
 
 def build_embeddings(
-    provider: str = "openai",
-    model: str = "text-embedding-3-large",
+    provider: str = None,
+    model: str = None,
+    request_batch_size = None,
+    gpu_batch_size = None,
+    normalise_embeddings = None,
     trust_remote_code: bool = False,
     rate_limiter: BaseRateLimiter | None = None,
     requests_per_second: float | None = None,
@@ -120,14 +127,24 @@ def build_embeddings(
     """
     embedding_cls = get_embedding_class(provider)
 
+    if not model:
+        raise ValueError("Model required for creating the embeddings model")
+
     if provider.lower() == "huggingface":
         base = embedding_cls(
             model_name=model,
             model_kwargs={"trust_remote_code": trust_remote_code},
         )
     elif provider.lower() == "modal":
+
+        if not request_batch_size or not gpu_batch_size or not normalise_embeddings:
+            raise ValueError("Must provide both gpu_batch_size and request_batch_size and normalise_embeddings for modal")
+
         base = embedding_cls(
             model_name=model,
+            request_batch_size=request_batch_size,
+            gpu_batch_size=gpu_batch_size,
+            normalise_embeddings=normalise_embeddings
         )
     else:
         base = embedding_cls(model=model)
@@ -599,11 +616,10 @@ class IndexingConfig:
     chunk_size: int = 1000
     chunk_overlap: int = 200
 
-    # ── bulk insert (no GPU involved, just I/O) ──────────────────────
-    batch_size: int = 5000
-
     # ── GPU embedding (runtime — no redeploy needed) ────────────────────
-    gpu_batch_size: int = 2048       # forward-pass batch on GPU
+    gpu_batch_size: int = None       # forward-pass batch on GPU
+    request_batch_size: int = None
+    normalise_embeddings: bool = None
 
     # ── Embedding provider ──────────────────────────────────────────────
     embedding_provider: str = "openai"

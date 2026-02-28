@@ -64,6 +64,9 @@ class ElasticsearchRagService(RagService):
             self._embeddings = build_embeddings(
                 provider=config.embedding_provider,
                 model=config.embedding_model,
+                request_batch_size=config.request_batch_size,
+                gpu_batch_size=config.gpu_batch_size,
+                normalise_embeddings=config.normalise_embeddings,
                 trust_remote_code=config.trust_remote_code,
                 rate_limiter=config.rate_limiter,
                 requests_per_second=config.requests_per_second,
@@ -215,15 +218,11 @@ class ElasticsearchRagService(RagService):
         progress_bar: bool | None = None,
         batch_size: int,
         skip_rows: int = 0,
+        streaming_upload: bool = True,
     ) -> tuple[ElasticsearchStore, int]:
-        """
-        Three-stage pipeline, each stage runs on its own thread:
+        NUM_UPLOADERS = 3
+        ES_UPLOAD_BATCH = 500
 
-          Producer (read+chunk) → Embedder (GPU) → Uploader (ES bulk)
-
-        Queues hold up to 2 items each so the next stage always has work ready.
-        The main thread polls progress updates for the tqdm bar (Jupyter-safe).
-        """
         if collection_name is None:
             raise ValueError("collection_name is required")
         if not parquet_path.exists():
@@ -231,22 +230,40 @@ class ElasticsearchRagService(RagService):
         if self._embeddings is None:
             raise ValueError("Embeddings required for vector indexing")
 
-        store = self._create_store(collection_name)
+        # ── Pre-create the index ONCE before any thread starts ───────────
+        # This prevents the race condition where multiple uploader threads
+        # all call _create_index_if_not_exists() simultaneously and crash
+        # with resource_already_exists_exception.
+        bootstrap_store = self._create_store(collection_name)
+        try:
+            bootstrap_store._store._create_index_if_not_exists()
+            logger.info(f"[Init] Index '{collection_name}' ready")
+        except Exception as e:
+            # Already exists from a previous partial run — that's fine
+            if "resource_already_exists" in str(e).lower():
+                logger.info(f"[Init] Index '{collection_name}' already exists, resuming")
+            else:
+                raise
+
         total_chunks = 0
+        chunks_lock = threading.Lock()
 
         parquet_file = pq.ParquetFile(parquet_path)
         total_rows = parquet_file.metadata.num_rows
         columns = [text_field] + list(metadata_fields or [])
 
-        logger.info(f"Indexing {total_rows - skip_rows:,} rows (skip {skip_rows:,}) | batch={batch_size:,}")
+        logger.info(f"Indexing {total_rows - skip_rows:,} rows (skip {skip_rows:,}) | "
+                     f"batch={batch_size:,} | uploaders={NUM_UPLOADERS}")
 
-        prepare_queue: queue.Queue = queue.Queue(maxsize=2)
-        upload_queue: queue.Queue = queue.Queue(maxsize=2)
+        # Stage sizes — tune these to keep each stage always busy
+        prepare_queue: queue.Queue = queue.Queue(maxsize=3)   # Producer runs up to 4 batches ahead
+        upload_queue:  queue.Queue = queue.Queue(maxsize=3)  # Embedder runs up to 32 sub-batches ahead
         progress_queue: queue.Queue = queue.Queue()
         errors: list[Exception] = []
         cancel = threading.Event()
 
         # ── Stage 1: Producer ────────────────────────────────────────────
+        # Reads parquet → chunks → puts (texts, metadatas) on prepare_queue
         def producer():
             try:
                 rows_seen = 0
@@ -265,77 +282,104 @@ class ElasticsearchRagService(RagService):
                     n_rows = len(df)
                     documents = documents_from_dataframe(df, text_field, metadata_fields)
                     chunks = self._prepare_documents(documents, log_details=False)
-                    logger.info(f"[Prepare] {n_rows:,} rows → {len(chunks):,} chunks")
                     del documents, df
 
-                    texts = [doc.page_content for doc in chunks]
-                    metadatas = [doc.metadata for doc in chunks]
+                    texts    = [doc.page_content for doc in chunks]
+                    metadatas = [doc.metadata    for doc in chunks]
                     del chunks
 
+                    # Blocks here if embedder is already 4 batches ahead — that's fine
                     prepare_queue.put((texts, metadatas, n_rows))
+                    logger.info(f"[Produce] +{n_rows:,} rows → {len(texts):,} chunks queued")
                     gc.collect()
             except Exception as e:
                 errors.append(e)
                 cancel.set()
             finally:
-                prepare_queue.put(None)
+                prepare_queue.put(None)  # sentinel
 
         # ── Stage 2: Embedder ────────────────────────────────────────────
+        # ONE job: get batch → embed → put. Nothing else.
+        # Modal handles internal GPU batching. Uploaders handle ES batching.
         def embedder():
             try:
-                while not cancel.is_set():
+                while True:
                     item = prepare_queue.get()
                     if item is None:
                         break
                     texts, metadatas, n_rows = item
 
-                    logger.info(f"[Embed] {len(texts):,} chunks...")
-                    embeddings = self._embeddings.embed_documents(texts)
-                    progress_queue.put(n_rows)
+                    logger.info(f"[Embed] {len(texts):,} chunks → Modal …")
+                    embeddings = self._embeddings.embed_documents(texts)  # Modal batches internally
+                    logger.info(f"[Embed] ✓ {len(texts):,} done → upload_queue")
 
-                    upload_queue.put((texts, embeddings, metadatas))
+                    while True:
+                        try:
+                            upload_queue.put((texts, embeddings, metadatas, n_rows), timeout=1)
+                            break
+                        except queue.Full:
+                            continue  # uploaders slow — never give up
+
+                    del embeddings
+                    gc.collect()
+
             except Exception as e:
                 errors.append(e)
                 cancel.set()
             finally:
-                upload_queue.put(None)
+                for _ in range(NUM_UPLOADERS):
+                    upload_queue.put(None)
 
-        # ── Stage 3: Uploader ────────────────────────────────────────────
-        ES_SUB_BATCH = 5_000
-
+        # ── Stage 3: Uploaders (parallel) ────────────────────────────────
+        # NUM_UPLOADERS threads all pulling from upload_queue independently.
+        # Each has its own ES store (no shared connection).
         def uploader():
             nonlocal total_chunks
+            my_store = self._create_store(collection_name)
             try:
-                while not cancel.is_set():
-                    item = upload_queue.get()
+                while True:
+                    try:
+                        item = upload_queue.get(timeout=2)
+                    except queue.Empty:
+                        continue
+
                     if item is None:
                         break
-                    texts, embeddings, metadatas = item
+
+                    texts, embeddings, metadatas, n_rows = item
                     n = len(texts)
-                    logger.info(f"[Upload] {n:,} docs → ES")
-                    for i in range(0, n, ES_SUB_BATCH):
-                        pairs = list(zip(texts[i:i+ES_SUB_BATCH], embeddings[i:i+ES_SUB_BATCH]))
-                        meta = metadatas[i:i+ES_SUB_BATCH]
-                        store.add_embeddings(text_embeddings=pairs, metadatas=meta, refresh_indices=False)
-                    total_chunks += n
-                    logger.info(f"[Upload] ✓ +{n:,} (total: {total_chunks:,})")
+                    logger.info(f"[Upload] {n:,} chunks → ES …")
+
+                    for i in range(0, n, ES_UPLOAD_BATCH):
+                        end   = min(i + ES_UPLOAD_BATCH, n)
+                        pairs = list(zip(texts[i:end], embeddings[i:end]))
+                        my_store.add_embeddings(
+                            text_embeddings=pairs,
+                            metadatas=metadatas[i:end],
+                            refresh_indices=False,
+                        )
+                        batch_n = end - i
+                        with chunks_lock:
+                            total_chunks += batch_n
+                        # credit rows proportionally to this ES batch
+                        progress_queue.put(round(batch_n * n_rows / n))
+                        logger.info(f"[Upload] ✓ {end:,}/{n:,} chunks (total: {total_chunks:,})")
+
                     del texts, embeddings, metadatas
                     gc.collect()
+
             except Exception as e:
                 logger.error(f"[Upload] FAILED: {e}", exc_info=True)
                 errors.append(e)
-                cancel.set()
 
         # ── Start pipeline ───────────────────────────────────────────────
-        threads = [
-            threading.Thread(target=producer, name="Producer", daemon=True),
-            threading.Thread(target=embedder, name="Embedder", daemon=True),
-            threading.Thread(target=uploader, name="Uploader", daemon=True),
-        ]
+        threads = [threading.Thread(target=producer, name="Producer", daemon=True)]
+        threads.append(threading.Thread(target=embedder, name="Embedder", daemon=True))
+        for i in range(NUM_UPLOADERS):
+            threads.append(threading.Thread(target=uploader, name=f"Uploader-{i}", daemon=True))
         for t in threads:
             t.start()
 
-        # Main thread: poll progress queue so tqdm renders in Jupyter
         pbar = tqdm(total=total_rows, initial=skip_rows, desc="Indexing", unit="row", disable=not progress_bar)
         while any(t.is_alive() for t in threads):
             try:
@@ -349,7 +393,7 @@ class ElasticsearchRagService(RagService):
         pbar.close()
 
         try:
-            store.client.indices.refresh(index=collection_name)
+            bootstrap_store.client.indices.refresh(index=collection_name)
         except Exception as e:
             logger.error(f"Refresh failed: {e}")
 
@@ -357,7 +401,7 @@ class ElasticsearchRagService(RagService):
             raise errors[0]
 
         logger.info(f"=== Done: {total_chunks:,} chunks indexed ===")
-        return store, total_chunks
+        return bootstrap_store, total_chunks
 
     def index_from_dataframe(
         self,

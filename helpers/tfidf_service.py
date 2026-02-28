@@ -27,9 +27,46 @@ _CACHE_KEY = "decile_tfidf_stats"
 _NUM_DECILES = 10
 
 
+def _cache_key(chunk_size: int | None, chunk_overlap: int, sample_per_decile: int) -> str:
+    """Return the metadata.json key for the given chunking + sample settings."""
+    if chunk_size:
+        return f"{_CACHE_KEY}_chunks_{chunk_size}_{chunk_overlap}_n{sample_per_decile}"
+    return f"{_CACHE_KEY}_n{sample_per_decile}"
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _chunk_texts(
+    texts: list[str],
+    deciles: list[int],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> tuple[list[str], list[int]]:
+    """Split each document into chunks using RecursiveCharacterTextSplitter.
+
+    Each chunk inherits the popularity decile of its parent document.
+
+    Returns
+    -------
+    texts   : flat list of chunk strings
+    deciles : parallel list of 0-based decile indices
+    """
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    out_texts: list[str] = []
+    out_deciles: list[int] = []
+    for text, d in zip(texts, deciles):
+        chunks = splitter.split_text(text)
+        out_texts.extend(chunks)
+        out_deciles.extend([d] * len(chunks))
+    return out_texts, out_deciles
+
 
 def _reservoir_sample_corpus(
     corpus_path: Path | str,
@@ -102,8 +139,17 @@ def _compute_stats(
     texts: list[str],
     deciles: list[int],
     max_features: int,
+    source_deciles: list[int] | None = None,
 ) -> dict[str, dict]:
-    """Fit TF-IDF vectorizer and compute per-decile summary statistics."""
+    """Fit TF-IDF vectorizer and compute per-decile summary statistics.
+
+    Parameters
+    ----------
+    source_deciles : list[int] | None
+        If texts are chunks, pass the decile list of the *original documents*
+        so that ``n_source_docs`` is counted correctly.  When ``None``,
+        ``n_source_docs`` equals ``n_items``.
+    """
     from sklearn.feature_extraction.text import TfidfVectorizer
 
     print("  Fitting TF-IDF vectorizer…")
@@ -118,6 +164,11 @@ def _compute_stats(
     print(f"  Vocabulary size: {len(vectorizer.vocabulary_):,} terms")
 
     all_deciles_arr = np.array(deciles)
+    source_counts = {}
+    if source_deciles is not None:
+        src_arr = np.array(source_deciles)
+        for d in range(_NUM_DECILES):
+            source_counts[d] = int((src_arr == d).sum())
     stats: dict[str, dict] = {}
 
     for d in range(_NUM_DECILES):
@@ -143,6 +194,7 @@ def _compute_stats(
 
         stats[str(d)] = {
             "n_docs_sampled": n_docs_d,
+            "n_source_docs": source_counts.get(d, n_docs_d),
             "mean_unique_terms": float(np.mean(unique_per_doc)),
             "std_unique_terms": float(np.std(unique_per_doc)),
             "mean_tfidf_score": mean_score,
@@ -164,6 +216,8 @@ def load_or_compute_tfidf_stats(
     *,
     sample_per_decile: int = 300,
     max_features: int = 20_000,
+    chunk_size: int | None = None,
+    chunk_overlap: int = 100,
     force_recompute: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Return per-decile TF-IDF statistics, using the cache when possible.
@@ -179,9 +233,20 @@ def load_or_compute_tfidf_stats(
         Decile boundary array (length ``NUM_DECILES + 1``) as returned by
         ``rag.decile_utils.boundaries_for``.
     sample_per_decile : int
-        Maximum number of documents to sample per decile.
+        Maximum number of documents to sample per decile.  When
+        ``chunk_size`` is set this is the number of *documents* sampled;
+        the actual TF-IDF corpus will contain more units (one per chunk).
     max_features : int
         Vocabulary cap for ``TfidfVectorizer``.
+    chunk_size : int | None
+        When set, each sampled document is split into chunks of this many
+        characters using LangChain's ``RecursiveCharacterTextSplitter``
+        before TF-IDF is computed.  Stats then reflect chunk-level
+        vocabulary rather than full-document vocabulary.  ``None`` (default)
+        keeps the original document-level behaviour.
+    chunk_overlap : int
+        Overlap in characters between consecutive chunks (only used when
+        ``chunk_size`` is not ``None``).
     force_recompute : bool
         If ``True``, skip the cache and recompute from scratch.
 
@@ -192,17 +257,20 @@ def load_or_compute_tfidf_stats(
         mean_tfidf_score, mean_idf_of_used_terms, vocab_coverage
     """
     metadata_path = Path(metadata_path)
+    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile)
 
     # ---- Try cache first ------------------------------------------------
     if not force_recompute and metadata_path.exists():
         with open(metadata_path) as f:
             meta = json.load(f)
-        if _CACHE_KEY in meta:
-            print("✓ Loaded TF-IDF stats from metadata.json (cached — skipping heavy computation)")
-            return meta[_CACHE_KEY]
+        if key in meta:
+            level = f"chunk (size={chunk_size}, overlap={chunk_overlap})" if chunk_size else "document"
+            print(f"✓ Loaded TF-IDF stats from metadata.json [{level} level, cached]")
+            return meta[key]
 
+    level = f"chunk (size={chunk_size}, overlap={chunk_overlap})" if chunk_size else "document"
     print(
-        f"No cache found — computing TF-IDF stats "
+        f"No cache found — computing TF-IDF stats [{level} level] "
         f"(sampling {sample_per_decile} docs/decile from corpus)…"
     )
 
@@ -212,15 +280,25 @@ def load_or_compute_tfidf_stats(
         boundaries,
         sample_per_decile,
     )
-    stats = _compute_stats(texts, deciles, max_features)
+
+    if chunk_size:
+        print(f"  Splitting {len(texts):,} documents into chunks "
+              f"(size={chunk_size}, overlap={chunk_overlap})…")
+        source_deciles_for_stats = list(deciles)  # save before splitting
+        texts, deciles = _chunk_texts(texts, deciles, chunk_size, chunk_overlap)
+        print(f"  → {len(texts):,} chunks across all deciles")
+    else:
+        source_deciles_for_stats = None
+
+    stats = _compute_stats(texts, deciles, max_features, source_deciles_for_stats)
 
     # ---- Write cache back to metadata.json ------------------------------
     with open(metadata_path) as f:
         meta = json.load(f)
-    meta[_CACHE_KEY] = stats
+    meta[key] = stats
     with open(metadata_path, "w") as f:
         json.dump(meta, f, indent=2)
-    print("✓ Saved TF-IDF stats → metadata.json  (future runs will load instantly)")
+    print(f"✓ Saved TF-IDF stats [{level} level] → metadata.json  (future runs will load instantly)")
 
     return stats
 
@@ -228,7 +306,7 @@ def load_or_compute_tfidf_stats(
 def print_tfidf_stats(stats: dict[str, dict]) -> None:
     """Print a formatted summary table of per-decile TF-IDF statistics."""
     header = (
-        f"{'Decile':>7} {'n_sampled':>10} {'mean_unique_terms':>18} "
+        f"{'Decile':>7} {'src_docs':>9} {'n_chunks':>9} {'mean_unique_terms':>18} "
         f"{'mean_tfidf':>12} {'mean_idf':>10} {'vocab_cov':>10}"
     )
     print(f"\n{header}")
@@ -236,8 +314,10 @@ def print_tfidf_stats(stats: dict[str, dict]) -> None:
         s = stats.get(str(d), {})
         if not s:
             continue
+        n_chunks = s['n_docs_sampled']
+        n_src = s.get('n_source_docs', n_chunks)
         print(
-            f"  {d + 1:>5}   {s['n_docs_sampled']:>10}   "
+            f"  {d + 1:>5}   {n_src:>9}  {n_chunks:>9}   "
             f"{s['mean_unique_terms']:>16.1f}   "
             f"{s['mean_tfidf_score']:>10.4f}   "
             f"{s['mean_idf_of_used_terms']:>8.4f}   "
@@ -251,6 +331,8 @@ def plot_tfidf_stats(
     decile_mode: str = "",
     sample_per_decile: int = 300,
     max_features: int = 20_000,
+    chunk_size: int | None = None,
+    chunk_overlap: int = 100,
     out_path: Path | str | None = None,
 ) -> "plt.Figure":  # type: ignore[name-defined]  # noqa: F821
     """Create and return a 3-panel TF-IDF distribution figure.
@@ -265,6 +347,11 @@ def plot_tfidf_stats(
         Used only in the subtitle for context.
     max_features : int
         Used only in the subtitle for context.
+    chunk_size : int | None
+        When set, axis labels refer to chunks rather than documents.
+        Should match the value passed to :func:`load_or_compute_tfidf_stats`.
+    chunk_overlap : int
+        Used only in the subtitle when ``chunk_size`` is set.
     out_path : Path | str | None
         If provided, the figure is saved to this path at 150 dpi.
 
@@ -274,12 +361,17 @@ def plot_tfidf_stats(
     """
     import matplotlib.pyplot as plt
 
+    unit = f"chunk ({chunk_size} chars)" if chunk_size else "document"
+    unit_short = "Chunk" if chunk_size else "Doc"
+
     d_idx = np.arange(1, _NUM_DECILES + 1)
 
     mean_unique = [stats.get(str(d), {}).get("mean_unique_terms", np.nan) for d in range(_NUM_DECILES)]
     std_unique  = [stats.get(str(d), {}).get("std_unique_terms",  np.nan) for d in range(_NUM_DECILES)]
     mean_score  = [stats.get(str(d), {}).get("mean_tfidf_score",  np.nan) for d in range(_NUM_DECILES)]
     mean_idf    = [stats.get(str(d), {}).get("mean_idf_of_used_terms", np.nan) for d in range(_NUM_DECILES)]
+    n_chunks    = [stats.get(str(d), {}).get("n_docs_sampled", np.nan)    for d in range(_NUM_DECILES)]
+    n_src       = [stats.get(str(d), {}).get("n_source_docs",  np.nan)    for d in range(_NUM_DECILES)]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
@@ -290,9 +382,14 @@ def plot_tfidf_stats(
         d_idx, mean_unique, yerr=std_unique,
         fmt="none", color="black", capsize=4, linewidth=1.5, elinewidth=1,
     )
+    if chunk_size:
+        for xi, nc, ns in zip(d_idx, n_chunks, n_src):
+            if not np.isnan(nc):
+                ax.text(xi, 0, f"{int(nc):,}\nchunks\n({int(ns):,} docs)",
+                        ha="center", va="bottom", fontsize=6.5, color="#555555")
     ax.set_xlabel("Popularity Decile (1=Rare → 10=Famous)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Mean Unique Terms / Doc", fontsize=11, fontweight="bold")
-    ax.set_title("A. Vocabulary Breadth\n(unique TF-IDF terms per document)", fontsize=12, fontweight="bold")
+    ax.set_ylabel(f"Mean Unique Terms / {unit_short}", fontsize=11, fontweight="bold")
+    ax.set_title(f"A. Vocabulary Breadth\n(unique TF-IDF terms per {unit})", fontsize=12, fontweight="bold")
     ax.set_xticks(d_idx)
     ax.grid(axis="y", alpha=0.3)
 
@@ -300,8 +397,8 @@ def plot_tfidf_stats(
     ax = axes[1]
     ax.bar(d_idx, mean_score, color="#e67e22", alpha=0.85, edgecolor="white", linewidth=1)
     ax.set_xlabel("Popularity Decile (1=Rare → 10=Famous)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Mean TF-IDF Score (non-zero entries)", fontsize=11, fontweight="bold")
-    ax.set_title("B. Keyword Intensity\n(sublinear TF-IDF of matched terms)", fontsize=12, fontweight="bold")
+    ax.set_ylabel(f"Mean TF-IDF Score (non-zero entries)", fontsize=11, fontweight="bold")
+    ax.set_title(f"B. Keyword Intensity\n(sublinear TF-IDF of matched terms per {unit})", fontsize=12, fontweight="bold")
     ax.set_xticks(d_idx)
     ax.grid(axis="y", alpha=0.3)
 
@@ -315,9 +412,13 @@ def plot_tfidf_stats(
     ax.grid(axis="y", alpha=0.3)
 
     mode_label = f" — {decile_mode} mode" if decile_mode else ""
+    chunk_label = (
+        f" · chunked {chunk_size} chars / {chunk_overlap} overlap"
+        if chunk_size else ""
+    )
     plt.suptitle(
-        f"TF-IDF Distribution Per Decile{mode_label}\n"
-        f"(sampled ≤{sample_per_decile} docs/decile · vocab cap {max_features:,})",
+        f"TF-IDF Distribution Per Decile{mode_label} [{unit} level]\n"
+        f"(sampled ≤{sample_per_decile} docs/decile · vocab cap {max_features:,}{chunk_label})",
         fontsize=14,
         fontweight="bold",
         y=1.02,
