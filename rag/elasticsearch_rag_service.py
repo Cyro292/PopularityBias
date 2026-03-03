@@ -17,7 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from langchain.schema import Document
 from langchain_elasticsearch import ElasticsearchStore
-from langchain_elasticsearch.vectorstores import DenseVectorStrategy, DenseVectorScriptScoreStrategy, BM25Strategy
+from langchain_elasticsearch.vectorstores import DenseVectorStrategy, DenseVectorScriptScoreStrategy
+
 from tqdm import tqdm
 
 from .base import RagService, VectorStoreLike
@@ -42,13 +43,14 @@ class ElasticsearchRagService(RagService):
         es_password: str | None = None,
         strategy: Literal["vector", "approximation", "bm25", "hybrid"] = "vector",
         distance_function: Literal["COSINE", "DOT_PRODUCT", "EUCLIDEAN_DISTANCE"] | None = None,
+        request_timeout: int = 600,
     ):
         self.es_url = es_url
         self.es_user = es_user
         self.es_password = es_password
         self.strategy = strategy
         self._current_index_name: str | None = None
-        self._request_timeout: int = 120
+        self._request_timeout: int = request_timeout
 
         # Load prompt templates
         self._passage_prompt, self._query_prompt = self._load_prompts()
@@ -56,7 +58,7 @@ class ElasticsearchRagService(RagService):
         if strategy == "bm25":
             self.config = config or IndexingConfig()
             self._embeddings = None
-            self._retrieval_strategy = BM25Strategy()
+            self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy()
         else:
             if config is None:
                 raise ValueError(f"IndexingConfig required for '{strategy}' strategy")
@@ -218,10 +220,12 @@ class ElasticsearchRagService(RagService):
         progress_bar: bool | None = None,
         batch_size: int,
         skip_rows: int = 0,
-        streaming_upload: bool = True,
+        es_upload_batch: int = 2000,
+        num_uploaders: int = 4,
+        use_send_mode: bool = False,
     ) -> tuple[ElasticsearchStore, int]:
-        NUM_UPLOADERS = 3
-        ES_UPLOAD_BATCH = 500
+        ES_UPLOAD_BATCH = es_upload_batch
+        NUM_UPLOADERS = num_uploaders
 
         if collection_name is None:
             raise ValueError("collection_name is required")
@@ -245,7 +249,7 @@ class ElasticsearchRagService(RagService):
             else:
                 raise
 
-        total_chunks = 0
+        state = {"chunks": 0}          # mutable dict — no nonlocal needed
         chunks_lock = threading.Lock()
 
         parquet_file = pq.ParquetFile(parquet_path)
@@ -253,11 +257,12 @@ class ElasticsearchRagService(RagService):
         columns = [text_field] + list(metadata_fields or [])
 
         logger.info(f"Indexing {total_rows - skip_rows:,} rows (skip {skip_rows:,}) | "
-                     f"batch={batch_size:,} | uploaders={NUM_UPLOADERS}")
+                     f"batch={batch_size:,} | "
+                     f"{'embed+send (Modal→ES direct)' if use_send_mode else 'embed→upload'}")
 
         # Stage sizes — tune these to keep each stage always busy
         prepare_queue: queue.Queue = queue.Queue(maxsize=3)   # Producer runs up to 4 batches ahead
-        upload_queue:  queue.Queue = queue.Queue(maxsize=3)  # Embedder runs up to 32 sub-batches ahead
+        upload_queue:  queue.Queue = queue.Queue(maxsize=3)   # Used only in standard mode
         progress_queue: queue.Queue = queue.Queue()
         errors: list[Exception] = []
         cancel = threading.Event()
@@ -284,11 +289,10 @@ class ElasticsearchRagService(RagService):
                     chunks = self._prepare_documents(documents, log_details=False)
                     del documents, df
 
-                    texts    = [doc.page_content for doc in chunks]
-                    metadatas = [doc.metadata    for doc in chunks]
+                    texts     = [doc.page_content for doc in chunks]
+                    metadatas = [doc.metadata     for doc in chunks]
                     del chunks
 
-                    # Blocks here if embedder is already 4 batches ahead — that's fine
                     prepare_queue.put((texts, metadatas, n_rows))
                     logger.info(f"[Produce] +{n_rows:,} rows → {len(texts):,} chunks queued")
                     gc.collect()
@@ -298,10 +302,41 @@ class ElasticsearchRagService(RagService):
             finally:
                 prepare_queue.put(None)  # sentinel
 
-        # ── Stage 2: Embedder ────────────────────────────────────────────
-        # ONE job: get batch → embed → put. Nothing else.
-        # Modal handles internal GPU batching. Uploaders handle ES batching.
-        def embedder():
+        # ── Stage 2a: Embedder — send mode (Modal → ES direct) ───────────
+        # Embeds on GPU and pushes to ES without returning vectors to the client.
+        # Progress is updated immediately after each batch completes.
+        def embedder_send():
+            try:
+                while True:
+                    item = prepare_queue.get()
+                    if item is None:
+                        break
+                    texts, metadatas, n_rows = item
+
+                    logger.info(f"[Embed+Send] {len(texts):,} chunks → Modal (direct to ES) …")
+                    indexed = self._embeddings.embed_and_send_documents(
+                        texts, metadatas,
+                        es_url=self.es_url,
+                        index_name=collection_name,
+                        strategy=self.strategy,
+                        distance_strategy=getattr(self, "distance_strategy", None),
+                        es_user=self.es_user,
+                        es_password=self.es_password,
+                        request_timeout=self._request_timeout,
+                    )
+                    logger.info(f"[Embed+Send] ✓ {indexed:,} docs indexed")
+
+                    with chunks_lock:
+                        state["chunks"] += indexed
+                    progress_queue.put(n_rows)
+                    gc.collect()
+
+            except Exception as e:
+                errors.append(e)
+                cancel.set()
+
+        # ── Stage 2b: Embedder — standard mode (embed → upload_queue) ────
+        def embedder_standard():
             try:
                 while True:
                     item = prepare_queue.get()
@@ -310,7 +345,7 @@ class ElasticsearchRagService(RagService):
                     texts, metadatas, n_rows = item
 
                     logger.info(f"[Embed] {len(texts):,} chunks → Modal …")
-                    embeddings = self._embeddings.embed_documents(texts)  # Modal batches internally
+                    embeddings = self._embeddings.embed_documents(texts)
                     logger.info(f"[Embed] ✓ {len(texts):,} done → upload_queue")
 
                     while True:
@@ -318,7 +353,7 @@ class ElasticsearchRagService(RagService):
                             upload_queue.put((texts, embeddings, metadatas, n_rows), timeout=1)
                             break
                         except queue.Full:
-                            continue  # uploaders slow — never give up
+                            continue
 
                     del embeddings
                     gc.collect()
@@ -327,56 +362,74 @@ class ElasticsearchRagService(RagService):
                 errors.append(e)
                 cancel.set()
             finally:
-                for _ in range(NUM_UPLOADERS):
-                    upload_queue.put(None)
+                upload_queue.put(None)  # sentinel for uploader
 
-        # ── Stage 3: Uploaders (parallel) ────────────────────────────────
-        # NUM_UPLOADERS threads all pulling from upload_queue independently.
-        # Each has its own ES store (no shared connection).
+        # ── Stage 3: Uploader (standard mode only) ────────────────────────
         def uploader():
-            nonlocal total_chunks
-            my_store = self._create_store(collection_name)
+            stores = [self._create_store(collection_name) for _ in range(NUM_UPLOADERS)]
+
+            def _send(worker, pairs, metas):
+                """Send one sub-batch with retry."""
+                for attempt in range(6):
+                    try:
+                        stores[worker].add_embeddings(
+                            text_embeddings=pairs, metadatas=metas, refresh_indices=False,
+                        )
+                        return len(pairs)
+                    except Exception as err:
+                        if attempt >= 5:
+                            raise
+                        delay = [5, 10, 30, 60, 120][min(attempt, 4)]
+                        logger.warning(f"[Upload][w{worker}] ⚠ {type(err).__name__}: {err}, "
+                                       f"retry {attempt+1}/5 in {delay}s")
+                        time.sleep(delay)
+                        stores[worker] = self._create_store(collection_name)
+
             try:
+                pool = ThreadPoolExecutor(max_workers=NUM_UPLOADERS, thread_name_prefix="ES")
                 while True:
                     try:
                         item = upload_queue.get(timeout=2)
                     except queue.Empty:
                         continue
-
                     if item is None:
                         break
 
                     texts, embeddings, metadatas, n_rows = item
                     n = len(texts)
-                    logger.info(f"[Upload] {n:,} chunks → ES …")
+                    logger.info(f"[Upload] {n:,} chunks received → uploading with {NUM_UPLOADERS} workers …")
 
-                    for i in range(0, n, ES_UPLOAD_BATCH):
-                        end   = min(i + ES_UPLOAD_BATCH, n)
+                    futs = []
+                    for idx, i in enumerate(range(0, n, ES_UPLOAD_BATCH)):
+                        end = min(i + ES_UPLOAD_BATCH, n)
                         pairs = list(zip(texts[i:end], embeddings[i:end]))
-                        my_store.add_embeddings(
-                            text_embeddings=pairs,
-                            metadatas=metadatas[i:end],
-                            refresh_indices=False,
-                        )
-                        batch_n = end - i
-                        with chunks_lock:
-                            total_chunks += batch_n
-                        # credit rows proportionally to this ES batch
-                        progress_queue.put(round(batch_n * n_rows / n))
-                        logger.info(f"[Upload] ✓ {end:,}/{n:,} chunks (total: {total_chunks:,})")
+                        metas = metadatas[i:end]
+                        worker = idx % NUM_UPLOADERS
+                        futs.append((end - i, n_rows, n, pool.submit(_send, worker, pairs, metas)))
 
+                    for batch_n, nr, ntot, fut in futs:
+                        fut.result()
+                        with chunks_lock:
+                            state["chunks"] += batch_n
+                        progress_queue.put(round(batch_n * nr / ntot))
+
+                    logger.info(f"[Upload] Batch of {n:,} chunks fully uploaded")
                     del texts, embeddings, metadatas
                     gc.collect()
 
+                pool.shutdown(wait=True)
             except Exception as e:
                 logger.error(f"[Upload] FAILED: {e}", exc_info=True)
                 errors.append(e)
 
         # ── Start pipeline ───────────────────────────────────────────────
         threads = [threading.Thread(target=producer, name="Producer", daemon=True)]
-        threads.append(threading.Thread(target=embedder, name="Embedder", daemon=True))
-        for i in range(NUM_UPLOADERS):
-            threads.append(threading.Thread(target=uploader, name=f"Uploader-{i}", daemon=True))
+        if use_send_mode:
+            # embed+send: no uploader thread needed
+            threads.append(threading.Thread(target=embedder_send, name="Embedder", daemon=True))
+        else:
+            threads.append(threading.Thread(target=embedder_standard, name="Embedder", daemon=True))
+            threads.append(threading.Thread(target=uploader, name="Uploader", daemon=True))
         for t in threads:
             t.start()
 
@@ -400,8 +453,8 @@ class ElasticsearchRagService(RagService):
         if errors:
             raise errors[0]
 
-        logger.info(f"=== Done: {total_chunks:,} chunks indexed ===")
-        return bootstrap_store, total_chunks
+        logger.info(f"=== Done: {state['chunks']:,} chunks indexed ===")
+        return bootstrap_store, state["chunks"]
 
     def index_from_dataframe(
         self,
@@ -449,7 +502,7 @@ class ElasticsearchRagService(RagService):
         try:
             self.strategy = strategy
             if strategy == "bm25":
-                self._retrieval_strategy = BM25Strategy()
+                self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy()
                 self._embeddings = None
             elif strategy in ["vector", "approximation", "hybrid"]:
                 if self._embeddings is None:
@@ -484,11 +537,9 @@ class ElasticsearchRagService(RagService):
         num_candidates: int | None = None,
     ) -> list[Document]:
         """Retrieve documents using the configured strategy."""
-
-        with self._strategy_context(strategy):
+        with self._strategy_context(strategy) as strat:
             index = self._create_store(self._current_index_name)
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
-
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and strat != "bm25" else None
             return index.similarity_search(self._prepare_query(text), top_k, custom_query=custom_query)
 
     def retrieve_documents_with_scores(
@@ -499,92 +550,10 @@ class ElasticsearchRagService(RagService):
         num_candidates: int | None = None,
     ) -> list[tuple[Document, float]]:
         """Retrieve documents with relevance scores."""
-        with self._strategy_context(strategy):
+        with self._strategy_context(strategy) as strat:
             index = self._create_store(self._current_index_name)
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
-
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and strat != "bm25" else None
             return index.similarity_search_with_score(self._prepare_query(text), top_k, custom_query=custom_query)
-
-    @staticmethod
-    def _parse_msearch_hits(
-        responses: list[dict],
-        text_field: str = "text",
-    ) -> list[list[tuple[Document, float]]]:
-        """Convert raw _msearch response dicts into (Document, score) lists."""
-        all_results = []
-        for resp in responses:
-            docs = []
-            for hit in resp.get("hits", {}).get("hits", []):
-                src = hit.get("_source", {})
-                page_content = src.get(text_field, "")
-                # langchain-elasticsearch stores metadata under a "metadata" key
-                metadata = src.get("metadata") or {
-                    k: v for k, v in src.items() if k not in (text_field, "vector")
-                }
-                score = hit.get("_score") or 0.0
-                docs.append((Document(page_content=page_content, metadata=metadata), float(score)))
-            all_results.append(docs)
-        return all_results
-
-    def _threaded_vector_search(
-        self,
-        index_name: str,
-        vectors: list[list[float]],
-        top_k: int,
-        num_candidates: int | None,
-        search_workers: int,
-        custom_query,
-        progress_bar: bool,
-        desc: str,
-        request_timeout: int | None = None,
-    ) -> list[list[tuple[Document, float]]]:
-        """Run one similarity_search_by_vector_with_relevance_scores per vector,
-        concurrently via a thread pool.  Each thread creates its own store so
-        connections are not shared across threads.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        n = len(vectors)
-        results: list[list[tuple[Document, float]] | None] = [None] * n
-
-        def _search(idx: int) -> tuple[int, list[tuple[Document, float]]]:
-            store = self._create_store(index_name, request_timeout=request_timeout)
-            hits = store.similarity_search_by_vector_with_relevance_scores(
-                vectors[idx], k=top_k, custom_query=custom_query
-            )
-            return idx, hits
-
-        pbar = tqdm(total=n, desc=desc, unit="q", disable=not progress_bar)
-        with ThreadPoolExecutor(max_workers=search_workers) as pool:
-            futures = {pool.submit(_search, i): i for i in range(n)}
-            for fut in as_completed(futures):
-                idx, hits = fut.result()
-                results[idx] = hits
-                pbar.update(1)
-        pbar.close()
-        return results  # type: ignore[return-value]
-
-    def _msearch_bm25(
-        self,
-        index_name: str,
-        texts: list[str],
-        top_k: int,
-        text_field: str = "text",
-    ) -> list[list[tuple[Document, float]]]:
-        """Send all BM25 queries as a single _msearch request."""
-        store = self._create_store(index_name)
-        es = store.client
-
-        body = []
-        for text in texts:
-            body.append({"index": index_name})
-            body.append({
-                "query": {"match": {text_field: text}},
-                "size": top_k,
-            })
-
-        resp = es.msearch(body=body)
-        return self._parse_msearch_hits(resp["responses"], text_field=text_field)
 
     def batch_retrieve(
         self,
@@ -598,77 +567,47 @@ class ElasticsearchRagService(RagService):
         search_workers: int = 16,
         request_timeout: int | None = None,
     ) -> list[list[tuple[Document, float]]]:
-        """Retrieve for multiple queries using batched embedding + parallel search.
+        """Retrieve for multiple queries concurrently using a thread pool.
 
-        Strategy-aware pipeline:
-          * BM25  → batch-embed skipped; _msearch sends `msearch_batch_size`
-                    queries per HTTP request (cheap, ES handles them fast).
-          * kNN   → batch-embed all queries first; then fire one ES request
-                    per query via a ThreadPoolExecutor (`search_workers` threads).
-                    Individual requests run concurrently so network latency
-                    overlaps — much faster than _msearch which serialises kNN
-                    sub-queries inside one HTTP connection.
-
-        Args:
-            embed_batch_size:   Queries to embed per embedder call.
-            msearch_batch_size: Queries per _msearch HTTP request (BM25 only).
-            search_workers:     Thread-pool size for concurrent kNN searches.
-            request_timeout:    Per-request timeout in seconds. Defaults to
-                                self._request_timeout (120 s).
+        BM25: queries run directly in threads via similarity_search_with_score.
+        Vector: all queries are batch-embedded first, then searched in threads
+        via similarity_search_by_vector_with_relevance_scores.
         """
-        with self._strategy_context(strategy) as strat:
-            n = len(questions)
-            is_bm25 = (strat == "bm25" or self._embeddings is None)
-            prepared_texts = [self._prepare_query(q) for q in questions]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            # ── Stage 1: batch-embed (skipped for BM25) ───────────────────────
+        with self._strategy_context(strategy) as strat:
+            is_bm25 = strat == "bm25" or self._embeddings is None
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and not is_bm25 else None
+            prepared = [self._prepare_query(q) for q in questions]
+            n = len(prepared)
+            results: list[list[tuple[Document, float]] | None] = [None] * n
+            timeout = request_timeout or self._request_timeout
+
+            # ── Stage 1: batch-embed (vector only) ────────────────────────────
             if not is_bm25:
                 logger.info(f"[Embed] Embedding {n:,} queries (batch_size={embed_batch_size})...")
                 vectors: list[list[float]] = []
-                for start in tqdm(
-                    range(0, n, embed_batch_size),
-                    desc="Embedding queries",
-                    unit="batch",
-                    disable=not progress_bar,
-                ):
-                    chunk = prepared_texts[start : start + embed_batch_size]
-                    vectors.extend(self._embeddings.embed_documents(chunk))
+                for start in tqdm(range(0, n, embed_batch_size), desc="Embedding queries", unit="batch", disable=not progress_bar):
+                    vectors.extend(self._embeddings.embed_documents(prepared[start : start + embed_batch_size]))
                 logger.info(f"[Embed] ✓ {len(vectors):,} vectors ready")
-            else:
-                vectors = []
 
-            # ── Stage 2a (BM25): chunked _msearch ────────────────────────────
-            if is_bm25:
-                results: list[list[tuple[Document, float]]] = []
-                pbar = tqdm(total=n, desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar)
+            # ── Stage 2: concurrent search ────────────────────────────────────
+            # One shared store — elasticsearch-py uses a thread-safe urllib3
+            # connection pool internally, so all worker threads can share it safely.
+            store = self._create_store(self._current_index_name, request_timeout=timeout)
 
-                msearch_batch_size = 1
+            def _search(idx: int):
+                if is_bm25:
+                    return idx, store.similarity_search_with_score(prepared[idx], k=top_k)
+                return idx, store.similarity_search_by_vector_with_relevance_scores(vectors[idx], k=top_k, custom_query=custom_query)
 
-                for start in range(0, n, msearch_batch_size):
-                    end = min(start + msearch_batch_size, n)
-                    batch_results = self._msearch_bm25(
-                        self._current_index_name,
-                        texts=prepared_texts[start:end],
-                        top_k=top_k,
-                    )
-                    results.extend(batch_results)
-                    pbar.update(end - start)
-                pbar.close()
-                return results
+            with ThreadPoolExecutor(max_workers=search_workers) as pool:
+                futures = {pool.submit(_search, i): i for i in range(n)}
+                for fut in tqdm(as_completed(futures), total=n, desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar):
+                    idx, hits = fut.result()
+                    results[idx] = hits
 
-            # ── Stage 2b (kNN): concurrent individual searches ────────────────
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates else None
-            return self._threaded_vector_search(
-                index_name=self._current_index_name,
-                vectors=vectors,
-                top_k=top_k,
-                num_candidates=num_candidates,
-                search_workers=search_workers,
-                custom_query=custom_query,
-                progress_bar=progress_bar,
-                desc=f"Retrieving ({strat})",
-                request_timeout=request_timeout or self._request_timeout,
-            )
+            return results  # type: ignore[return-value]
 
     def get_store(self) -> ElasticsearchStore:
         """
@@ -677,72 +616,3 @@ class ElasticsearchRagService(RagService):
         if not self._current_index_name:
             raise ValueError("No index loaded. Use load_index() first.")
         return self._create_store(self._current_index_name)
-
-    def retrieve_all_documents(
-        self,
-        batch_size: int = 1000,
-        progress_bar: bool = True,
-    ) -> list[Document]:
-        """
-        Retrieve all documents from the current index.
-        
-        Args:
-            batch_size: Number of documents to fetch per scroll request
-            progress_bar: Whether to show progress bar
-            
-        Returns:
-            List of all documents in the index
-        """
-        if not self._current_index_name:
-            raise ValueError("No index loaded. Use load_index() first.")
-        
-        store = self._create_store(self._current_index_name)
-        es_client = store.client
-        
-        # Get total document count
-        count_response = es_client.count(index=self._current_index_name)
-        total_docs = count_response['count']
-        
-        logger.info(f"Retrieving {total_docs:,} documents from '{self._current_index_name}'")
-        
-        all_documents = []
-        
-        # Initialize scroll
-        response = es_client.search(
-            index=self._current_index_name,
-            body={"query": {"match_all": {}}, "size": batch_size},
-            scroll='5m'
-        )
-        
-        scroll_id = response['_scroll_id']
-        hits = response['hits']['hits']
-        
-        pbar = tqdm(total=total_docs, desc="Fetching documents", unit="doc") if progress_bar else None
-        
-        while hits:
-            for hit in hits:
-                doc = Document(
-                    page_content=hit['_source'].get('text', ''),
-                    metadata={
-                        '_id': hit['_id'],
-                        **{k: v for k, v in hit['_source'].items() if k != 'text'}
-                    }
-                )
-                all_documents.append(doc)
-            
-            if pbar:
-                pbar.update(len(hits))
-            
-            # Get next batch
-            response = es_client.scroll(scroll_id=scroll_id, scroll='5m')
-            scroll_id = response['_scroll_id']
-            hits = response['hits']['hits']
-        
-        # Clear scroll
-        es_client.clear_scroll(scroll_id=scroll_id)
-        
-        if pbar:
-            pbar.close()
-        
-        logger.info(f"Retrieved {len(all_documents):,} documents")
-        return all_documents
