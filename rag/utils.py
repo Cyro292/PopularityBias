@@ -627,6 +627,10 @@ class IndexingConfig:
     trust_remote_code: bool = False
     distance_function: str = "COSINE"
 
+    # ── Prompt templates ─────────────────────────────────────────────────
+    passage_prompt_file: str | None = None   # path to passage/embedding prompt file
+    query_prompt_file: str | None = None     # path to query prompt file
+
     # ── Rate limiting ───────────────────────────────────────────────────
     rate_limiter: BaseRateLimiter | None = None
     requests_per_second: float | None = None

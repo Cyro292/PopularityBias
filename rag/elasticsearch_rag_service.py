@@ -52,8 +52,13 @@ class ElasticsearchRagService(RagService):
         self._current_index_name: str | None = None
         self._request_timeout: int = request_timeout
 
-        # Load prompt templates
-        self._passage_prompt, self._query_prompt = self._load_prompts()
+        # Load prompt templates (use config overrides if provided)
+        passage_file = getattr(config, "passage_prompt_file", None) if config else None
+        query_file = getattr(config, "query_prompt_file", None) if config else None
+        self._passage_prompt, self._query_prompt = self._load_prompts(
+            passage_prompt_file=passage_file,
+            query_prompt_file=query_file,
+        )
 
         if strategy == "bm25":
             self.config = config or IndexingConfig()
@@ -95,21 +100,34 @@ class ElasticsearchRagService(RagService):
     # ── Prompt helpers ───────────────────────────────────────────────────
 
     @staticmethod
-    def _load_prompts() -> tuple[str, str]:
-        """Load passage and query prompt templates from disk."""
+    def _load_prompts(
+        passage_prompt_file: str | None = None,
+        query_prompt_file: str | None = None,
+    ) -> tuple[str, str]:
+        """Load passage and query prompt templates from disk.
+
+        If explicit file paths are given they take priority, otherwise
+        the default files under ``data/prompts/`` are used.
+        """
         from config import DATA_DIR
         prompts_dir = Path(DATA_DIR) / "prompts"
 
-        def _read(filename: str, default: str) -> str:
-            path = prompts_dir / filename
+        def _read(override_path: str | None, fallback_name: str, default: str) -> str:
+            if override_path:
+                p = Path(override_path)
+                if p.exists():
+                    logger.info(f"Using custom prompt: {p}")
+                    return p.read_text().strip()
+                logger.warning(f"Custom prompt {p} not found, falling back to default")
+            path = prompts_dir / fallback_name
             if path.exists():
                 return path.read_text().strip()
-            logger.warning(f"Prompt {path} not found, using default")
+            logger.warning(f"Prompt {path} not found, using built-in default")
             return default
 
         return (
-            _read("embeding_promt.txt", "passage: {passage}"),
-            _read("query_promt.txt", "query: {query}"),
+            _read(passage_prompt_file, "embeding_promt.txt", "passage: {passage}"),
+            _read(query_prompt_file, "query_promt.txt", "query: {query}"),
         )
 
     def _prepare_query(self, query: str) -> str:
@@ -566,21 +584,23 @@ class ElasticsearchRagService(RagService):
         embed_batch_size: int = 512,
         search_workers: int = 16,
         request_timeout: int | None = None,
+        msearch_batch_size: int = 100,
     ) -> list[list[tuple[Document, float]]]:
-        """Retrieve for multiple queries concurrently using a thread pool.
+        """Retrieve for multiple queries using batched _msearch (vector) or threaded BM25.
 
-        BM25: queries run directly in threads via similarity_search_with_score.
-        Vector: all queries are batch-embedded first, then searched in threads
-        via similarity_search_by_vector_with_relevance_scores.
+        BM25: queries run in threads via similarity_search_with_score.
+        Vector/approximation: queries are batch-embedded first, then sent to ES
+        via _msearch in batches of `msearch_batch_size` — this sends many kNN
+        queries in a single HTTP request, dramatically cutting network overhead
+        compared to one-request-per-query threading.
+        Set msearch_batch_size=0 to fall back to the old threaded approach.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with self._strategy_context(strategy) as strat:
             is_bm25 = strat == "bm25" or self._embeddings is None
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and not is_bm25 else None
             prepared = [self._prepare_query(q) for q in questions]
             n = len(prepared)
-            results: list[list[tuple[Document, float]] | None] = [None] * n
             timeout = request_timeout or self._request_timeout
 
             # ── Stage 1: batch-embed (vector only) ────────────────────────────
@@ -591,19 +611,76 @@ class ElasticsearchRagService(RagService):
                     vectors.extend(self._embeddings.embed_documents(prepared[start : start + embed_batch_size]))
                 logger.info(f"[Embed] ✓ {len(vectors):,} vectors ready")
 
-            # ── Stage 2: concurrent search ────────────────────────────────────
-            # One shared store — elasticsearch-py uses a thread-safe urllib3
-            # connection pool internally, so all worker threads can share it safely.
             store = self._create_store(self._current_index_name, request_timeout=timeout)
+
+            # ── Stage 2a: vector — _msearch batching ─────────────────────────
+            if not is_bm25 and msearch_batch_size > 0:
+                nc = num_candidates or (top_k * 10)
+                results: list[list[tuple[Document, float]] | None] = [None] * n
+
+                def _hits_to_docs(hits: list[dict]) -> list[tuple[Document, float]]:
+                    out = []
+                    for hit in hits:
+                        src = hit.get("_source", {})
+                        doc = Document(
+                            page_content=src.get("text", ""),
+                            metadata=src.get("metadata", {}),
+                        )
+                        out.append((doc, float(hit.get("_score") or 0.0)))
+                    return out
+
+                def _run_msearch_batch(batch_indices: list[int]) -> list[tuple[int, list[tuple[Document, float]]]]:
+                    body: list[dict] = []
+                    for i in batch_indices:
+                        body.append({"index": self._current_index_name})
+                        body.append({
+                            "knn": {
+                                "field": "vector",
+                                "query_vector": vectors[i],
+                                "k": top_k,
+                                "num_candidates": nc,
+                            },
+                            "size": top_k,
+                            "_source": True,
+                        })
+                    resp = store.client.msearch(body=body, request_timeout=timeout)
+                    out = []
+                    for idx, response in zip(batch_indices, resp["responses"]):
+                        hits = response.get("hits", {}).get("hits", [])
+                        out.append((idx, _hits_to_docs(hits)))
+                    return out
+
+                # Split into batches and process concurrently
+                batches = [
+                    list(range(start, min(start + msearch_batch_size, n)))
+                    for start in range(0, n, msearch_batch_size)
+                ]
+                n_workers = max(1, min(search_workers, len(batches)))
+
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {pool.submit(_run_msearch_batch, b): b for b in batches}
+                    with tqdm(total=n, desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar) as pbar:
+                        for fut in as_completed(futures):
+                            for idx, hits in fut.result():
+                                results[idx] = hits
+                            pbar.update(len(futures[fut]))
+
+                return results  # type: ignore[return-value]
+
+            # ── Stage 2b: BM25 (or msearch disabled) — threaded ──────────────
+            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and not is_bm25 else None
+            results = [None] * n
 
             def _search(idx: int):
                 if is_bm25:
                     return idx, store.similarity_search_with_score(prepared[idx], k=top_k)
-                return idx, store.similarity_search_by_vector_with_relevance_scores(vectors[idx], k=top_k, custom_query=custom_query)
+                return idx, store.similarity_search_by_vector_with_relevance_scores(
+                    vectors[idx], k=top_k, custom_query=custom_query
+                )
 
             with ThreadPoolExecutor(max_workers=search_workers) as pool:
-                futures = {pool.submit(_search, i): i for i in range(n)}
-                for fut in tqdm(as_completed(futures), total=n, desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar):
+                futures_map = {pool.submit(_search, i): i for i in range(n)}
+                for fut in tqdm(as_completed(futures_map), total=n, desc=f"Retrieving ({strat})", unit="q", disable=not progress_bar):
                     idx, hits = fut.result()
                     results[idx] = hits
 
