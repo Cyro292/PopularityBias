@@ -332,16 +332,26 @@ class ElasticsearchRagService(RagService):
                     texts, metadatas, n_rows = item
 
                     logger.info(f"[Embed+Send] {len(texts):,} chunks → Modal (direct to ES) …")
-                    indexed = self._embeddings.embed_and_send_documents(
-                        texts, metadatas,
-                        es_url=self.es_url,
-                        index_name=collection_name,
-                        strategy=self.strategy,
-                        distance_strategy=getattr(self, "distance_strategy", None),
-                        es_user=self.es_user,
-                        es_password=self.es_password,
-                        request_timeout=self._request_timeout,
-                    )
+                    for attempt in range(6):
+                        try:
+                            indexed = self._embeddings.embed_and_send_documents(
+                                texts, metadatas,
+                                es_url=self.es_url,
+                                index_name=collection_name,
+                                strategy=self.strategy,
+                                distance_strategy=getattr(self, "distance_strategy", None),
+                                es_user=self.es_user,
+                                es_password=self.es_password,
+                                request_timeout=self._request_timeout,
+                            )
+                            break
+                        except Exception as err:
+                            if attempt >= 5:
+                                raise
+                            delay = [5, 15, 30, 60, 120][min(attempt, 4)]
+                            logger.warning(f"[Embed+Send] ⚠ {type(err).__name__}: {err}, "
+                                           f"retry {attempt+1}/5 in {delay}s")
+                            time.sleep(delay)
                     logger.info(f"[Embed+Send] ✓ {indexed:,} docs indexed")
 
                     with chunks_lock:
@@ -363,7 +373,17 @@ class ElasticsearchRagService(RagService):
                     texts, metadatas, n_rows = item
 
                     logger.info(f"[Embed] {len(texts):,} chunks → Modal …")
-                    embeddings = self._embeddings.embed_documents(texts)
+                    for attempt in range(6):
+                        try:
+                            embeddings = self._embeddings.embed_documents(texts)
+                            break
+                        except Exception as err:
+                            if attempt >= 5:
+                                raise
+                            delay = [5, 15, 30, 60, 120][min(attempt, 4)]
+                            logger.warning(f"[Embed] ⚠ {type(err).__name__}: {err}, "
+                                           f"retry {attempt+1}/5 in {delay}s")
+                            time.sleep(delay)
                     logger.info(f"[Embed] ✓ {len(texts):,} done → upload_queue")
 
                     while True:
