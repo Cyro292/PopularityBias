@@ -85,6 +85,9 @@ class nativeRagService(RagService):
             requests_per_second=self.config.requests_per_second,
             check_interval=self.config.rate_limit_check_interval,
             bucket_size=self.config.rate_limit_bucket_size,
+            gpu_batch_size=self.config.gpu_batch_size,
+            request_batch_size=self.config.request_batch_size,
+            normalise_embeddings=self.config.normalise_embeddings,
         )
 
         # Load embedding prompt template

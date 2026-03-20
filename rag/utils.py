@@ -137,7 +137,7 @@ def build_embeddings(
         )
     elif provider.lower() == "modal":
 
-        if not request_batch_size or not gpu_batch_size or not normalise_embeddings:
+        if request_batch_size is None or gpu_batch_size is None or normalise_embeddings is None:
             raise ValueError("Must provide both gpu_batch_size and request_batch_size and normalise_embeddings for modal")
 
         base = embedding_cls(

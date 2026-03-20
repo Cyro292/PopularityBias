@@ -238,6 +238,7 @@ class ElasticsearchRagService(RagService):
         progress_bar: bool | None = None,
         batch_size: int,
         skip_rows: int = 0,
+        end_row: Optional[int] = None,
         es_upload_batch: int = 2000,
         num_uploaders: int = 4,
         use_send_mode: bool = False,
@@ -300,6 +301,8 @@ class ElasticsearchRagService(RagService):
                     df = batch.to_pandas()
                     if rows_seen < skip_rows:
                         df = df.iloc[skip_rows - rows_seen:]
+                    if end_row is not None and rows_seen >= end_row:
+                        break
                     rows_seen += batch_len
 
                     n_rows = len(df)
@@ -627,8 +630,8 @@ class ElasticsearchRagService(RagService):
             if not is_bm25:
                 logger.info(f"[Embed] Embedding {n:,} queries (batch_size={embed_batch_size})...")
                 vectors: list[list[float]] = []
-                for start in tqdm(range(0, n, embed_batch_size), desc="Embedding queries", unit="batch", disable=not progress_bar):
-                    vectors.extend(self._embeddings.embed_documents(prepared[start : start + embed_batch_size]))
+                embeddings = self._embeddings.embed_documents(prepared)
+                vectors.extend(embeddings)
                 logger.info(f"[Embed] ✓ {len(vectors):,} vectors ready")
 
             store = self._create_store(self._current_index_name, request_timeout=timeout)

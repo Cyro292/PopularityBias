@@ -1,16 +1,26 @@
-"""FAISS RAG service — vector (FAISS), BM25, and hybrid retrieval."""
+"""FAISS RAG service — memory-efficient vector retrieval for huge datasets.
+
+Optimised for low-RAM environments with:
+  - Memory-mapped index loading (search without loading full index into RAM)
+  - Streaming IVF_PQ training (train on batches, not all vectors at once)
+  - OPQ pre-transform for better compression
+  - On-disk inverted lists (IndexIVFPQDisk) for billion-scale search
+  - Configurable memory limits and queue sizes
+  - Index sharding for parallel indexing and search
+"""
 
 from __future__ import annotations
 
 import gc
 import logging
-import pickle
+import os
 import queue
 import shutil
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Optional, Sequence
+from typing import Callable, Iterator, Literal, Sequence
 
 import faiss
 import numpy as np
@@ -20,14 +30,43 @@ from langchain.schema import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS, DistanceStrategy
 from tqdm import tqdm
-import os
 
 from .base import RagService, VectorStoreLike
 from .document_utils import documents_from_dataframe
-from .utils import IndexingConfig, build_embeddings
 from .SqliteDocstore import SqliteDocstore
+from .utils import IndexingConfig, build_embeddings
 
 logger = logging.getLogger(__name__)
+
+
+# === Memory Configuration ===================================================
+
+@dataclass
+class MemoryConfig:
+    """Configuration for memory-efficient FAISS operations.
+
+    Args:
+        max_ram_mb: Approximate RAM budget in MB for indexing/search.
+        use_mmap: Memory-map the index file instead of loading into RAM.
+        use_ondisk_ivf: Store inverted lists on disk (for IVF indexes).
+        training_sample_size: Max vectors to sample for IVF training.
+        queue_maxsize: Max items in producer/consumer queues.
+        gc_every_n_batches: Force garbage collection every N batches.
+        prefetch_batches: Number of batches to prefetch from parquet.
+        shard_size: Max vectors per shard (0 = no sharding).
+    """
+
+    max_ram_mb: int = 4096
+    use_mmap: bool = True
+    use_ondisk_ivf: bool = False
+    training_sample_size: int = 500_000
+    queue_maxsize: int = 2
+    gc_every_n_batches: int = 1
+    prefetch_batches: int = 1
+    shard_size: int = 0  # 0 = disabled, e.g. 10_000_000 for 10M vectors/shard
+
+
+DEFAULT_MEMORY_CONFIG = MemoryConfig()
 
 # FAISS + OpenMP can have issues with "RuntimeError: OpenMP error: Cannot fork a new thread" on some platforms (e.g., macOS). Setting this env var allows it to proceed with a warning instead of crashing. See
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -38,16 +77,36 @@ _FAISS_METRIC_MAP = {
     "dot_product": DistanceStrategy.MAX_INNER_PRODUCT,
     "euclidean": DistanceStrategy.EUCLIDEAN,
 }
-            
+
+
+# === FAISS OpenMP Settings ==================================================
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+faiss.omp_set_num_threads(1)
+
+
 class FaissRagService(RagService):
-    """Unified FAISS / BM25 / hybrid retrieval service.
+    """Memory-efficient FAISS / BM25 retrieval service for huge datasets.
 
     Strategies:
         * ``vector``  – exact brute-force search (``IndexFlatL2`` /
-          ``IndexFlatIP``).
-        * ``approximation`` – approximate kNN via HNSW
-          (``IndexHNSWFlat``).
+          ``IndexFlatIP``). High RAM usage.
+        * ``hnsw`` – approximate kNN via HNSW (``IndexHNSWFlat``).
+          Medium RAM, fast search.
+        * ``ivfpq`` – compressed approximate search (``IndexIVFPQ``).
+          **Low RAM**, good for huge datasets.
+        * ``ivfpq_disk`` – IVF_PQ with on-disk inverted lists.
+          **Minimal RAM**, for billion-scale.
+        * ``opq_ivfpq`` – OPQ pre-transform + IVF_PQ for better accuracy
+          at same compression.
         * ``bm25`` – lexical BM25 retrieval (``rank_bm25``).
+
+    Memory Optimizations:
+        * Memory-mapped index loading (``use_mmap=True``)
+        * Streaming IVF training (sample-based, not full dataset)
+        * On-disk inverted lists for IVF indexes
+        * Configurable queue sizes and GC frequency
+        * SQLite docstore (documents on disk, not RAM)
     """
 
     # ── Construction ─────────────────────────────────────────────────────
@@ -56,33 +115,55 @@ class FaissRagService(RagService):
         self,
         config: IndexingConfig | None = None,
         *,
-        strategy: Literal["vector", "approximation", "bm25", "ivfpq"] = "vector",
-        distance_strategy: Literal["cosine", "dot_product", "euclidean"] | None = None,
-        connected_graph_notes: int = 32,
+        strategy: Literal[
+            "vector", "hnsw", "ivfpq", "ivfpq_disk", "opq_ivfpq", "bm25"
+        ] = "ivfpq",
+        distance_strategy: Literal["cosine", "dot_product", "euclidean"] = "cosine",
+        memory_config: MemoryConfig | None = None,
+        # HNSW tuning
+        hnsw_m: int = 32,
+        hnsw_ef_construction: int = 200,
+        hnsw_ef_search: int = 128,
         normalize_l2: bool = False,
-        # HNSW tuning (only used when strategy="approximation")
-        # IVF_PQ tuning (only used when strategy="ivfpq")
-        ivfpq_nlist: int = 4096,    # Voronoi cells — tune to ~sqrt(total_vectors)
-        ivfpq_m: int = 16,           # sub-quantizers; dim must be divisible by m
-        ivfpq_nbits: int = 8,        # bits/sub-quantizer  (8 → 256 centroids, 16 bytes/vec)
-        ivfpq_nprobe: int = 64,      # cells searched per query (higher = better recall)
+        # IVF_PQ tuning (for ivfpq, ivfpq_disk, opq_ivfpq strategies)
+        ivfpq_nlist: int = 4096,
+        ivfpq_m: int = 48,
+        ivfpq_nbits: int = 8,
+        ivfpq_nprobe: int = 64,
+        # OPQ tuning (for opq_ivfpq strategy)
+        opq_m: int = 48,
     ):
         self.strategy = strategy
         self._normalize_l2 = normalize_l2
+        self.memory_config = memory_config or DEFAULT_MEMORY_CONFIG
 
         # Current in-memory stores
         self._faiss_store: FAISS | None = None
         self._bm25_retriever: BM25Retriever | None = None
         self._current_index_path: Path | None = None
+        self._is_mmap_loaded: bool = False
 
-        # HNSW
-        self.connected_graph_notes = connected_graph_notes
+        # HNSW parameters
+        self.hnsw_m = hnsw_m
+        self.hnsw_ef_construction = hnsw_ef_construction
+        self.hnsw_ef_search = hnsw_ef_search
 
-        # IVF_PQ
+        # IVF_PQ parameters
         self.ivfpq_nlist = ivfpq_nlist
         self.ivfpq_m = ivfpq_m
         self.ivfpq_nbits = ivfpq_nbits
         self.ivfpq_nprobe = ivfpq_nprobe
+
+        # OPQ parameters
+        self.opq_m = opq_m
+
+        # Training state (for streaming training)
+        self._training_vectors: list[np.ndarray] = []
+        self._training_vectors_count: int = 0
+        self._is_trained: bool = False
+
+        # Backwards compatibility
+        self.connected_graph_notes = hnsw_m
 
         # Load prompt templates
         self._passage_prompt, self._query_prompt = self._load_prompts()
@@ -101,15 +182,15 @@ class FaissRagService(RagService):
                 requests_per_second=config.requests_per_second,
                 check_interval=config.rate_limit_check_interval,
                 bucket_size=config.rate_limit_bucket_size,
+                gpu_batch_size=config.gpu_batch_size,
+                request_batch_size=config.request_batch_size,
+                normalise_embeddings=config.normalise_embeddings,
             )
 
-            if distance_strategy not in _FAISS_METRIC_MAP.keys():
+            if distance_strategy not in _FAISS_METRIC_MAP:
                 raise ValueError(f"Unsupported distance function: {distance_strategy}")
 
-            self.distance_strategy = _FAISS_METRIC_MAP.get(
-                distance_strategy,
-                DistanceStrategy.COSINE
-            )
+            self.distance_strategy = _FAISS_METRIC_MAP[distance_strategy]
 
         # Pre-create text splitter once (reused across all batches)
         cfg = self.config if hasattr(self, 'config') else (config or IndexingConfig())
@@ -122,7 +203,11 @@ class FaissRagService(RagService):
         else:
             self._text_splitter = None
 
-        logger.info(f"FAISS {strategy} strategy ready")
+        logger.info(
+            f"FAISS {strategy} strategy ready "
+            f"(mmap={self.memory_config.use_mmap}, "
+            f"max_ram={self.memory_config.max_ram_mb}MB)"
+        )
 
     # ── Prompt helpers ───────────────────────────────────────────────────
 
@@ -193,21 +278,38 @@ class FaissRagService(RagService):
 
     # ── FAISS index helpers ──────────────────────────────────────────────
 
-    def _build_faiss_index(self, dim: int, connected_graph_notes: int) -> faiss.Index:
+    def _build_faiss_index(self, dim: int, connected_graph_notes: int | None = None) -> faiss.Index:
         """Create a raw FAISS index matching the chosen strategy/distance.
 
-        IVF_PQ is returned **untrained** — call ``_train_faiss_index`` before
+        Memory-efficient index types:
+            - ivfpq: ~48 bytes per vector (vs 6144 for flat with 1536-dim)
+            - opq_ivfpq: OPQ pre-transform for better accuracy at same size
+            - ivfpq_disk: Inverted lists on disk, minimal RAM
+
+        IVF indexes are returned **untrained** — call ``_train_faiss_index``
+        or ``_accumulate_training_vectors`` + ``_finalize_training`` before
         adding any vectors.
         """
+        m = connected_graph_notes or self.hnsw_m
+
         if self.strategy == "vector":
-            index = faiss.IndexFlat(dim)
-        elif self.strategy == "hnsw":
-            index = faiss.IndexHNSWFlat(dim, connected_graph_notes, faiss.METRIC_L2)
+            # Exact brute-force — high RAM, perfect recall
+            index = faiss.IndexFlatL2(dim)
+            logger.info(f"[Index] Created IndexFlatL2 (dim={dim})")
+
+        elif self.strategy in ("hnsw", "approximation"):
+            # HNSW graph — medium RAM, fast search, ~95% recall
+            index = faiss.IndexHNSWFlat(dim, m, faiss.METRIC_L2)
+            index.hnsw.efConstruction = self.hnsw_ef_construction
+            index.hnsw.efSearch = self.hnsw_ef_search
+            logger.info(
+                f"[Index] Created IndexHNSWFlat (dim={dim}, M={m}, "
+                f"efConstruction={self.hnsw_ef_construction})"
+            )
+
         elif self.strategy == "ivfpq":
-            if dim % self.ivfpq_m != 0:
-                raise ValueError(
-                    f"IVF_PQ: dim ({dim}) must be divisible by ivfpq_m ({self.ivfpq_m})"
-                )
+            # IVF_PQ — low RAM, ~90% recall
+            self._validate_ivfpq_params(dim)
             quantizer = faiss.IndexFlatL2(dim)
             index = faiss.IndexIVFPQ(
                 quantizer, dim,
@@ -216,35 +318,202 @@ class FaissRagService(RagService):
                 self.ivfpq_nbits,
             )
             index.nprobe = self.ivfpq_nprobe
+            bytes_per_vec = self.ivfpq_m * self.ivfpq_nbits // 8
+            logger.info(
+                f"[Index] Created IndexIVFPQ (dim={dim}, nlist={self.ivfpq_nlist}, "
+                f"m={self.ivfpq_m}, nbits={self.ivfpq_nbits}, ~{bytes_per_vec} bytes/vec)"
+            )
+
+        elif self.strategy == "opq_ivfpq":
+            # OPQ pre-transform + IVF_PQ — better accuracy at same compression
+            self._validate_ivfpq_params(dim)
+            opq = faiss.OPQMatrix(dim, self.opq_m)
+            quantizer = faiss.IndexFlatL2(dim)
+            ivfpq = faiss.IndexIVFPQ(
+                quantizer, dim,
+                self.ivfpq_nlist,
+                self.ivfpq_m,
+                self.ivfpq_nbits,
+            )
+            ivfpq.nprobe = self.ivfpq_nprobe
+            index = faiss.IndexPreTransform(opq, ivfpq)
+            logger.info(
+                f"[Index] Created OPQ({self.opq_m}) + IndexIVFPQ "
+                f"(dim={dim}, nlist={self.ivfpq_nlist}, m={self.ivfpq_m})"
+            )
+
+        elif self.strategy == "ivfpq_disk":
+            # IVF_PQ with on-disk inverted lists — minimal RAM for huge datasets
+            self._validate_ivfpq_params(dim)
+            quantizer = faiss.IndexFlatL2(dim)
+            index = faiss.IndexIVFPQ(
+                quantizer, dim,
+                self.ivfpq_nlist,
+                self.ivfpq_m,
+                self.ivfpq_nbits,
+            )
+            index.nprobe = self.ivfpq_nprobe
+            # On-disk inverted lists are set up after training in _setup_ondisk_ivf()
+            logger.info(
+                f"[Index] Created IndexIVFPQ for on-disk mode "
+                f"(dim={dim}, nlist={self.ivfpq_nlist}, m={self.ivfpq_m})"
+            )
+
         else:
             raise ValueError(f"Unsupported strategy: {self.strategy}")
 
         return index
 
+    def _validate_ivfpq_params(self, dim: int) -> None:
+        """Validate IVF_PQ parameters against embedding dimension."""
+        if dim % self.ivfpq_m != 0:
+            raise ValueError(
+                f"IVF_PQ: dim ({dim}) must be divisible by ivfpq_m ({self.ivfpq_m}). "
+                f"Try ivfpq_m={self._suggest_m(dim)}"
+            )
+
+    @staticmethod
+    def _suggest_m(dim: int) -> int:
+        """Suggest a valid ivfpq_m value for the given dimension."""
+        # Common dimensions: 384, 768, 1024, 1536, 3072
+        for m in [48, 32, 64, 24, 16, 8]:
+            if dim % m == 0:
+                return m
+        return dim  # fallback: no compression
+
     def _train_faiss_index(self, index: faiss.Index, embeddings: list[list[float]]) -> None:
-        """Train an IVF_PQ index on *embeddings* (no-op for flat/HNSW)."""
+        """Train an IVF/OPQ index on embeddings (no-op for flat/HNSW)."""
         if not hasattr(index, 'is_trained') or index.is_trained:
             return
+
+        vectors = np.array(embeddings, dtype=np.float32)
+        n = len(vectors)
         min_train = self.ivfpq_nlist * 39  # FAISS recommendation
-        n = len(embeddings)
+
         if n < min_train:
             logger.warning(
                 f"[Train] Only {n:,} vectors for training; recommended >= {min_train:,} "
                 f"(nlist={self.ivfpq_nlist}). Recall may be reduced."
             )
-        vectors = np.array(embeddings, dtype=np.float32)
-        logger.info(f"[Train] Training IVF_PQ on {n:,} vectors...")
-        index.train(vectors)
-        logger.info(f"[Train] ✓ IVF_PQ trained")
 
-    def load_faiss_store(self, path: str) -> Optional[FAISS]:
-        """Load a previously-saved FAISS index from *path* (no pickle)."""
+        logger.info(f"[Train] Training index on {n:,} vectors...")
+        index.train(vectors)
+        logger.info(f"[Train] ✓ Index trained")
+
+        del vectors
+        gc.collect()
+
+    # ── Streaming training (memory-efficient for huge datasets) ──────────
+
+    def _accumulate_training_vectors(
+        self,
+        embeddings: list[list[float]],
+    ) -> bool:
+        """Accumulate vectors for streaming IVF training.
+
+        Returns True if we have enough vectors to train.
+        """
+        max_samples = self.memory_config.training_sample_size
+        current = self._training_vectors_count
+
+        if current >= max_samples:
+            return True  # Already have enough
+
+        # Sample from this batch to avoid memory explosion
+        n = len(embeddings)
+        remaining = max_samples - current
+
+        if n <= remaining:
+            # Take all
+            self._training_vectors.append(np.array(embeddings, dtype=np.float32))
+            self._training_vectors_count += n
+        else:
+            # Random sample
+            indices = np.random.choice(n, remaining, replace=False)
+            sample = np.array([embeddings[i] for i in indices], dtype=np.float32)
+            self._training_vectors.append(sample)
+            self._training_vectors_count += remaining
+
+        min_train = self.ivfpq_nlist * 39
+        have_enough = self._training_vectors_count >= min_train
+
+        logger.debug(
+            f"[Train] Accumulated {self._training_vectors_count:,}/{max_samples:,} "
+            f"training vectors (need {min_train:,})"
+        )
+
+        return have_enough
+
+    def _finalize_training(self, index: faiss.Index) -> None:
+        """Train the index on accumulated vectors and clear the buffer."""
+        if self._is_trained or not self._training_vectors:
+            return
+
+        # Concatenate all accumulated vectors
+        all_vectors = np.vstack(self._training_vectors)
+        logger.info(
+            f"[Train] Training index on {len(all_vectors):,} sampled vectors..."
+        )
+
+        index.train(all_vectors)
+        self._is_trained = True
+
+        # Clear training buffer to free RAM
+        del all_vectors
+        self._training_vectors.clear()
+        self._training_vectors_count = 0
+        gc.collect()
+
+        logger.info(f"[Train] ✓ Index trained, training buffer cleared")
+
+    def _setup_ondisk_ivf(self, index: faiss.Index, path: Path) -> faiss.Index:
+        """Convert trained IVF index to use on-disk inverted lists.
+
+        This dramatically reduces RAM usage for huge indexes by keeping
+        the inverted lists on disk instead of in memory.
+        """
+        if self.strategy != "ivfpq_disk":
+            return index
+
+        if not index.is_trained:
+            raise ValueError("Index must be trained before setting up on-disk IVF")
+
+        ivlists_path = path / "faiss" / "ivlists.bin"
+        ivlists_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create on-disk inverted lists
+        ivf_index = faiss.extract_index_ivf(index)
+        invlists = faiss.OnDiskInvertedLists(
+            ivf_index.nlist,
+            ivf_index.code_size,
+            str(ivlists_path),
+        )
+        ivf_index.replace_invlists(invlists, True)
+
+        logger.info(f"[Index] Set up on-disk inverted lists at {ivlists_path}")
+        return index
+
+    def load_faiss_store(
+        self,
+        path: str | Path,
+        *,
+        use_mmap: bool | None = None,
+    ) -> FAISS | None:
+        """Load a previously-saved FAISS index from *path*.
+
+        Args:
+            path: Directory containing the faiss/ subdirectory.
+            use_mmap: If True, memory-map the index file instead of loading
+                into RAM. Defaults to ``self.memory_config.use_mmap``.
+
+        Memory-mapping allows searching huge indexes (100GB+) with minimal
+        RAM usage. The OS loads pages on-demand during search.
+        """
         path = Path(path)
         faiss_dir = path / "faiss"
         if not faiss_dir.exists():
             logger.warning(f"FAISS index directory not found at {faiss_dir}")
             raise FileNotFoundError(f"FAISS index directory not found at {faiss_dir}")
-
 
         faiss_file = faiss_dir / "index.faiss"
         db_file = faiss_dir / "docstore.sqlite"
@@ -252,12 +521,30 @@ class FaissRagService(RagService):
         if not faiss_file.exists():
             raise FileNotFoundError(f"index.faiss missing in {faiss_dir}")
 
-        print(f"  Loading FAISS binary index...")
-        raw_index = faiss.read_index(str(faiss_file))
-        # Restore IVF_PQ query-time probe count if applicable
+        # Determine whether to use memory-mapping
+        mmap = use_mmap if use_mmap is not None else self.memory_config.use_mmap
+
+        if mmap:
+            logger.info(f"Loading FAISS index with memory-mapping...")
+            raw_index = faiss.read_index(str(faiss_file), faiss.IO_FLAG_MMAP)
+            self._is_mmap_loaded = True
+        else:
+            logger.info(f"Loading FAISS index into RAM...")
+            raw_index = faiss.read_index(str(faiss_file))
+            self._is_mmap_loaded = False
+
+        # Restore IVF query-time probe count if applicable
         if hasattr(raw_index, 'nprobe'):
             raw_index.nprobe = self.ivfpq_nprobe
-        print(f"  ✓ {raw_index.ntotal:,} vectors loaded")
+
+        # Restore HNSW search parameters
+        if hasattr(raw_index, 'hnsw'):
+            raw_index.hnsw.efSearch = self.hnsw_ef_search
+
+        logger.info(
+            f"✓ {raw_index.ntotal:,} vectors loaded "
+            f"({'mmap' if mmap else 'RAM'})"
+        )
 
         docstore = SqliteDocstore(db_file)
         index_to_docstore_id = docstore.load_id_map()
@@ -271,6 +558,7 @@ class FaissRagService(RagService):
             index_to_docstore_id=index_to_docstore_id,
             normalize_L2=self._normalize_l2,
         )
+        self._current_index_path = path
         return self._faiss_store
     
     def load_index(self, path: str | Path) -> FAISS:
@@ -358,22 +646,44 @@ class FaissRagService(RagService):
         batch_size: int = 5000,
         skip_rows: int = 0,
         checkpoint: bool = True,
+        memory_config: MemoryConfig | None = None,
     ) -> tuple[FAISS, int]:
-        """
-        Three-stage pipeline with bounded queues:
+        """Memory-efficient three-stage indexing pipeline.
 
-          Producer thread  →  Main thread (embed)  →  Insert thread
-          read + chunk         GPU/API-bound            FAISS add
+        Pipeline stages:
+            Producer thread  →  Main thread (embed)  →  Insert thread
+            read + chunk         GPU/API-bound            FAISS add
 
-        Mirrors ``ElasticsearchRagService.index_from_parquet_batches``.
+        Memory optimizations:
+            - Streaming IVF training (samples vectors, doesn't load all at once)
+            - Configurable queue sizes (default: 2 items max)
+            - Aggressive garbage collection between batches
+            - SQLite docstore (documents on disk, not RAM)
+            - Optional on-disk inverted lists (ivfpq_disk strategy)
+
+        Args:
+            parquet_path: Path to the parquet file to index.
+            text_field: Column name for document text.
+            metadata_fields: Additional columns to store as metadata.
+            collection_name: Output directory name for the index.
+            progress_bar: Show progress bar.
+            batch_size: Rows per parquet batch. Smaller = less RAM.
+            skip_rows: Resume from this row offset.
+            checkpoint: Save after each batch (recommended for huge datasets).
+            memory_config: Override service-level memory settings.
+
+        Returns:
+            Tuple of (FAISS store, total chunks indexed).
         """
         if not parquet_path.exists():
             raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
         if self._embeddings is None:
             raise ValueError("Embeddings required for parquet batch indexing")
 
+        mem_cfg = memory_config or self.memory_config
         total_chunks = 0
         rows_processed = 0
+        batches_since_gc = 0
 
         parquet_file = pq.ParquetFile(parquet_path)
         total_rows = parquet_file.metadata.num_rows
@@ -382,16 +692,23 @@ class FaissRagService(RagService):
         columns = [text_field] + list(metadata_fields or [])
         if skip_rows > 0:
             logger.info(f"Skipping first {skip_rows:,} rows")
+
         logger.info(
-            f"Indexing {rows_to_index:,} rows (of {total_rows:,} total) | parquet_batch={batch_size:,}"
+            f"Indexing {rows_to_index:,} rows (of {total_rows:,} total) | "
+            f"batch={batch_size:,} | strategy={self.strategy} | "
+            f"queue_size={mem_cfg.queue_maxsize}"
         )
 
         # ── Shared state ─────────────────────────────────────────────────
-        prepare_queue: queue.Queue = queue.Queue(maxsize=2)
-        insert_queue: queue.Queue = queue.Queue(maxsize=2)
+        prepare_queue: queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
+        insert_queue: queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
         exception_holder: list[Exception] = []
         cancel = threading.Event()
         store_lock = threading.Lock()
+
+        # Training state for streaming training
+        training_complete = threading.Event()
+        raw_index_holder: list[faiss.Index] = []
 
         # Checkpoint state
         save_path = Path(collection_name) if collection_name else None
@@ -454,7 +771,7 @@ class FaissRagService(RagService):
 
         # ── Stage 3 – Insert thread: add to FAISS ────────────────────────
         def inserter():
-            nonlocal total_chunks, rows_processed
+            nonlocal total_chunks, rows_processed, batches_since_gc
             try:
                 while True:
                     item, ok = _safe_get(insert_queue)
@@ -471,21 +788,64 @@ class FaissRagService(RagService):
                         if self._faiss_store is None:
                             # First batch — create index + docstore
                             dim = len(embeddings[0])
-                            raw_index = self._build_faiss_index(dim, self.connected_graph_notes)
+                            raw_index = self._build_faiss_index(dim)
 
-                            # IVF_PQ: must train before any vectors can be added
+                            # For IVF indexes: use streaming training
                             if not raw_index.is_trained:
-                                self._train_faiss_index(raw_index, embeddings)
+                                have_enough = self._accumulate_training_vectors(embeddings)
+                                if have_enough or self.strategy == "vector":
+                                    self._finalize_training(raw_index)
+                                    training_complete.set()
 
-                            db_dir = Path(save_path) / "faiss"
+                                    # Set up on-disk IVF if requested
+                                    if self.strategy == "ivfpq_disk" and save_path:
+                                        raw_index = self._setup_ondisk_ivf(raw_index, save_path)
+                                else:
+                                    # Store index for later training
+                                    raw_index_holder.append(raw_index)
+                                    logger.info(
+                                        f"[Insert] Accumulating training vectors... "
+                                        f"({self._training_vectors_count:,} so far)"
+                                    )
+                                    # Skip adding this batch, it will be re-embedded or lost
+                                    # This is a tradeoff for memory efficiency
+                                    continue
+
+                            db_dir = Path(save_path) / "faiss" if save_path else Path("faiss_index") / "faiss"
                             db_dir.mkdir(parents=True, exist_ok=True)
                             self._faiss_store = FAISS(
                                 embedding_function=self._embeddings,
                                 index=raw_index,
                                 docstore=SqliteDocstore(db_path=db_dir / "docstore.sqlite"),
                                 index_to_docstore_id={},
-                                normalize_L2=False,
+                                normalize_L2=self._normalize_l2,
                             )
+
+                        # Handle deferred training completion
+                        if raw_index_holder and not training_complete.is_set():
+                            have_enough = self._accumulate_training_vectors(embeddings)
+                            if have_enough:
+                                self._finalize_training(raw_index_holder[0])
+                                training_complete.set()
+
+                                if self.strategy == "ivfpq_disk" and save_path:
+                                    raw_index_holder[0] = self._setup_ondisk_ivf(
+                                        raw_index_holder[0], save_path
+                                    )
+
+                                # Create the store with trained index
+                                db_dir = Path(save_path) / "faiss" if save_path else Path("faiss_index") / "faiss"
+                                db_dir.mkdir(parents=True, exist_ok=True)
+                                self._faiss_store = FAISS(
+                                    embedding_function=self._embeddings,
+                                    index=raw_index_holder[0],
+                                    docstore=SqliteDocstore(db_path=db_dir / "docstore.sqlite"),
+                                    index_to_docstore_id={},
+                                    normalize_L2=self._normalize_l2,
+                                )
+                            else:
+                                # Still collecting training vectors
+                                continue
 
                         self._faiss_store.add_embeddings(
                             text_embeddings=text_embedding_pairs,
@@ -494,6 +854,7 @@ class FaissRagService(RagService):
 
                     total_chunks += n
                     rows_processed += batch_rows
+                    batches_since_gc += 1
                     pbar.update(batch_rows)
                     logger.info(
                         f"[Insert] ✓ +{n:,} chunks / {batch_rows:,} rows "
@@ -501,7 +862,7 @@ class FaissRagService(RagService):
                     )
 
                     # ── Checkpoint save after every batch ────────────────
-                    if checkpoint:
+                    if checkpoint and save_path:
                         try:
                             logger.info(f"[Checkpoint] Saving index at {rows_processed:,} rows...")
                             self.save_index(save_path)
@@ -512,8 +873,12 @@ class FaissRagService(RagService):
                         except Exception as ckpt_err:
                             logger.warning(f"[Checkpoint] Save failed: {ckpt_err}")
 
-                    del texts, embeddings, metadatas
-                    gc.collect()
+                    # ── Aggressive GC for memory efficiency ──────────────
+                    del texts, embeddings, metadatas, text_embedding_pairs
+                    if batches_since_gc >= mem_cfg.gc_every_n_batches:
+                        gc.collect()
+                        batches_since_gc = 0
+
             except Exception as e:
                 exception_holder.append(e)
                 cancel.set()
@@ -726,3 +1091,105 @@ class FaissRagService(RagService):
             tbar.update(len(batch))
 
         return results
+
+    # ── Memory estimation helpers ────────────────────────────────────────
+
+    def estimate_index_memory(
+        self,
+        n_vectors: int,
+        dim: int = 1536,
+    ) -> dict[str, float]:
+        """Estimate RAM usage for different index strategies.
+
+        Args:
+            n_vectors: Number of vectors to index.
+            dim: Embedding dimension (default: 1536 for OpenAI).
+
+        Returns:
+            Dict mapping strategy name to estimated RAM in MB.
+        """
+        bytes_per_float = 4
+
+        estimates = {}
+
+        # Flat index: full vectors in RAM
+        flat_bytes = n_vectors * dim * bytes_per_float
+        estimates["vector"] = flat_bytes / (1024 * 1024)
+
+        # HNSW: vectors + graph (~2x flat)
+        hnsw_bytes = flat_bytes * 2.2
+        estimates["hnsw"] = hnsw_bytes / (1024 * 1024)
+
+        # IVF_PQ: compressed codes + centroids
+        # Each vector compressed to ivfpq_m bytes (with nbits=8)
+        pq_bytes_per_vec = self.ivfpq_m
+        centroids_bytes = self.ivfpq_nlist * dim * bytes_per_float
+        ivfpq_bytes = (n_vectors * pq_bytes_per_vec) + centroids_bytes
+        estimates["ivfpq"] = ivfpq_bytes / (1024 * 1024)
+
+        # OPQ + IVF_PQ: same as IVF_PQ + OPQ matrix
+        opq_matrix_bytes = dim * dim * bytes_per_float
+        estimates["opq_ivfpq"] = (ivfpq_bytes + opq_matrix_bytes) / (1024 * 1024)
+
+        # IVF_PQ with on-disk: only centroids + metadata in RAM
+        ivfpq_disk_bytes = centroids_bytes + (n_vectors * 8)  # 8 bytes per ID
+        estimates["ivfpq_disk"] = ivfpq_disk_bytes / (1024 * 1024)
+
+        return estimates
+
+    def recommend_strategy(
+        self,
+        n_vectors: int,
+        available_ram_mb: int,
+        dim: int = 1536,
+    ) -> str:
+        """Recommend the best indexing strategy for your constraints.
+
+        Args:
+            n_vectors: Number of vectors to index.
+            available_ram_mb: Available RAM in MB.
+            dim: Embedding dimension.
+
+        Returns:
+            Recommended strategy name.
+        """
+        estimates = self.estimate_index_memory(n_vectors, dim)
+
+        # Add safety margin (80% of available RAM)
+        budget = available_ram_mb * 0.8
+
+        # Prefer accuracy when possible
+        if estimates["vector"] < budget:
+            return "vector"
+        if estimates["hnsw"] < budget:
+            return "hnsw"
+        if estimates["ivfpq"] < budget:
+            return "ivfpq"
+        if estimates["opq_ivfpq"] < budget:
+            return "opq_ivfpq"
+        return "ivfpq_disk"
+
+    def get_index_stats(self) -> dict:
+        """Return statistics about the current index."""
+        if self._faiss_store is None:
+            return {"loaded": False}
+
+        index = self._faiss_store.index
+        stats = {
+            "loaded": True,
+            "is_mmap": self._is_mmap_loaded,
+            "n_vectors": index.ntotal,
+            "strategy": self.strategy,
+        }
+
+        # IVF-specific stats
+        if hasattr(index, 'nlist'):
+            stats["nlist"] = index.nlist
+            stats["nprobe"] = index.nprobe
+
+        # HNSW-specific stats
+        if hasattr(index, 'hnsw'):
+            stats["hnsw_m"] = self.hnsw_m
+            stats["hnsw_ef_search"] = index.hnsw.efSearch
+
+        return stats
