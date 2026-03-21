@@ -227,6 +227,305 @@ def _compute_stats(
 # Public API
 # ---------------------------------------------------------------------------
 
+def load_or_compute_corpus_vectorizer(
+    metadata_path: Path | str,
+    corpus_path: Path | str,
+    boundaries: np.ndarray,
+    *,
+    sample_per_decile: int = 20_000,
+    max_features: int = 50_000,
+    chunk_size: int | None = 1000,
+    chunk_overlap: int = 100,
+    force_recompute: bool = False,
+) -> "TfidfVectorizer":  # type: ignore[name-defined]  # noqa: F821
+    """Return a ``TfidfVectorizer`` fitted on a stratified corpus sample.
+
+    The fitted vectorizer is cached as a ``tfidf_vectorizer_<key>.pkl`` file
+    in the same directory as *metadata_path*.  On subsequent calls the cached
+    file is loaded directly (fast) unless *force_recompute* is ``True``.
+
+    The vectorizer is fitted with the same settings used by
+    :func:`load_or_compute_tfidf_stats` so that IDF values are consistent
+    across both functions.
+
+    Parameters
+    ----------
+    metadata_path : Path | str
+        Path to ``metadata.json`` — used only to derive the cache directory.
+    corpus_path : Path | str
+        Path to the Parquet corpus file.
+    boundaries : np.ndarray
+        Decile boundary array as returned by ``boundaries_for``.
+    sample_per_decile : int
+        Documents sampled per decile when building the vectorizer.
+    max_features : int
+        Vocabulary cap — must match the value passed to
+        :func:`load_or_compute_tfidf_stats`.
+    chunk_size : int | None
+        If set, documents are chunked before fitting (same as in
+        :func:`load_or_compute_tfidf_stats`).
+    chunk_overlap : int
+        Chunk overlap in characters.
+    force_recompute : bool
+        Skip the cache and recompute from scratch.
+
+    Returns
+    -------
+    sklearn.feature_extraction.text.TfidfVectorizer
+        A fitted vectorizer whose ``idf_`` array reflects corpus-wide term
+        rarity.
+    """
+    import pickle
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    metadata_path = Path(metadata_path)
+    cache_dir = metadata_path.parent
+    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile)
+    pkl_path = cache_dir / f"tfidf_vectorizer_{key}.pkl"
+
+    if not force_recompute and pkl_path.exists():
+        print(f"✓ Loading corpus vectorizer from cache: {pkl_path.name}")
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+
+    print(
+        f"No vectorizer cache found — sampling corpus and fitting "
+        f"(sample_per_decile={sample_per_decile}, max_features={max_features})…"
+    )
+    texts, deciles = _reservoir_sample_corpus(corpus_path, boundaries, sample_per_decile)
+
+    if chunk_size:
+        print(f"  Chunking {len(texts):,} docs (size={chunk_size}, overlap={chunk_overlap})…")
+        texts, deciles = _chunk_texts(texts, deciles, chunk_size, chunk_overlap)
+        print(f"  → {len(texts):,} chunks")
+
+    print(f"  Fitting TfidfVectorizer on {len(texts):,} texts…")
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        strip_accents="unicode",
+        sublinear_tf=True,
+        min_df=2,
+    )
+    vectorizer.fit(texts)
+    print(f"  Vocabulary: {len(vectorizer.vocabulary_):,} terms")
+
+    with open(pkl_path, "wb") as f:
+        pickle.dump(vectorizer, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"✓ Saved corpus vectorizer → {pkl_path.name}")
+
+    return vectorizer
+
+
+def compute_tfidf_stats_for_ids(
+    query_df: "pd.DataFrame",
+    corpus_path: Path | str,
+    *,
+    decile_col: str,
+    group_col: str | None = None,
+    corpus_vectorizer: "TfidfVectorizer | None" = None,  # type: ignore[name-defined]  # noqa: F821
+    max_features: int = 50_000,
+    chunk_size: int | None = None,
+    chunk_overlap: int = 100,
+) -> "dict[str, dict[int, dict]]":
+    """Compute per-(group, decile) TF-IDF statistics from the target documents
+    of a set of queries, using corpus-wide IDF values when available.
+
+    For each query row in *query_df* the function fetches the corresponding
+    gold document text from *corpus_path* by ``wikipedia_id``.  It then uses
+    *corpus_vectorizer* (a ``TfidfVectorizer`` pre-fitted on the full corpus)
+    to **transform** (not re-fit) those texts, ensuring that IDF values reflect
+    term rarity across the whole corpus rather than just the query subset.
+
+    When *corpus_vectorizer* is ``None`` the function falls back to fitting a
+    new vectorizer on the query target docs only (original behaviour).
+
+    Parameters
+    ----------
+    query_df : pd.DataFrame
+        Must contain ``wikipedia_id`` and the column named by *decile_col*.
+        If *group_col* is provided that column must also be present.
+    corpus_path : Path | str
+        Path to the Parquet corpus (``wikipedia_id`` int64, ``text`` string).
+    decile_col : str
+        Name of the 0-based decile column in *query_df*.
+    group_col : str | None
+        Column to split results by (e.g. ``"dataset"``).  ``None`` → single
+        group keyed ``"all"``.
+    corpus_vectorizer : TfidfVectorizer | None
+        A ``TfidfVectorizer`` already fitted on the corpus (e.g. from
+        :func:`load_or_compute_corpus_vectorizer`).  When supplied, IDF values
+        come from the corpus; when ``None``, a new vectorizer is fitted on the
+        query target docs.
+    max_features : int
+        Vocabulary cap — only used when *corpus_vectorizer* is ``None``.
+    chunk_size : int | None
+        When set, each document is split into chunks before TF-IDF is applied.
+    chunk_overlap : int
+        Overlap between consecutive chunks.
+
+    Returns
+    -------
+    dict mapping group_label → dict mapping decile_int → stats_dict.
+
+    Stats dict keys: ``n_docs_sampled``, ``n_source_docs``,
+    ``mean_unique_terms``, ``std_unique_terms``, ``mean_tfidf_score``,
+    ``mean_idf_of_used_terms``, ``vocab_coverage``, ``mean_chunk_length``,
+    ``std_chunk_length``, ``mean_tf_score``.
+    """
+    import pyarrow.parquet as pq
+    from tqdm.auto import tqdm
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    corpus_path = Path(corpus_path)
+
+    # ── 1. Fetch target document texts from corpus ────────────────────────────
+    needed_ids = set(str(wid).strip() for wid in query_df["wikipedia_id"].dropna())
+    print(f"  Fetching {len(needed_ids):,} unique document IDs from corpus…")
+
+    id_to_text: dict[str, str] = {}
+    pf = pq.ParquetFile(str(corpus_path))
+    for batch in tqdm(
+        pf.iter_batches(batch_size=100_000, columns=["wikipedia_id", "text"]),
+        desc="Scanning corpus",
+    ):
+        batch_df = batch.to_pandas()
+        batch_df["wikipedia_id"] = batch_df["wikipedia_id"].astype(str).str.strip()
+        mask = batch_df["wikipedia_id"].isin(needed_ids)
+        for wid, text in zip(
+            batch_df.loc[mask, "wikipedia_id"], batch_df.loc[mask, "text"]
+        ):
+            if wid not in id_to_text and isinstance(text, str) and text.strip():
+                id_to_text[wid] = text
+        if len(id_to_text) >= len(needed_ids):
+            break
+
+    print(f"  Matched {len(id_to_text):,} / {len(needed_ids):,} IDs in corpus")
+
+    # ── 2. Build per-group (text, decile) lists ───────────────────────────────
+    if group_col and group_col in query_df.columns:
+        groups = sorted(query_df[group_col].dropna().astype(str).unique())
+    else:
+        group_col = None
+        groups = ["all"]
+
+    group_texts: dict[str, list[tuple[str, int]]] = {g: [] for g in groups}
+    for _, row in query_df.iterrows():
+        wid = str(row["wikipedia_id"]).strip()
+        text = id_to_text.get(wid)
+        if text is None:
+            continue
+        decile = int(row[decile_col])
+        grp = str(row[group_col]) if group_col else "all"
+        group_texts[grp].append((text, decile))
+
+    # ── 3. Assemble flat text list (optionally chunked) ───────────────────────
+    all_texts: list[str] = []
+    all_labels: list[tuple[str, int]] = []   # (group, decile)
+    all_source_labels: list[tuple[str, int]] = []
+
+    for grp, pairs in group_texts.items():
+        if not pairs:
+            continue
+        texts_g, deciles_g = zip(*pairs)
+        texts_g = list(texts_g)
+        deciles_g = list(deciles_g)
+
+        if chunk_size:
+            chunks_g, chunk_deciles_g = _chunk_texts(texts_g, deciles_g, chunk_size, chunk_overlap)
+            for t, d in zip(chunks_g, chunk_deciles_g):
+                all_texts.append(t)
+                all_labels.append((grp, d))
+            for d in deciles_g:
+                all_source_labels.append((grp, d))
+        else:
+            for t, d in zip(texts_g, deciles_g):
+                all_texts.append(t)
+                all_labels.append((grp, d))
+
+    if not all_texts:
+        print("  ⚠ No texts found — returning empty stats")
+        return {}
+
+    # ── 4. Transform texts using corpus vectorizer (or fit a new one) ─────────
+    if corpus_vectorizer is not None:
+        print(
+            f"  Transforming {len(all_texts):,} texts with corpus vectorizer "
+            f"(vocab={len(corpus_vectorizer.vocabulary_):,})…"
+        )
+        tfidf_matrix = corpus_vectorizer.transform(all_texts)
+        idf_values = corpus_vectorizer.idf_
+        vocab_size = len(corpus_vectorizer.vocabulary_)
+    else:
+        print(
+            f"  No corpus vectorizer supplied — fitting on {len(all_texts):,} "
+            f"query target texts (vocab cap {max_features:,})…"
+        )
+        vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            strip_accents="unicode",
+            sublinear_tf=True,
+            min_df=2,
+        )
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        idf_values = vectorizer.idf_
+        vocab_size = len(vectorizer.vocabulary_)
+
+    print(f"  Vocabulary in use: {vocab_size:,} terms")
+
+    labels_arr = np.array(all_labels, dtype=object)   # shape (N, 2)
+    texts_arr = np.array(all_texts, dtype=object)
+
+    # ── 5. Compute stats per (group, decile) ──────────────────────────────────
+    results: dict[str, dict[int, dict]] = {g: {} for g in groups}
+
+    for grp in groups:
+        source_counts: dict[int, int] = {}
+        if chunk_size:
+            for sg, sd in all_source_labels:
+                if sg == grp:
+                    source_counts[sd] = source_counts.get(sd, 0) + 1
+
+        for d in range(_NUM_DECILES):
+            mask = (labels_arr[:, 0] == grp) & (labels_arr[:, 1].astype(int) == d)
+            n = int(mask.sum())
+            if n == 0:
+                continue
+
+            sub = tfidf_matrix[mask]
+            texts_sub = texts_arr[mask]
+
+            unique_per_doc = np.diff(sub.indptr).astype(float)
+            nnz = sub.nnz
+            mean_score = float(sub.sum() / nnz) if nnz > 0 else 0.0
+            used_idx = np.unique(sub.nonzero()[1])
+            mean_idf = float(idf_values[used_idx].mean()) if len(used_idx) > 0 else 0.0
+            vocab_cover = float(len(used_idx) / vocab_size)
+            lengths = np.array([len(t) for t in texts_sub])
+            mean_chunk_len = float(np.mean(lengths))
+            std_chunk_len = float(np.std(lengths))
+            coo = sub.tocoo()
+            if coo.nnz > 0:
+                tf_vals = coo.data / idf_values[coo.col]
+                mean_tf = float(np.mean(tf_vals))
+            else:
+                mean_tf = 0.0
+
+            results[grp][d] = {
+                "n_docs_sampled": n,
+                "n_source_docs": source_counts.get(d, n),
+                "mean_unique_terms": float(np.mean(unique_per_doc)),
+                "std_unique_terms": float(np.std(unique_per_doc)),
+                "mean_tfidf_score": mean_score,
+                "mean_idf_of_used_terms": mean_idf,
+                "vocab_coverage": vocab_cover,
+                "mean_chunk_length": mean_chunk_len,
+                "std_chunk_length": std_chunk_len,
+                "mean_tf_score": mean_tf,
+            }
+
+    return results
+
+
 def load_or_compute_tfidf_stats(
     metadata_path: Path | str,
     corpus_path: Path | str,
