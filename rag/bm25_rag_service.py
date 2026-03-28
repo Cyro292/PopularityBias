@@ -123,15 +123,30 @@ class BM25RagService(RagService):
         ...     output_dir=Path("./bm25_index")
         ... )
         >>> results = service.retrieve_documents(index, "your query", top_k=5)
+
+        # Disable length normalisation:
+        >>> service = BM25RagService(b=0.0)
+
+        # Tune both BM25 parameters:
+        >>> service = BM25RagService(b=0.5, k1=1.2)
     """
 
-    def __init__(self, k: int = 5):
+    def __init__(self, k: int = 5, *, b: float = 0.75, k1: float = 1.5):
         """Initialize BM25 RAG service.
 
         Args:
             k: Default number of documents to retrieve.
+            b: Length normalisation parameter (BM25 ``b``). Controls how much
+                document length influences scoring. ``0`` disables length
+                normalisation; ``1`` applies full normalisation. Default is
+                ``0.75`` (rank-bm25 default).
+            k1: Term saturation parameter (BM25 ``k1``). Controls how quickly
+                term-frequency contributions saturate. Typical range 1.2–2.0.
+                Default is ``1.5`` (rank-bm25 default).
         """
         self.k = k
+        self.b = b
+        self.k1 = k1
 
     def index_from_parquet(
         self,
@@ -183,7 +198,10 @@ class BM25RagService(RagService):
         logger.info(f"Converted {len(df)} rows to {len(documents)} documents")
 
         # Create BM25 retriever
-        retriever = BM25Retriever.from_documents(documents)
+        retriever = BM25Retriever.from_documents(
+            documents,
+            bm25_params={"b": self.b, "k1": self.k1},
+        )
         retriever.k = self.k
 
         index = BM25Index(retriever)
@@ -238,7 +256,10 @@ class BM25RagService(RagService):
         logger.info(f"Converted {len(df)} rows to {len(documents)} documents")
 
         # Create BM25 retriever
-        retriever = BM25Retriever.from_documents(documents)
+        retriever = BM25Retriever.from_documents(
+            documents,
+            bm25_params={"b": self.b, "k1": self.k1},
+        )
         retriever.k = self.k
 
         index = BM25Index(retriever)

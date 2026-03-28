@@ -19,9 +19,9 @@ except ImportError:
 # ── Configuration ─────────────────────────────────────────────────────────────
 APP_NAME = "PopularityBias_Thesis_Amon_Embedding_Service"
 # MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-# MODEL_NAME = "Lajavaness/bilingual-embedding-small"
+MODEL_NAME = "Lajavaness/bilingual-embedding-small"
 # MODEL_NAME = "intfloat/multilingual-e5-small"
-MODEL_NAME = "intfloat/multilingual-e5-large"
+# MODEL_NAME = "intfloat/multilingual-e5-large"
 GPU_CONFIG = "A10"
 DEFAULT_GPU_BATCH_SIZE = 512  # Max batch size for A10, can be tuned based on actual GPU memory and model requirements
 DEFAULT_BATCH_SIZE = 2048  # Max batch size for A10, can be tuned based on actual GPU memory and model requirements

@@ -10,6 +10,12 @@ Public API
 ``plot_tfidf_stats``
     Produces a 3-panel matplotlib figure (vocabulary breadth, keyword
     intensity, term specificity) from the stats dict and saves it to disk.
+
+Cache versioning
+----------------
+``TFIDF_STATS_VERSION`` is embedded in every cached entry.  When the
+computation logic changes, bump this constant so that old caches are
+automatically detected as stale and recomputed on the next run.
 """
 
 from __future__ import annotations
@@ -25,6 +31,10 @@ import pandas as pd
 # Keys used inside metadata.json
 _CACHE_KEY = "decile_tfidf_stats"
 _NUM_DECILES = 10
+
+# Bump this whenever the stats computation changes so cached entries are
+# automatically invalidated on the next run.
+TFIDF_STATS_VERSION = 2
 
 
 def _cache_key(chunk_size: int | None, chunk_overlap: int, sample_per_decile: int) -> str:
@@ -159,8 +169,21 @@ def _compute_stats(
         sublinear_tf=True, 
         min_df=2,
     )
-    tfidf_matrix = vectorizer.fit_transform(texts)  # CSR (n_docs, vocab)
+    tfidf_matrix = vectorizer.fit_transform(texts)  # CSR (n_docs, vocab), L2-normalised
     idf_values = vectorizer.idf_                    # shape (vocab,)
+
+    # Un-normalised TF-IDF matrix (same vocab, no L2 norm) — used only for
+    # recovering the sublinear TF values in panel E.
+    vectorizer_unnorm = TfidfVectorizer(
+        max_features=max_features,
+        strip_accents="unicode",
+        sublinear_tf=True,
+        min_df=2,
+        norm=None,
+        vocabulary=vectorizer.vocabulary_,
+    )
+    vectorizer_unnorm.idf_ = idf_values  # reuse fitted IDF — only normalisation differs
+    tfidf_matrix_unnorm = vectorizer_unnorm.transform(texts)  # CSR (n_docs, vocab), no norm
     print(f"  Vocabulary size: {len(vectorizer.vocabulary_):,} terms")
 
     all_deciles_arr = np.array(deciles)
@@ -180,44 +203,74 @@ def _compute_stats(
             stats[str(d)] = {}
             continue
 
-        sub = tfidf_matrix[mask]  # (n_d, vocab) CSR
+        sub = tfidf_matrix[mask]  # (n_d, vocab) CSR, L2-normalised
+        sub_unnorm = tfidf_matrix_unnorm[mask]  # (n_d, vocab) CSR, no norm
 
         # A. Unique terms per document (non-zero columns per row)
         unique_per_doc = np.diff(sub.indptr).astype(float)
+        n_chunks = len(unique_per_doc)
 
         # B. Mean TF-IDF score of non-zero entries → keyword intensity
         nnz = sub.nnz
         mean_score = float(sub.sum() / nnz) if nnz > 0 else 0.0
 
-        # C. IDF of terms used in this decile → term specificity
+        # C. IDF of terms used in this decile → term specificity.
+        #    Computed as the mean-over-documents of per-document mean IDF,
+        #    so that every document contributes equally regardless of how
+        #    many terms the decile's aggregate vocabulary contains.
+        #    (Using the union vocabulary would inflate IDF for deciles that
+        #    collectively cover more rare terms, conflating vocabulary
+        #    breadth with per-document term specificity.)
         used_idx = np.unique(sub.nonzero()[1])
-        mean_idf = float(idf_values[used_idx].mean()) if len(used_idx) > 0 else 0.0
         vocab_cover = float(len(used_idx) / tfidf_matrix.shape[1])
+        per_doc_idf: list[float] = []
+        for start, end in zip(sub.indptr[:-1], sub.indptr[1:]):
+            doc_idx = sub.indices[start:end]
+            if len(doc_idx) > 0:
+                per_doc_idf.append(float(idf_values[doc_idx].mean()))
+        idf_arr = np.array(per_doc_idf) if per_doc_idf else np.array([0.0])
+        mean_idf = float(idf_arr.mean())
+        se_idf = float(idf_arr.std(ddof=1) / np.sqrt(len(idf_arr))) if len(idf_arr) > 1 else 0.0
 
         # D. Average character length of each item (document or chunk)
         lengths = np.array([len(t) for t in texts_arr[mask]])
         mean_chunk_len = float(np.mean(lengths))
-        std_chunk_len = float(np.std(lengths))
+        std_chunk_len = float(np.std(lengths, ddof=1) if len(lengths) > 1 else 0.0)
+        se_chunk_len = float(std_chunk_len / np.sqrt(len(lengths))) if len(lengths) > 1 else 0.0
 
-        # E. Mean sublinear TF (recover TF component: tfidf / idf per entry)
-        coo = sub.tocoo()
+        # E. Mean sublinear TF (recover TF component from the un-normalised
+        #    TF-IDF matrix).  sub_unnorm entries equal tf_sublinear * idf so
+        #    dividing by idf gives the actual 1 + log(count) values.
+        #    SE is computed at the per-(chunk, term) entry level — this
+        #    reflects variability of term frequency across all term usages.
+        coo = sub_unnorm.tocoo()
         if coo.nnz > 0:
             tf_vals = coo.data / idf_values[coo.col]
             mean_tf = float(np.mean(tf_vals))
+            se_tf = float(np.std(tf_vals, ddof=1) / np.sqrt(len(tf_vals))) if len(tf_vals) > 1 else 0.0
         else:
             mean_tf = 0.0
+            se_tf = 0.0
+
+        # SE for unique terms: SE = std / sqrt(n_chunks)
+        std_unique = float(np.std(unique_per_doc, ddof=1) if n_chunks > 1 else 0.0)
+        se_unique = float(std_unique / np.sqrt(n_chunks)) if n_chunks > 1 else 0.0
 
         stats[str(d)] = {
             "n_docs_sampled": n_docs_d,
             "n_source_docs": source_counts.get(d, n_docs_d),
             "mean_unique_terms": float(np.mean(unique_per_doc)),
-            "std_unique_terms": float(np.std(unique_per_doc)),
+            "std_unique_terms": std_unique,
+            "se_unique_terms": se_unique,
             "mean_tfidf_score": mean_score,
             "mean_idf_of_used_terms": mean_idf,
+            "se_idf_of_used_terms": se_idf,
             "vocab_coverage": vocab_cover,
             "mean_chunk_length": mean_chunk_len,
             "std_chunk_length": std_chunk_len,
+            "se_chunk_length": se_chunk_len,
             "mean_tf_score": mean_tf,
+            "se_tf_score": se_tf,
         }
 
     return stats
@@ -455,6 +508,15 @@ def compute_tfidf_stats_for_ids(
         tfidf_matrix = corpus_vectorizer.transform(all_texts)
         idf_values = corpus_vectorizer.idf_
         vocab_size = len(corpus_vectorizer.vocabulary_)
+        # Build un-normalised variant for sublinear-TF recovery
+        _cv_unnorm = TfidfVectorizer(
+            strip_accents="unicode",
+            sublinear_tf=True,
+            norm=None,
+            vocabulary=corpus_vectorizer.vocabulary_,
+        )
+        _cv_unnorm.idf_ = idf_values
+        tfidf_matrix_unnorm = _cv_unnorm.transform(all_texts)
     else:
         print(
             f"  No corpus vectorizer supplied — fitting on {len(all_texts):,} "
@@ -469,6 +531,15 @@ def compute_tfidf_stats_for_ids(
         tfidf_matrix = vectorizer.fit_transform(all_texts)
         idf_values = vectorizer.idf_
         vocab_size = len(vectorizer.vocabulary_)
+        # Build un-normalised variant for sublinear-TF recovery
+        _v_unnorm = TfidfVectorizer(
+            strip_accents="unicode",
+            sublinear_tf=True,
+            norm=None,
+            vocabulary=vectorizer.vocabulary_,
+        )
+        _v_unnorm.idf_ = idf_values
+        tfidf_matrix_unnorm = _v_unnorm.transform(all_texts)
 
     print(f"  Vocabulary in use: {vocab_size:,} terms")
 
@@ -492,35 +563,62 @@ def compute_tfidf_stats_for_ids(
                 continue
 
             sub = tfidf_matrix[mask]
+            sub_unnorm = tfidf_matrix_unnorm[mask]
             texts_sub = texts_arr[mask]
 
             unique_per_doc = np.diff(sub.indptr).astype(float)
             nnz = sub.nnz
             mean_score = float(sub.sum() / nnz) if nnz > 0 else 0.0
             used_idx = np.unique(sub.nonzero()[1])
-            mean_idf = float(idf_values[used_idx].mean()) if len(used_idx) > 0 else 0.0
             vocab_cover = float(len(used_idx) / vocab_size)
+            # Per-document mean IDF, averaged across documents in the decile.
+            # This avoids the union-vocabulary bias where deciles with more
+            # documents contribute more rare terms to the aggregate vocabulary,
+            # inflating the mean IDF independently of per-document specificity.
+            per_doc_idf: list[float] = []
+            for start, end in zip(sub.indptr[:-1], sub.indptr[1:]):
+                doc_idx = sub.indices[start:end]
+                if len(doc_idx) > 0:
+                    per_doc_idf.append(float(idf_values[doc_idx].mean()))
+            idf_arr = np.array(per_doc_idf) if per_doc_idf else np.array([0.0])
+            mean_idf = float(idf_arr.mean())
+            se_idf = float(idf_arr.std(ddof=1) / np.sqrt(len(idf_arr))) if len(idf_arr) > 1 else 0.0
             lengths = np.array([len(t) for t in texts_sub])
             mean_chunk_len = float(np.mean(lengths))
-            std_chunk_len = float(np.std(lengths))
-            coo = sub.tocoo()
+            std_chunk_len = float(np.std(lengths, ddof=1) if len(lengths) > 1 else 0.0)
+            se_chunk_len = float(std_chunk_len / np.sqrt(len(lengths))) if len(lengths) > 1 else 0.0
+            # Recover sublinear TF from the un-normalised TF-IDF matrix.
+            # sub_unnorm entries = tf_sublinear * idf, so dividing by idf
+            # gives 1 + log(count) directly without needing to undo L2 norm.
+            coo = sub_unnorm.tocoo()
             if coo.nnz > 0:
                 tf_vals = coo.data / idf_values[coo.col]
                 mean_tf = float(np.mean(tf_vals))
+                se_tf = float(np.std(tf_vals, ddof=1) / np.sqrt(len(tf_vals))) if len(tf_vals) > 1 else 0.0
             else:
                 mean_tf = 0.0
+                se_tf = 0.0
+
+            # SE for unique terms
+            n_chunks = len(unique_per_doc)
+            std_unique = float(np.std(unique_per_doc, ddof=1) if n_chunks > 1 else 0.0)
+            se_unique = float(std_unique / np.sqrt(n_chunks)) if n_chunks > 1 else 0.0
 
             results[grp][d] = {
                 "n_docs_sampled": n,
                 "n_source_docs": source_counts.get(d, n),
                 "mean_unique_terms": float(np.mean(unique_per_doc)),
-                "std_unique_terms": float(np.std(unique_per_doc)),
+                "std_unique_terms": std_unique,
+                "se_unique_terms": se_unique,
                 "mean_tfidf_score": mean_score,
                 "mean_idf_of_used_terms": mean_idf,
+                "se_idf_of_used_terms": se_idf,
                 "vocab_coverage": vocab_cover,
                 "mean_chunk_length": mean_chunk_len,
                 "std_chunk_length": std_chunk_len,
+                "se_chunk_length": se_chunk_len,
                 "mean_tf_score": mean_tf,
+                "se_tf_score": se_tf,
             }
 
     return results
@@ -581,9 +679,17 @@ def load_or_compute_tfidf_stats(
         with open(metadata_path) as f:
             meta = json.load(f)
         if key in meta:
-            level = f"chunk (size={chunk_size}, overlap={chunk_overlap})" if chunk_size else "document"
-            print(f"✓ Loaded TF-IDF stats from metadata.json [{level} level, cached]")
-            return meta[key]
+            cached = meta[key]
+            cached_version = cached.get("_version", 1)
+            if cached_version == TFIDF_STATS_VERSION:
+                level = f"chunk (size={chunk_size}, overlap={chunk_overlap})" if chunk_size else "document"
+                print(f"✓ Loaded TF-IDF stats from metadata.json [{level} level, cached v{TFIDF_STATS_VERSION}]")
+                return cached
+            else:
+                print(
+                    f"  Cache version mismatch (cached v{cached_version} ≠ current v{TFIDF_STATS_VERSION})"
+                    f" — recomputing TF-IDF stats…"
+                )
 
     level = f"chunk (size={chunk_size}, overlap={chunk_overlap})" if chunk_size else "document"
     print(
@@ -612,6 +718,7 @@ def load_or_compute_tfidf_stats(
     # ---- Write cache back to metadata.json ------------------------------
     with open(metadata_path) as f:
         meta = json.load(f)
+    stats["_version"] = TFIDF_STATS_VERSION
     meta[key] = stats
     with open(metadata_path, "w") as f:
         json.dump(meta, f, indent=2)

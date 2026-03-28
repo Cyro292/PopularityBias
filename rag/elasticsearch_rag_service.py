@@ -32,7 +32,14 @@ _VALID_DISTANCES = {"COSINE", "DOT_PRODUCT", "EUCLIDEAN_DISTANCE"}
 
 
 class ElasticsearchRagService(RagService):
-    """Unified Elasticsearch retrieval: dense vector, BM25, or hybrid."""
+    """Unified Elasticsearch retrieval: dense vector, BM25, or hybrid.
+
+    BM25 length-normalisation (``b``) and term-saturation (``k1``) are
+    configurable via ``bm25_b`` and ``bm25_k1``. These are baked into the
+    Elasticsearch index similarity settings at index-creation time, so they
+    only take effect when a new index is created — not when querying an
+    existing index.
+    """
 
     def __init__(
         self,
@@ -44,13 +51,36 @@ class ElasticsearchRagService(RagService):
         strategy: Literal["vector", "approximation", "bm25", "hybrid"] = "vector",
         distance_function: Literal["COSINE", "DOT_PRODUCT", "EUCLIDEAN_DISTANCE"] | None = None,
         request_timeout: int = 600,
+        bm25_b: float | None = None,
+        bm25_k1: float | None = None,
     ):
+        """Initialise the Elasticsearch RAG service.
+
+        Args:
+            config: Indexing configuration (required for non-BM25 strategies).
+            es_url: Elasticsearch endpoint URL.
+            es_user: Optional HTTP basic-auth username.
+            es_password: Optional HTTP basic-auth password.
+            strategy: Retrieval strategy — ``"vector"``, ``"approximation"``,
+                ``"bm25"``, or ``"hybrid"``.
+            distance_function: Vector distance metric (vector strategies only).
+            request_timeout: Request timeout in seconds.
+            bm25_b: Length normalisation parameter (BM25 ``b``). ``0`` disables
+                length normalisation; ``1`` applies full normalisation. Defaults
+                to Elasticsearch's built-in default (``0.75``) when ``None``.
+                Applied at index-creation time only.
+            bm25_k1: Term saturation parameter (BM25 ``k1``). Typical range
+                1.2–2.0. Defaults to Elasticsearch's built-in default (``1.2``)
+                when ``None``. Applied at index-creation time only.
+        """
         self.es_url = es_url
         self.es_user = es_user
         self.es_password = es_password
         self.strategy = strategy
         self._current_index_name: str | None = None
         self._request_timeout: int = request_timeout
+        self._bm25_b = bm25_b
+        self._bm25_k1 = bm25_k1
 
         # Load prompt templates (use config overrides if provided)
         passage_file = getattr(config, "passage_prompt_file", None) if config else None
@@ -63,7 +93,10 @@ class ElasticsearchRagService(RagService):
         if strategy == "bm25":
             self.config = config or IndexingConfig()
             self._embeddings = None
-            self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy()
+            self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy(
+                k1=self._bm25_k1,
+                b=self._bm25_b,
+            )
         else:
             if config is None:
                 raise ValueError(f"IndexingConfig required for '{strategy}' strategy")
@@ -543,7 +576,10 @@ class ElasticsearchRagService(RagService):
         try:
             self.strategy = strategy
             if strategy == "bm25":
-                self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy()
+                self._retrieval_strategy = ElasticsearchStore.BM25RetrievalStrategy(
+                    k1=self._bm25_k1,
+                    b=self._bm25_b,
+                )
                 self._embeddings = None
             elif strategy in ["vector", "approximation", "hybrid"]:
                 if self._embeddings is None:
@@ -630,8 +666,20 @@ class ElasticsearchRagService(RagService):
             if not is_bm25:
                 logger.info(f"[Embed] Embedding {n:,} queries (batch_size={embed_batch_size})...")
                 vectors: list[list[float]] = []
-                embeddings = self._embeddings.embed_documents(prepared)
-                vectors.extend(embeddings)
+                batches = [
+                    prepared[start : start + embed_batch_size]
+                    for start in range(0, n, embed_batch_size)
+                ]
+                with tqdm(
+                    total=n,
+                    desc="Embedding queries",
+                    unit="q",
+                    disable=not progress_bar,
+                ) as pbar:
+                    for batch in batches:
+                        vecs = self._embeddings.embed_documents(batch)
+                        vectors.extend(vecs)
+                        pbar.update(len(batch))
                 logger.info(f"[Embed] ✓ {len(vectors):,} vectors ready")
 
             store = self._create_store(self._current_index_name, request_timeout=timeout)
@@ -669,6 +717,13 @@ class ElasticsearchRagService(RagService):
                     resp = store.client.msearch(body=body, request_timeout=timeout)
                     out = []
                     for idx, response in zip(batch_indices, resp["responses"]):
+                        if "error" in response:
+                            err = response["error"]
+                            logger.error(
+                                f"msearch sub-response error for query index {idx}: "
+                                f"type={err.get('type')}, reason={err.get('reason')}, "
+                                f"status={response.get('status')}"
+                            )
                         hits = response.get("hits", {}).get("hits", [])
                         out.append((idx, _hits_to_docs(hits)))
                     return out
