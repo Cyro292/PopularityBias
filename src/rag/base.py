@@ -3,83 +3,105 @@
 from __future__ import annotations
 
 import pandas as pd
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Protocol, Sequence
 
 from langchain.schema import Document
+from langchain.vectorstores import VectorStore
 
 
-class VectorStoreLike(Protocol):
-    """Minimal interface representing an object that can forward similarity queries."""
-
-    def similarity_search_by_vector(self, embedding: Sequence[float], k: int = 4, **kwargs: Sequence[float]) -> list[Document]:
-        ...
+IndexResult = tuple[Optional[VectorStore], int]
 
 
-IndexResult = tuple[Optional[VectorStoreLike], int]
-
-
-class RagService(ABC):
+class RagService():
     """Abstract definition of a retrieval-augmented generation service."""
 
-    @abstractmethod
     def index_from_dataframe(
         self,
         df: pd.DataFrame,
         text_field: str,
         html_field: str | None = None,
-        *,
         metadata_fields: Sequence[str] | None = None,
         output_dir: Path | None = None,
         collection_name: str = "rag",
+        *args, 
+        **kwargs,
     ) -> IndexResult:
-        """Create a Chroma index from a pandas DataFrame.
-        
-        Args:
-            df: DataFrame containing the text data to index.
-            text_field: Column name containing the text content.
-            metadata_fields: Optional column names to include as document metadata.
-            output_dir: Optional directory to persist the index. If None, index is in-memory.
-            collection_name: Name for the Chroma collection.
-        """
+        """Create a inde index from a pandas DataFrame."""
 
         raise NotImplementedError("index_from_dataframe is not implemented")
+    
+    def batch_index_from_dataframe(
+        self,
+        df: pd.DataFrame,
+        text_field: str,
+        html_field: str | None = None,
+        metadata_fields: Sequence[str] | None = None,
+        output_dir: Path | None = None,
+        collection_name: str | None = None,
+        batch_size: int = 1000,
+        *args, 
+        **kwargs,
+    ) -> IndexResult:
+        """Batch version of index_from_dataframe."""
+        raise NotImplementedError("batch_index_from_dataframe is not implemented")
 
-    @abstractmethod 
     def index_from_parquet(
         self,
         parquet_path: Path,
         output_dir: Path,
-        *,
         text_field: str | None = None,
         html_field: str | None = None,
         metadata_fields: Sequence[str] | None = None,
         collection_name: str = "rag",
+        *args, 
+        **kwargs,
     ) -> IndexResult:
-        """Load text or HTML from Parquet into whatever storage the service owns.
-        
-        Args:
-            parquet_path: Path to the Parquet file.
-            output_dir: Directory to persist the index.
-            text_field: Column name containing text content. Mutually exclusive with html_field.
-            html_field: Column name containing HTML content. Mutually exclusive with text_field.
-            metadata_fields: Optional column names to include as document metadata.
-            collection_name: Name for the collection.
-            
-        Raises:
-            ValueError: If neither or both text_field and html_field are provided.
-        """
+        """Create a index from a Parquet file."""
         raise NotImplementedError("index_from_parquet is not implemented")
 
-    @abstractmethod
-    def retrieve_documents(
+
+    def index_from_parquet_batches(
         self,
-        index: Optional[VectorStoreLike],
+        parquet_path: Path,
+        output_dir: Path,
+        text_field: str | None = None,
+        metadata_fields: Sequence[str] | None = None,
+        collection_name: str | None = None,
+        batch_size: int = 1000,
+        *args, **kwargs,
+    ) -> IndexResult:
+        """Batch version of index_from_parquet."""
+        raise NotImplementedError("index_from_parquet_batches is not implemented")
+
+    def retrieve_document(
+        self,
         text: str,
-        *,
         top_k: int = 5,
+        *args, 
+        **kwargs,
     ) -> list[Document]:
         """Return documents matching an embedding using the configured similarity strategy."""
 
-        raise NotImplementedError("retrieve_documents is not implemented")
+        raise NotImplementedError("retrieve_document is not implemented")
+    
+    def batch_retrieve(
+        self,
+        texts: list[str],
+        *args, 
+        **kwargs,
+    ) -> list[list[list[Document]]]:
+        """Batch version of retrieve_document."""
+        raise NotImplementedError("batch_retrieve is not implemented")
+    
+    def batch_retrieve_with_scores(
+        self,
+        texts: list[str],
+        top_k: int = 5,
+        *args, 
+        **kwargs,
+    ) -> list[list[tuple[Document, float]]]:
+        """Return documents and similarity scores matching an embedding using the configured similarity strategy."""
+        raise NotImplementedError("batch_retrieve_with_scores is not implemented")
+    
+    

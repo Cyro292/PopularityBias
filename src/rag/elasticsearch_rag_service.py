@@ -10,7 +10,7 @@ import queue
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Literal, Optional, Sequence, Any
+from typing import Callable, Literal, Optional, Sequence
 
 import pandas as pd
 import pyarrow as pa
@@ -21,7 +21,7 @@ from langchain_elasticsearch.vectorstores import DenseVectorStrategy, DenseVecto
 
 from tqdm import tqdm
 
-from .base import RagService, VectorStoreLike
+from .base import RagService, IndexResult, VectorStore
 from .document_utils import documents_from_dataframe
 from .utils import IndexingConfig, build_embeddings, split_documents
 
@@ -44,7 +44,6 @@ class ElasticsearchRagService(RagService):
     def __init__(
         self,
         config: IndexingConfig | None = None,
-        *,
         es_url: str = "http://localhost:9200",
         es_user: str | None = None,
         es_password: str | None = None,
@@ -257,30 +256,25 @@ class ElasticsearchRagService(RagService):
             pbar.close()
         logger.info(f"Successfully indexed {indexed:,} documents in {time.time() - start:.1f}s")
         return indexed
-    
-    def index_from_parquet(self, parquet_path, output_dir, *, text_field = None, html_field = None, metadata_fields = None, collection_name = "rag"):
-        return super().index_from_parquet(parquet_path, output_dir, text_field=text_field, html_field=html_field, metadata_fields=metadata_fields, collection_name=collection_name)
 
     def index_from_parquet_batches(
         self,
         parquet_path: Path,
-        *,
         text_field: str = "text",
+        output_dir: str | None = None,
         metadata_fields: Sequence[str] | None = None,
-        collection_name: str = None,
+        batch_size: int = 5000,
         progress_bar: bool | None = None,
-        batch_size: int,
         skip_rows: int = 0,
-        end_row: Optional[int] = None,
+        end_row: int | None = None,
         es_upload_batch: int = 2000,
         num_uploaders: int = 4,
         use_send_mode: bool = False,
-    ) -> tuple[ElasticsearchStore, int]:
+    ) -> IndexResult:
         ES_UPLOAD_BATCH = es_upload_batch
         NUM_UPLOADERS = num_uploaders
 
-        if collection_name is None:
-            raise ValueError("collection_name is required")
+        collection_name = output_dir or "elasticsearch_index"
         if not parquet_path.exists():
             raise FileNotFoundError(parquet_path)
         if self._embeddings is None:
@@ -528,39 +522,7 @@ class ElasticsearchRagService(RagService):
             raise errors[0]
 
         logger.info(f"=== Done: {state['chunks']:,} chunks indexed ===")
-        return bootstrap_store, state["chunks"]
-
-    def index_from_dataframe(
-        self,
-        df: pd.DataFrame,
-        text_field: str,
-        html_field: str | None = None,
-        *,
-        metadata_fields: Sequence[str] | None = None,
-        output_dir: Path | None = None,
-        collection_name: str = None,
-        progress_bar: bool | None = None,
-    ) -> tuple[ElasticsearchStore]:
-        raise NotImplementedError()
-
-    def _validate_store(self, index) -> ElasticsearchStore:
-        if not isinstance(index, ElasticsearchStore):
-            raise ValueError("Valid ElasticsearchStore required")
-        return index
-
-    def delete_index(self, index: ElasticsearchStore) -> None:
-        """Delete an Elasticsearch index."""
-        if not self._current_index_name:
-            raise ValueError("No index loaded")
-        index.client.indices.delete(index=self._current_index_name)
-        logger.info(f"Deleted '{self._current_index_name}'")
-
-    def add_documents(
-        self, index: ElasticsearchStore, documents: Sequence[Document]
-    ) -> ElasticsearchStore:
-        """Add documents to an existing index."""
-        index.add_documents(list(documents))
-        return index
+        return IndexResult(index=bootstrap_store, indexed_count=state["chunks"])
     
     @contextmanager
     def _strategy_context(self, strategy: str | None):
@@ -606,36 +568,9 @@ class ElasticsearchRagService(RagService):
             return query_body
         return _custom_query
 
-    def retrieve_documents(
-        self,
-        text: str,
-        top_k: int = 5,
-        strategy: str | None = None,
-        num_candidates: int | None = None,
-    ) -> list[Document]:
-        """Retrieve documents using the configured strategy."""
-        with self._strategy_context(strategy) as strat:
-            index = self._create_store(self._current_index_name)
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and strat != "bm25" else None
-            return index.similarity_search(self._prepare_query(text), top_k, custom_query=custom_query)
-
-    def retrieve_documents_with_scores(
-        self,
-        text: str,
-        top_k: int = 5,
-        strategy: str | None = None,
-        num_candidates: int | None = None,
-    ) -> list[tuple[Document, float]]:
-        """Retrieve documents with relevance scores."""
-        with self._strategy_context(strategy) as strat:
-            index = self._create_store(self._current_index_name)
-            custom_query = self._make_num_candidates_query(num_candidates) if num_candidates and strat != "bm25" else None
-            return index.similarity_search_with_score(self._prepare_query(text), top_k, custom_query=custom_query)
-
-    def batch_retrieve(
+    def batch_retrieve_with_scores(
         self,
         questions: list[str],
-        *,
         top_k: int = 5,
         strategy: str | None = None,
         num_candidates: int | None = None,
