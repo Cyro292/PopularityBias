@@ -95,7 +95,7 @@ def _reservoir_sample_corpus(
     """
     import pyarrow.parquet as pq
     from tqdm.auto import tqdm
-    from helpers.decile_utils import assign_decile
+    from .decile_utils import assign_decile
 
     random.seed(seed)
     reservoirs: dict[int, list[str]] = {d: [] for d in range(_NUM_DECILES)}

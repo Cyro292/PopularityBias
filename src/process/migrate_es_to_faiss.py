@@ -57,12 +57,12 @@ from langchain.schema import Document
 from tqdm import tqdm
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from config import DATA_DIR
-from rag.faiss_rag_service import FaissRagService, MemoryConfig
-from rag.SqliteDocstore import SqliteDocstore
-from rag.utils import IndexingConfig
+from src.rag.faiss_rag_service import FaissRagService, MemoryConfig
+from src.rag.SqliteDocstore import SqliteDocstore
+from src.rag.utils import IndexingConfig
 
 # Configure logging
 logging.basicConfig(
@@ -326,7 +326,7 @@ def migrate_with_existing_vectors(
     compatible with the FAISS index configuration.
     """
     import faiss
-    from rag.SqliteDocstore import SqliteDocstore
+    from src.rag.SqliteDocstore import SqliteDocstore
 
     logger.info("Migration mode: Using existing vectors from Elasticsearch")
 

@@ -65,7 +65,7 @@ def get_embedding_class(provider: str):
 
             _EMBEDDING_CLASSES[provider] = HuggingFaceEmbeddings
         elif provider == "modal":
-            from rag.ModalEmbedding import ModalEmbeddings
+            from .ModalEmbedding import ModalEmbeddings
 
             _EMBEDDING_CLASSES[provider] = ModalEmbeddings
         else:

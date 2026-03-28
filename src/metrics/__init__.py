@@ -1,4 +1,4 @@
-"""helpers — Shared evaluation and analysis utilities.
+"""src.metrics — Shared evaluation and analysis utilities.
 
 Modules
 -------

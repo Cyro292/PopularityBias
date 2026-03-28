@@ -7,7 +7,7 @@ only on standard NumPy arrays, Pandas DataFrames, and Matplotlib Axes.
 
 Typical usage::
 
-    from helpers.bias_utils import (
+    from src.metrics.bias_utils import (
         build_heatmap_pct,
         pref_curve,
         render_heatmap,
@@ -92,7 +92,7 @@ def build_heatmap_pct(
         A ``(10, 10)`` float array where rows sum to 100 (or 0 if no wrong
         docs for that expected decile).
     """
-    from helpers.decile_utils import assign_decile
+    from .decile_utils import assign_decile
 
     hm = np.zeros((10, 10), dtype=float)
     for _, row in df.iterrows():
@@ -135,7 +135,7 @@ def pref_curve(
         the preference fraction and its 95% CI. Deciles with no data
         contain ``float("nan")``.
     """
-    from helpers.decile_utils import COL_POPULARITY
+    from .decile_utils import COL_POPULARITY
 
     bias: list[float] = []
     ci95: list[float] = []

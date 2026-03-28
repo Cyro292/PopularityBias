@@ -12,9 +12,9 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config import DATA_DIR, CACHE_DIR, SYTHETNIC_QA_PROMPT_PATH
-from helpers.decile_utils import (
+from src.metrics.decile_utils import (
     compute_corpus_boundaries as _compute_corpus_boundaries,
     assign_decile,
     assign_both_deciles,
@@ -350,7 +350,7 @@ def generate_questions_from_docs(
     model_name: str = "gpt-4.1-nano",
 ) -> list[dict]:
     """Generate synthetic questions from sampled documents."""
-    from llm.openAi_service import OpenAIService
+    from src.llm.openAi_service import OpenAIService
     
     service = OpenAIService(model_name=model_name)
     questions = []

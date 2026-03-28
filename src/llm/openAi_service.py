@@ -25,7 +25,7 @@ try:
     from config import DATA_DIR
 except ModuleNotFoundError:
     # If running as a script, add parent directory to path and try again
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from config import DATA_DIR
 
 logger = logging.getLogger(__name__)

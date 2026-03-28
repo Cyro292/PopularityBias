@@ -49,14 +49,14 @@ import time
 from pathlib import Path
 
 # Ensure project root is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import dotenv
 dotenv.load_dotenv()
 
 from config import DATA_DIR
-from rag.elasticsearch_rag_service import ElasticsearchRagService
-from rag.utils import IndexingConfig
+from src.rag.elasticsearch_rag_service import ElasticsearchRagService
+from src.rag.utils import IndexingConfig
 
 logger = logging.getLogger(__name__)
 

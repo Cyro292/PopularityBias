@@ -45,7 +45,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from config import DATA_DIR
-from helpers.decile_utils import (
+from src.metrics.decile_utils import (
     load_boundaries_from_metadata,
     load_corpus_distributions,
     load_avg_doc_length_per_decile,
@@ -56,7 +56,7 @@ from helpers.decile_utils import (
     COL_DECILE_CHUNK_WEIGHTED,
     COL_POPULARITY,
 )
-from helpers.metrics import (
+from src.metrics.metrics import (
     compute_metrics,
     get_found_rank,
     get_wrong_pops,

@@ -44,10 +44,10 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 # Ensure project root is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from config import DATA_DIR
-from helpers.decile_utils import (
+from src.metrics.decile_utils import (
     COL_DECILE_CHUNK_WEIGHTED,
     COL_DECILE_UNWEIGHTED,
     COL_POPULARITY,
@@ -55,8 +55,8 @@ from helpers.decile_utils import (
     decile_col_for,
     load_boundaries_from_metadata,
 )
-from rag.faiss_rag_service import FaissRagService, MemoryConfig
-from rag.utils import IndexingConfig
+from src.rag.faiss_rag_service import FaissRagService, MemoryConfig
+from src.rag.utils import IndexingConfig
 
 logger = logging.getLogger(__name__)
 

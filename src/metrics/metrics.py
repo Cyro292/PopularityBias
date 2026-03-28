@@ -7,7 +7,7 @@ DataFrames produced by any RAG backend.
 
 Typical usage::
 
-    from helpers.metrics import (
+    from src.metrics.metrics import (
         compute_metrics,
         get_found_rank,
         get_wrong_pops,
