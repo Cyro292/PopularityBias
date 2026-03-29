@@ -23,6 +23,8 @@ from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
 from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.llm.openAi_service import OpenAIService
 from src.llm.modalLLMService import ModalLLMService
+from src.llm.mistralLLMService import MistralLLMService
+from src.llm.qwenLLMService import QwenLLMService
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
 from src.evaluator.binary_evaluator import BinaryEvaluator
 from src.evaluator.base import EvaluationObjects, EvaluationResult
@@ -35,10 +37,11 @@ load_dotenv()  # Load environment variables from .env file
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    output_dir: str = "evaluation_results_nq_turbo"  # Directory to save evaluation results
+    output_dir: str = "evaluation_results_mistral_300"  # Directory to save evaluation results
     dataset_names: list[str] = field(default_factory=lambda: ["natural_questions", "trivia_qa", "pop_qa", "fever", "trex"])  # List of HuggingFace dataset names to load questions from
-    questions_per_decile: int = 100  # Number of questions to sample from each decile (set to -1 for all)
-    model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"  # Model name for the ModalLLMService (e.g. "Qwen/Qwen3-1.7B" or a local GGUF model)
+    questions_per_decile: int = 300  # Number of questions to sample from each decile (set to -1 for all)
+    model_name: str | None = None  # Model name for the ModalLLMService (e.g. "Qwen/Qwen3-1.7B" or a local GGUF model)
+    model_request_batch_size: int = 254  # Batch size for requests to the LLM service
     requests_per_second_api: int = 8
     collection_name: str = "wiki_full_bil"
     es_url: str = os.getenv("ELASTICSEARCH_ENDPOINT", "")
@@ -48,8 +51,8 @@ class PipelineConfig:
     chunk_overlap: int = 100
     embedding_model: str = "Lajavaness/bilingual-embedding-small"
     embedding_provider: str = "huggingface"
-    request_batch_size: int = 254
-    gpu_batch_size: int = 64
+    embeddings_request_batch_size: int = 254
+    gpu_batch_size: int = 50
     top_k: int = 1  # Number of top documents to retrieve for each question
     num_candidates: int = 1000  # Number of candidates to retrieve for evaluation (after re-ranking)
 
@@ -82,7 +85,7 @@ def main():
             chunk_overlap=config.chunk_overlap,
             embedding_model=config.embedding_model,
             embedding_provider=config.embedding_provider,
-            request_batch_size=config.request_batch_size,
+            request_batch_size=config.embeddings_request_batch_size,
             gpu_batch_size=config.gpu_batch_size,
             normalise_embeddings=True,
             trust_remote_code=True,
@@ -91,11 +94,7 @@ def main():
         es_user=config.es_user,
         es_password=config.es_password,
     )
-    llm_service = ModalLLMService(
-        model_name=config.model_name,
-        temperature=0.5,
-        request_batch_size=40,
-    )
+    llm_service = MistralLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
 
     llm_evaluation_service = OpenAIService(model_name="gpt-4o-mini", requests_per_second=10)
     evaluator = BinaryEvaluator(evaluation_service=llm_evaluation_service)
@@ -107,17 +106,28 @@ def main():
 
     rag_service.load_index(config.collection_name)
 
-    for strategy in ["approximation", "bm25"]:
+    for strategy in ["zero_shot", "approximation", "bm25"]:
+
+        csv_output_path = output_folder / f"evaluation_results_{strategy}.csv"
+
+        if csv_output_path.exists():
+            logger.info("Evaluation results for strategy '%s' already exist at %s, skipping...", strategy, csv_output_path)
+            continue
+
         questions = [item.question_text for item in question_data]
-        retrieved_docs_with_scores = rag_service.batch_retrieve_with_scores(
-            questions,
-            top_k=config.top_k,
-            strategy=strategy,
-            search_workers=6,
-            msearch_batch_size=5,
-            num_candidates=config.num_candidates,
-        )
-        retrieved_docs = [[doc for doc, _score in docs] for docs in retrieved_docs_with_scores]
+
+        if strategy == "zero_shot":
+            retrieved_docs = [[] for _ in questions]  # No retrieval for zero-shot baseline
+        else:
+            retrieved_docs_with_scores = rag_service.batch_retrieve_with_scores(
+                questions,
+                top_k=config.top_k,
+                strategy=strategy,
+                search_workers=6,
+                msearch_batch_size=5,
+                num_candidates=config.num_candidates,
+            )
+            retrieved_docs = [[doc for doc, _score in docs] for docs in retrieved_docs_with_scores]
 
         answer_prompts = [
             f"Documents: {','.join([doc.page_content for doc in docs])}\nQuestion: {q.question_text}"
@@ -144,7 +154,7 @@ def main():
         
         evaluation_results_dicts = [result.__dict__ for result in evaluation_results]
         results_df = pd.DataFrame(evaluation_results_dicts)
-        results_df.to_csv(output_folder / f"evaluation_results_{strategy}.csv", index=False)
+        results_df.to_csv(csv_output_path, index=False)
         logger.info("Saved evaluation results for strategy '%s'", strategy)
 
 if __name__ == "__main__":

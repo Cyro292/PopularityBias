@@ -1,11 +1,20 @@
+from __future__ import annotations
+
+import asyncio
 from typing import Any, TypeVar
-from prompt_toolkit import prompt
+
 from pydantic import BaseModel
+from prompt_toolkit import prompt
 from tqdm import tqdm
 import modal
 
+if not modal.is_local():
+    LLMBase = object
+else:
+    from src.llm.base import LLMBase
+
 T = TypeVar("T", bound=BaseModel)
-APP_NAME = "popularity_bias_qwen_service"
+APP_NAME = "popularity_bias_qwen_service_as"
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
 def download_model() -> None:
@@ -20,7 +29,7 @@ image = (
     .run_function(download_model)
 )
 
-@app.function(gpu="A10", image=image, timeout=600, max_containers=3)
+@app.function(gpu="A100", image=image, timeout=600, max_containers=3)
 def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256) -> list[str]:
     from transformers import pipeline
     from tqdm import tqdm
@@ -37,7 +46,7 @@ def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: i
         results.append(result[0]["generated_text"][-1]["content"])  # type: ignore[index]
     return results
 
-@app.function(gpu="A10", image=image, timeout=600, max_containers=3)
+@app.function(gpu="A100", image=image, timeout=600, max_containers=3)
 def generate_structured(
     prompts: list[str],
     schema_class: type[BaseModel],
@@ -75,8 +84,7 @@ class QwenLLMService(LLMBase):  # type: ignore[misc]
         self.generate_structured_fn = modal.Function.from_name(APP_NAME, "generate_structured")
 
     def generate(self, prompt: str) -> str:
-        return next(
-            self.generate_fn.map(
+        return list(self.generate_fn.map(
                 [[prompt]],  # prompts
                 [self.model_name],
                 [256],
@@ -91,7 +99,6 @@ class QwenLLMService(LLMBase):  # type: ignore[misc]
         ]
 
         results = []
-
         for batch_result in tqdm(
             self.generate_fn.map(
                 batched_prompts,
@@ -107,14 +114,15 @@ class QwenLLMService(LLMBase):  # type: ignore[misc]
         return results
 
     def generate_structured(self, prompt: str, schema: T) -> Any:
-        return next(
+        results = list(
             self.generate_structured_fn.map(
                 [[prompt]],
                 [schema],
                 [self.model_name],
                 [256],
             )
-        )[0]
+        )
+        return results[0][0]
 
     def batch_generate_structured(self, prompts: list[str], schema: T) -> list[Any]:
         batched_prompts = [

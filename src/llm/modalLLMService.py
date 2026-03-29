@@ -26,7 +26,7 @@ if not modal.is_local():
 else:
     from src.llm.base import LLMBase
 
-APP_NAME = "PopularityBias_LLM_Service"
+APP_NAME = "popularity_bias_general_service_as"
 
 app = modal.App(APP_NAME)
 image = (
