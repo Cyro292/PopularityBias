@@ -27,7 +27,6 @@ else:
     from src.llm.base import LLMBase
 
 APP_NAME = "PopularityBias_LLM_Service"
-DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 app = modal.App(APP_NAME)
 image = (
@@ -39,6 +38,7 @@ image = (
 @app.function(gpu="T4", image=image, timeout=600)
 def generate(prompts: list[str], model_name: str, max_new_tokens: int) -> list[str]:
     from transformers import pipeline
+    from tqdm import tqdm
 
     chatbot = pipeline(
             "text-generation",
@@ -47,7 +47,7 @@ def generate(prompts: list[str], model_name: str, max_new_tokens: int) -> list[s
             max_new_tokens=max_new_tokens,
     )
     results = []
-    for prompt in prompts:
+    for prompt in tqdm(prompts, desc="Generating text"):
         result = chatbot([{"role": "user", "content": prompt}])
         results.append(result[0]["generated_text"][-1]["content"])  # type: ignore[index]
     return results
@@ -110,7 +110,7 @@ def generate_structured(
     return results
 
 class ModalLLMService(LLMBase):  # type: ignore[misc]
-    def __init__(self, model_name: str = DEFAULT_MODEL, temperature: float = 0.0,
+    def __init__(self, model_name: str, temperature: float = 0.0,
                  max_new_tokens: int = 512, request_batch_size: int = 64) -> None:
         super().__init__(model_name=model_name, temperature=temperature)
         self._max_new_tokens = max_new_tokens

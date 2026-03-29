@@ -419,29 +419,30 @@ def _balance_per_dataset(
     target_per_decile: int | None,
     random_state: int,
 ) -> "pd.DataFrame":
-    """Fill-from-bottom equalisation across datasets, stratified by decile."""
+    """Cap each dataset to at most target_per_decile // n_datasets rows per decile.
+
+    When *target_per_decile* is set, each dataset is allowed at most
+    ``target_per_decile // n_datasets`` rows per decile so that no single
+    source can crowd out the others.  Surplus rows from smaller datasets are
+    *not* redistributed — use ``_balance_by_decile`` afterwards to enforce the
+    overall per-decile total.
+    """
     import pandas as pd
     dataset_names = df["dataset"].unique().tolist()
     n_datasets = len(dataset_names)
 
     parts = []
     for _, decile_df in df.groupby("decile"):
-        groups = {d: decile_df[decile_df["dataset"] == d] for d in dataset_names}
-        datasets_sorted = sorted(groups, key=lambda d: len(groups[d]))
-
-        quota = target_per_decile if target_per_decile is not None else (
-            len(groups[datasets_sorted[0]]) * n_datasets
-        )
-
-        remaining = quota
-        for i, ds in enumerate(datasets_sorted):
-            per_ds = remaining // (n_datasets - i)
-            available = len(groups[ds])
-            take = min(available, per_ds)
-            part = groups[ds].sample(n=take, random_state=random_state) if take < available else groups[ds]
-            parts.append(part)
-            remaining -= take
+        for ds in dataset_names:
+            group = decile_df[decile_df["dataset"] == ds]
+            if target_per_decile is not None:
+                cap = target_per_decile // n_datasets
+                if len(group) > cap:
+                    group = group.sample(n=cap, random_state=random_state)
+            parts.append(group)
 
     result = pd.concat(parts, ignore_index=True)
-    logger.info("After dataset balance: %d rows", len(result))
+    logger.info("After dataset balance (cap=%s per dataset per decile): %d rows",
+                f"{target_per_decile}//{n_datasets}" if target_per_decile else "none",
+                len(result))
     return result

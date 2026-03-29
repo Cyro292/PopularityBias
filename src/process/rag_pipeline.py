@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
 from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.llm.openAi_service import OpenAIService
-from src.llm.ModalLLM import ModalLLMService
+from src.llm.modalLLMService import ModalLLMService
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
 from src.evaluator.binary_evaluator import BinaryEvaluator
 from src.evaluator.base import EvaluationObjects, EvaluationResult
@@ -37,8 +37,8 @@ load_dotenv()  # Load environment variables from .env file
 class PipelineConfig:
     output_dir: str = "evaluation_results_nq_turbo"  # Directory to save evaluation results
     dataset_names: list[str] = field(default_factory=lambda: ["natural_questions", "trivia_qa", "pop_qa", "fever", "trex"])  # List of HuggingFace dataset names to load questions from
-    questions_per_decile: int = 50  # Number of questions to sample from each decile (set to -1 for all)
-    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"  # Model name for the ModalLLMService (e.g. "Qwen/Qwen3-1.7B" or a local GGUF model)
+    questions_per_decile: int = 100  # Number of questions to sample from each decile (set to -1 for all)
+    model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"  # Model name for the ModalLLMService (e.g. "Qwen/Qwen3-1.7B" or a local GGUF model)
     requests_per_second_api: int = 8
     collection_name: str = "wiki_full_bil"
     es_url: str = os.getenv("ELASTICSEARCH_ENDPOINT", "")
@@ -94,7 +94,7 @@ def main():
     llm_service = ModalLLMService(
         model_name=config.model_name,
         temperature=0.5,
-        request_batch_size=config.request_batch_size,
+        request_batch_size=40,
     )
 
     llm_evaluation_service = OpenAIService(model_name="gpt-4o-mini", requests_per_second=10)
