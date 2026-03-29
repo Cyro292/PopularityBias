@@ -150,6 +150,7 @@ class BinaryEvaluator(EvaluatorBase):
                         proposed_answer=obj.proposed_answer,
                         evaluation_score=judgement.verdict,
                         reasoning=judgement.reasoning,
+                        metadata=obj.metadata,
                     )
                 )
                 logger.info(

@@ -33,13 +33,10 @@ DEFAULT_POPULARITY_DATASET = "Cyro1/enwiki_pageviews_m"
 import dotenv
 dotenv.load_dotenv()
 
-# Setup logger
-logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s - %(message)s"
 )
-
 logger = logging.getLogger(__name__)
 
 
@@ -349,20 +346,36 @@ def generate_questions_from_docs(
     prompt_template: str,
     model_name: str = "gpt-4.1-nano",
 ) -> list[dict]:
-    """Generate synthetic questions from sampled documents."""
+    """Generate synthetic questions from sampled documents using batch LLM calls.
+
+    Args:
+        docs: List of document dicts with at minimum ``"text"``, ``"wikipedia_id"``,
+            and ``"decile"`` keys.
+        prompt_template: Prompt string containing a ``{passage}`` placeholder.
+        model_name: OpenAI model identifier to use for generation.
+
+    Returns:
+        List of question dicts ready to be appended to the QA dataframe.
+    """
     from src.llm.openAi_service import OpenAIService
-    
+
     service = OpenAIService(model_name=model_name)
+
+    prompts = [prompt_template.format(passage=doc.get("text", "")) for doc in docs]
+
+    logger.info("Generating %d synthetic questions via batch_generate…", len(prompts))
+    try:
+        responses = service.batch_generate(prompts)
+    except Exception as e:
+        logger.error("batch_generate failed: %s", e)
+        raise
+
     questions = []
-    
-    for doc in tqdm(docs, desc="Generating questions"):
+    for doc, response in zip(docs, responses):
         try:
-            prompt = prompt_template.format(passage=doc.get("text", ""))
-            question_text = service.invoke(prompt)
-            
             questions.append({
                 "question_id": f"syn_{doc['decile']}_{len(questions)}",
-                "question_text": question_text.strip(),
+                "question_text": response.strip(),
                 "answer_texts": [],
                 "wikipedia_id": doc["wikipedia_id"],
                 "wikipedia_title": doc.get("wikipedia_title", ""),
@@ -370,8 +383,8 @@ def generate_questions_from_docs(
                 "dataset": "synthetic",
             })
         except Exception as e:
-            logger.warning(f"Failed: {e}")
-    
+            logger.warning("Failed to assemble question for doc %s: %s", doc.get("wikipedia_id"), e)
+
     return questions
 
 

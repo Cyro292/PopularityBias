@@ -111,8 +111,7 @@ _pick_group_col = pick_group_col
 
 # ── Load everything ───────────────────────────────────────────────────────────
 
-import pyarrow.parquet as pq
-import pyarrow.compute as pc
+from src.corpus_handler import ParquetCorpusHandler
 
 k_values_full = list(range(1, max(TOP_K, max(K_VALUES_DETAILED)) + 1))
 
@@ -227,26 +226,25 @@ for strategy in STRATEGIES:
     ).astype(str)
 
     # — doc_length from corpus —
-    print("    scanning corpus for doc lengths…")
-    question_ids: set[str] = set(df["wikipedia_id"].unique())
-    length_parts: list[pd.DataFrame] = []
-    pf = pq.ParquetFile(str(CORPUS_PATH))
-    for batch in pf.iter_batches(batch_size=100_000, columns=["wikipedia_id", "text"]):
-        lengths = pc.utf8_length(batch.column("text"))
-        part = pd.DataFrame({
-            "wikipedia_id": batch.column("wikipedia_id").to_pandas().astype(str).str.strip(),
-            "doc_length":   lengths.to_pandas(),
-        })
-        part = part[part["wikipedia_id"].isin(question_ids)]
-        length_parts.append(part)
-    doc_length_df = pd.concat(length_parts, ignore_index=True).drop_duplicates(
-        subset="wikipedia_id", keep="first"
-    )
-    print(f"    matched {len(doc_length_df):,} / {len(question_ids):,} IDs")
+    print("    fetching doc lengths via corpus handler…")
+    _corpus_handler = ParquetCorpusHandler(corpus_path=CORPUS_PATH, metadata_path=metadata_path)
+    question_ids_str: list[str] = df["wikipedia_id"].unique().tolist()
+    question_ids_int: list[int] = []
+    for _wid in question_ids_str:
+        try:
+            question_ids_int.append(int(_wid))
+        except (ValueError, TypeError):
+            pass
+    _docs = _corpus_handler.get_documents(question_ids_int)
+    doc_length_df = pd.DataFrame({
+        "wikipedia_id": [str(d.metadata["wikipedia_id"]) for d in _docs],
+        "doc_length":   [len(d.page_content) for d in _docs],
+    }).drop_duplicates(subset="wikipedia_id", keep="first")
+    print(f"    matched {len(doc_length_df):,} / {len(question_ids_str):,} IDs")
     if "doc_length" in df.columns:
         df = df.drop(columns=["doc_length"])
     df = df.merge(doc_length_df[["wikipedia_id", "doc_length"]], on="wikipedia_id", how="left")
-    del length_parts, doc_length_df
+    del _docs, doc_length_df
     gc.collect()
 
     # — save cache —

@@ -9,6 +9,7 @@ from typing import Any, Type, TypeVar
 from langchain_core.language_models import BaseLanguageModel
 from pydantic import BaseModel
 from langchain_core.rate_limiters import InMemoryRateLimiter
+from tqdm import tqdm
 
 from src.llm.base import LLMBase, T
 
@@ -51,10 +52,11 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         temperature: float = 0.0,
         api_key: str | None = None,
         rate_limiter: Any | None = None,
+        requests_per_second: int = 30,
         **kwargs: Any,
     ) -> None:
         
-        rate_limiter = InMemoryRateLimiter(requests_per_second=10) if rate_limiter is None else rate_limiter
+        rate_limiter = InMemoryRateLimiter(requests_per_second=requests_per_second) if rate_limiter is None else rate_limiter
 
         super().__init__(
             model_name=model_name,
@@ -82,6 +84,7 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
             "model": self.model_name,
             "temperature": self.temperature,
             "api_key": resolved_key,
+            "rate_limiter": self.rate_limiter,
             **self._kwargs,
         }
         if self.rate_limiter is not None:
@@ -142,7 +145,7 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
 
     # ── Batch interface ───────────────────────────────────────────────────────
 
-    def batch_generate(self, prompts: list[str]) -> list[str]:
+    def batch_generate(self, prompts: list[str], batch_size: int = 50) -> list[str]:
         """Generate freeform text responses for multiple prompts concurrently.
 
         Delegates to LangChain's ``Runnable.batch()``, which dispatches all
@@ -161,8 +164,16 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         if not prompts:
             return []
         try:
-            responses = self._llm.batch(prompts)  # type: ignore[union-attr]
-            return [r.content for r in responses]
+            all_responses = []
+
+            for i in tqdm(range(0, len(prompts), batch_size), desc="Generating responses", unit="batch"):
+                batch_prompts = prompts[i : i + batch_size]
+                responses = self._llm.batch(batch_prompts)  # type: ignore[union-attr]
+                all_responses.extend(responses)
+
+            contents = [r.content for r in all_responses]
+
+            return contents
         except Exception as e:
             logger.error("OpenAI batch_generate failed: %s", e)
             raise
@@ -171,6 +182,7 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         self,
         prompts: list[str],
         schema: Type[T],
+        batch_size: int = 50,
     ) -> list[T]:
         """Generate structured responses for multiple prompts concurrently.
 
@@ -192,7 +204,11 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         if not prompts:
             return []
         try:
-            results = self._llm.with_structured_output(schema).batch(prompts)  # type: ignore[union-attr]
+            results = []
+            for i in tqdm(range(0, len(prompts), batch_size), desc="Generating structured responses", unit="batch"):
+                batch_prompts = prompts[i : i + batch_size]
+                batch_results = self._llm.with_structured_output(schema).batch(batch_prompts)  # type: ignore[union-attr]
+                results.extend(batch_results)
         except Exception as e:
             logger.error("OpenAI batch_generate_structured failed: %s", e)
             raise

@@ -14,9 +14,10 @@ class EvaluationObjects:
     id: str
     question: str
     proposed_answer: str
+    page_content: str
     answer: str
     retrieved_docs: list[Document]
-    page_content: str
+    metadata: dict | None = None
 
 
 @dataclass
@@ -27,7 +28,7 @@ class EvaluationResult:
     proposed_answer: str
     evaluation_score: float | str | bool
     reasoning: str
-
+    metadata: dict | None = None
 
 class EvaluatorBase:
     def __init__(self, evaluation_service: LLMBase) -> None:
