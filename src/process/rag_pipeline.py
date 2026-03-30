@@ -40,8 +40,8 @@ class PipelineConfig:
     output_dir: str = "evaluation_results_mistral_300"  # Directory to save evaluation results
     dataset_names: list[str] = field(default_factory=lambda: ["natural_questions", "trivia_qa", "pop_qa", "fever", "trex"])  # List of HuggingFace dataset names to load questions from
     questions_per_decile: int = 300  # Number of questions to sample from each decile (set to -1 for all)
-    model_name: str | None = None  # Model name for the ModalLLMService (e.g. "Qwen/Qwen3-1.7B" or a local GGUF model)
-    model_request_batch_size: int = 254  # Batch size for requests to the LLM service
+    model_name: str | None = None 
+    model_request_batch_size: int = 50  # Batch size for requests to the LLM service
     requests_per_second_api: int = 8
     collection_name: str = "wiki_full_bil"
     es_url: str = os.getenv("ELASTICSEARCH_ENDPOINT", "")
@@ -52,7 +52,7 @@ class PipelineConfig:
     embedding_model: str = "Lajavaness/bilingual-embedding-small"
     embedding_provider: str = "huggingface"
     embeddings_request_batch_size: int = 254
-    gpu_batch_size: int = 50
+    gpu_batch_size: int = 254
     top_k: int = 1  # Number of top documents to retrieve for each question
     num_candidates: int = 1000  # Number of candidates to retrieve for evaluation (after re-ranking)
 

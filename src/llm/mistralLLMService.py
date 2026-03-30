@@ -24,7 +24,7 @@ image = (
     .run_function(download_model)
 )
 
-@app.function(gpu="A100", image=image, timeout=600, max_containers=3)
+@app.function(gpu="A10G", image=image, timeout=600, max_containers=3)
 def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256) -> list[str]:
     from transformers import pipeline
     from tqdm import tqdm
@@ -41,7 +41,7 @@ def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: i
         results.append(result[0]["generated_text"][-1]["content"])  # type: ignore[index]
     return results
 
-@app.function(gpu="A100", image=image, timeout=600, max_containers=3)
+@app.function(gpu="A10G", image=image, timeout=600, max_containers=3)
 def generate_structured(
     prompts: list[str],
     schema_class: type[BaseModel],
