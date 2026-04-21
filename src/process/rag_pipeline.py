@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing_extensions import Literal
 import pandas as pd
 import logging
 import pathlib
@@ -37,9 +38,9 @@ load_dotenv()  # Load environment variables from .env file
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    output_dir: str = "evaluation_results_mistral_300"  # Directory to save evaluation results
+    output_dir: str = "evaluation_results_qwen_400"  # Directory to save evaluation results
     dataset_names: list[str] = field(default_factory=lambda: ["natural_questions", "trivia_qa", "pop_qa", "fever", "trex"])  # List of HuggingFace dataset names to load questions from
-    questions_per_decile: int = 300  # Number of questions to sample from each decile (set to -1 for all)
+    questions_per_decile: int = 400  # Number of questions to sample from each decile (set to -1 for all)
     model_name: str | None = None 
     model_request_batch_size: int = 50  # Batch size for requests to the LLM service
     requests_per_second_api: int = 8
@@ -53,14 +54,17 @@ class PipelineConfig:
     embedding_provider: str = "huggingface"
     embeddings_request_batch_size: int = 254
     gpu_batch_size: int = 254
-    top_k: int = 1  # Number of top documents to retrieve for each question
+    top_k: int = 5  # Number of top documents to retrieve for each question
     num_candidates: int = 1000  # Number of candidates to retrieve for evaluation (after re-ranking)
+    balance_decile_mode: Literal["chunk_weighted", "unweighted"] = "chunk_weighted"  # Method to balance questions across deciles ("chunk_weighted" or "unweighted")
 
 
 def main():
 
     # Initialize services
     config = PipelineConfig()
+
+    logger.info("Starting RAG evaluation pipeline with config: %s", config)
 
     collection_folder = DATA_DIR / config.collection_name
     output_folder = collection_folder / config.output_dir
@@ -78,6 +82,7 @@ def main():
         balance_datasets=True,
         target_per_decile=config.questions_per_decile,
         shuffle=True,
+        balance_decile_mode=config.balance_decile_mode,
     )
     rag_service = ElasticsearchRagService(
         config=IndexingConfig(
@@ -93,10 +98,11 @@ def main():
         es_url=config.es_url,
         es_user=config.es_user,
         es_password=config.es_password,
+        bm25_b=0
     )
-    llm_service = MistralLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
+    llm_service = QwenLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
 
-    llm_evaluation_service = OpenAIService(model_name="gpt-4o-mini", requests_per_second=10)
+    llm_evaluation_service = OpenAIService(model_name="gpt-5-nano-2025-08-07", requests_per_second=10)
     evaluator = BinaryEvaluator(evaluation_service=llm_evaluation_service)
 
     question_input.load()
@@ -133,24 +139,36 @@ def main():
             f"Documents: {','.join([doc.page_content for doc in docs])}\nQuestion: {q.question_text}"
             for q, docs in zip(question_data, retrieved_docs)
         ]
-        answers = llm_service.batch_generate(answer_prompts)
+        answers = llm_service.batch_generate(answer_prompts, checkpoint_path=output_folder / f"answer_checkpoint_{strategy}.jsonl")
 
         evaluation_objects_list = [
             EvaluationObjects(
                 id=q.question_id,
                 question=q.question_text,
-                answer="",
+                answers=q.answer_texts,
                 page_content=q.page_content,
                 proposed_answer=answer,
                 retrieved_docs=docs,
-                metadata={"wikipedia_id": q.wikipedia_id, "decile": q.decile, "dataset": q.dataset, "strategy": strategy, "retrieved_doc_ids": [doc.metadata.get("wikipedia_id", "") for doc in docs]},
+                metadata={
+                        "wikipedia_id": q.wikipedia_id, 
+                        "decile": q.decile,
+                        "decile_unweighted": q.decile_unweighted,
+                        "decile_chunk_weighted": q.decile_chunk_weighted,
+                        "popularity_avg": q.popularity_avg,
+                        "dataset": q.dataset,                         
+                        "strategy": strategy, 
+                        "retrieved_doc_popularity": [doc.metadata.get("popularity", 0) for doc in docs], 
+                        "retrieved_doc_ids": [doc.metadata.get("wikipedia_id", "") for doc in docs]},
             )
             for q, answer, docs in zip(
                 question_data, answers, retrieved_docs
             )
         ]
 
-        evaluation_results: list[EvaluationResult] = evaluator.evaluate(evaluation_objects_list)
+        evaluation_results: list[EvaluationResult] = evaluator.evaluate(
+            evaluation_objects_list,
+            checkpoint_path=output_folder / f"eval_checkpoint_{strategy}.jsonl",
+        )
         
         evaluation_results_dicts = [result.__dict__ for result in evaluation_results]
         results_df = pd.DataFrame(evaluation_results_dicts)

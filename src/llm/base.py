@@ -2,30 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
 from typing import Any, Type, TypeVar
 
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
 
+logger = logging.getLogger(__name__)
+
 
 class LLMBase:
-    """Abstract base for LLM services.
-
-    All concrete implementations (e.g. ``OpenAIService``) must subclass this
-    and implement :meth:`generate`, :meth:`generate_structured`,
-    :meth:`batch_generate`, and :meth:`batch_generate_structured`.
-
-    Args:
-        model_name: Model identifier string (e.g. ``"gpt-4o-mini"``).
-        temperature: Sampling temperature.  ``0.0`` gives deterministic output.
-        api_key: Provider API key.  Falls back to the relevant environment
-            variable when ``None``.
-        rate_limiter: Optional LangChain-compatible rate limiter passed
-            directly to the underlying model constructor.  Use
-            ``langchain_core.rate_limiters.InMemoryRateLimiter`` or any object
-            that satisfies the ``BaseRateLimiter`` protocol.
-    """
+    """Abstract base for LLM services."""
 
     def __init__(
         self,
@@ -39,77 +29,55 @@ class LLMBase:
         self.api_key = api_key
         self.rate_limiter = rate_limiter
 
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    def _load_checkpoint(self, ckpt_path: Path) -> list[str]:
+        """Load completed prompt results from a .jsonl checkpoint file.
+
+        Returns a list of result strings in the order they were saved.
+        """
+        results: list[str] = []
+        if not ckpt_path.exists():
+            return results
+        with ckpt_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    results.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+        logger.info("Checkpoint: loaded %d completed results", len(results))
+        return results
+
+    def _save_checkpoint(self, ckpt_path: Path, results: list[str]) -> None:
+        """Write all completed results to a .jsonl checkpoint file."""
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        with ckpt_path.open("w", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps(r) + "\n")
+
     # ── Single-item interface ─────────────────────────────────────────────────
 
     def generate(self, prompt: str) -> str:
-        """Generate a freeform text response.
-
-        Args:
-            prompt: Input prompt string.
-
-        Returns:
-            The model's text response.
-
-        Raises:
-            NotImplementedError: Must be implemented by subclasses.
-        """
         raise NotImplementedError("generate is not implemented")
 
     def generate_structured(self, prompt: str, schema: Type[T]) -> T:
-        """Generate a response validated against a Pydantic model.
-
-        Args:
-            prompt: Input prompt string.
-            schema: A :class:`pydantic.BaseModel` subclass whose fields define
-                the expected output structure.
-
-        Returns:
-            An instance of *schema* populated with the model's response.
-
-        Raises:
-            NotImplementedError: Must be implemented by subclasses.
-        """
         raise NotImplementedError("generate_structured is not implemented")
 
     # ── Batch interface ───────────────────────────────────────────────────────
 
-    def batch_generate(self, prompts: list[str]) -> list[str]:
-        """Generate freeform text responses for multiple prompts.
-
-        Implementations should exploit the underlying model's native batch
-        endpoint (e.g. LangChain's ``Runnable.batch()``) rather than
-        looping over :meth:`generate`.
-
-        Args:
-            prompts: List of input prompt strings.
-
-        Returns:
-            List of text responses, same length and order as *prompts*.
-
-        Raises:
-            NotImplementedError: Must be implemented by subclasses.
-        """
+    def batch_generate(
+        self,
+        prompts: list[str],
+        *,
+        checkpoint_path: str | Path | None = None,
+    ) -> list[str]:
         raise NotImplementedError("batch_generate is not implemented")
 
     def batch_generate_structured(
         self,
         prompts: list[str],
         schema: Type[T],
+        *,
+        checkpoint_path: str | Path | None = None,
     ) -> list[T]:
-        """Generate structured responses for multiple prompts.
-
-        Implementations should use the underlying model's native batch
-        endpoint bound with ``with_structured_output``.
-
-        Args:
-            prompts: List of input prompt strings.
-            schema: A :class:`pydantic.BaseModel` subclass whose fields define
-                the expected output structure.
-
-        Returns:
-            List of *schema* instances, same length and order as *prompts*.
-
-        Raises:
-            NotImplementedError: Must be implemented by subclasses.
-        """
         raise NotImplementedError("batch_generate_structured is not implemented")

@@ -35,8 +35,11 @@ class QuestionItem:
     question_text: str
     answer_texts: list[str]
     wikipedia_id: str
+    popularity_avg: float | None = None
     wikipedia_title: str = ""
     decile: int = -1
+    decile_unweighted: int = -1
+    decile_chunk_weighted: int = -1
     dataset: str = ""
     page_content: str = ""
 

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Type, TypeVar
 
 from langchain_core.language_models import BaseLanguageModel
+from langchain_core.language_models.base import LanguageModelInput
 from pydantic import BaseModel
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from tqdm import tqdm
 
-from src.llm.base import LLMBase, T
+from src.llm.base import LLMBase
+
+T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
@@ -145,78 +149,81 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
 
     # ── Batch interface ───────────────────────────────────────────────────────
 
-    def batch_generate(self, prompts: list[str], batch_size: int = 50) -> list[str]:
-        """Generate freeform text responses for multiple prompts concurrently.
-
-        Delegates to LangChain's ``Runnable.batch()``, which dispatches all
-        prompts concurrently (subject to any ``rate_limiter`` set on the
-        model).
-
-        Args:
-            prompts: List of input prompt strings.
-
-        Returns:
-            List of text responses in the same order as *prompts*.
-
-        Raises:
-            Exception: Propagates any LangChain / OpenAI API errors.
-        """
+    def batch_generate(
+        self,
+        prompts: list[str],
+        batch_size: int = 50,
+        *,
+        checkpoint_path: str | Path | None = None,
+    ) -> list[str]:
         if not prompts:
             return []
+
+        ckpt_path = Path(checkpoint_path) if checkpoint_path else None
+        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        pending = prompts[len(completed):]
+        results: list[str] = list(completed)
+
+        if not pending:
+            return results
+
         try:
-            all_responses = []
-
-            for i in tqdm(range(0, len(prompts), batch_size), desc="Generating responses", unit="batch"):
-                batch_prompts = prompts[i : i + batch_size]
-                responses = self._llm.batch(batch_prompts)  # type: ignore[union-attr]
-                all_responses.extend(responses)
-
-            contents = [r.content for r in all_responses]
-
-            return contents
+            for i in tqdm(range(0, len(pending), batch_size), desc="Generating responses", unit="batch"):
+                batch: list[LanguageModelInput] = pending[i : i + batch_size]
+                responses = self._llm.batch(batch)  # type: ignore[union-attr]
+                results.extend(r.content for r in responses)
         except Exception as e:
             logger.error("OpenAI batch_generate failed: %s", e)
+            if ckpt_path:
+                self._save_checkpoint(ckpt_path, results)
+                logger.error("Checkpoint saved with %d completed results", len(results))
             raise
+
+        return results
 
     def batch_generate_structured(
         self,
         prompts: list[str],
         schema: Type[T],
         batch_size: int = 50,
+        *,
+        checkpoint_path: str | Path | None = None,
     ) -> list[T]:
-        """Generate structured responses for multiple prompts concurrently.
-
-        Binds the model with ``with_structured_output(schema)`` then calls
-        ``Runnable.batch()`` so all prompts are dispatched concurrently.
-
-        Args:
-            prompts: List of input prompt strings.
-            schema: A :class:`pydantic.BaseModel` subclass defining the
-                expected output structure.
-
-        Returns:
-            List of *schema* instances in the same order as *prompts*.
-
-        Raises:
-            ValueError: If any result is not an instance of *schema*.
-            Exception: Propagates any LangChain / OpenAI API errors.
-        """
         if not prompts:
             return []
+
+        ckpt_path = Path(checkpoint_path) if checkpoint_path else None
+        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        pending = prompts[len(completed):]
+        results: list[T] = list(completed)  # type: ignore[assignment]
+
+        if not pending:
+            return results
+
+        structured_llm = self._llm.with_structured_output(schema)  # type: ignore[union-attr]
+
         try:
-            results = []
-            for i in tqdm(range(0, len(prompts), batch_size), desc="Generating structured responses", unit="batch"):
-                batch_prompts = prompts[i : i + batch_size]
-                batch_results = self._llm.with_structured_output(schema).batch(batch_prompts)  # type: ignore[union-attr]
-                results.extend(batch_results)
+            for i in tqdm(range(0, len(pending), batch_size), desc="Generating structured responses", unit="batch"):
+                batch: list[LanguageModelInput] = pending[i : i + batch_size]
+                batch_results = structured_llm.batch(batch)
+                results.extend(batch_results)  # type: ignore[arg-type]
         except Exception as e:
+            from openai import BadRequestError
+            if isinstance(e, BadRequestError):
+                # find the offending prompt by retrying one-by-one
+                batch_start = (len(results) - len(completed))
+                for j, prompt in enumerate(pending[batch_start : batch_start + batch_size]):
+                    try:
+                        structured_llm.invoke(prompt)
+                    except BadRequestError:
+                        logger.error(
+                            "Bad prompt at index %d caused the 400 error:\n  %.500s",
+                            len(completed) + batch_start + j, prompt,
+                        )
             logger.error("OpenAI batch_generate_structured failed: %s", e)
+            if ckpt_path:
+                self._save_checkpoint(ckpt_path, results)  # type: ignore[arg-type]
+                logger.error("Checkpoint saved with %d completed results", len(results))
             raise
 
-        for i, result in enumerate(results):
-            if not isinstance(result, schema):
-                raise ValueError(
-                    f"Result at index {i}: expected {schema.__name__}, "
-                    f"got {type(result).__name__}"
-                )
         return results  # type: ignore[return-value]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal, Type
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -109,7 +109,12 @@ class BinaryEvaluator(EvaluatorBase):
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def evaluate(self, evaluation_objects: list[EvaluationObjects]) -> list[EvaluationResult]:
+    def evaluate(
+        self,
+        evaluation_objects: list[EvaluationObjects],
+        *,
+        checkpoint_path: str | Path | None = None,
+    ) -> list[EvaluationResult]:
         """Evaluate a list of question–answer pairs for relevance.
 
         All prompts are dispatched as a single batch via
@@ -133,7 +138,7 @@ class BinaryEvaluator(EvaluatorBase):
 
         try:
             judgements = self.evaluation_service.batch_generate_structured(
-                prompts, BinaryJudgement
+                prompts, BinaryJudgement, checkpoint_path=checkpoint_path
             )
         except Exception as e:
             logger.error("batch_generate_structured failed: %s", e)
@@ -146,7 +151,7 @@ class BinaryEvaluator(EvaluatorBase):
                     EvaluationResult(
                         id=obj.id,
                         question=obj.question,
-                        answer=obj.answer,
+                        answers=obj.answers,
                         proposed_answer=obj.proposed_answer,
                         evaluation_score=judgement.verdict,
                         reasoning=judgement.reasoning,

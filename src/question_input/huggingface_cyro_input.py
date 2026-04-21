@@ -64,6 +64,11 @@ class HuggingFaceCyroInput(QuestionInput):
             ``corpus_handler``.
         target_per_decile: Target count per decile when ``balance_deciles``
             is ``True``. Ignored otherwise.
+        balance_decile_mode: Which decile column to use when filtering and
+            balancing.  ``"unweighted"`` (default) uses
+            ``pop_decile_unweighted``; ``"chunk_weighted"`` uses
+            ``pop_decile_chunk_weighted``.  Both columns are always written
+            to the parquet regardless of this setting.
         shuffle: Shuffle rows before applying ``max_items``.
         random_state: Random seed for sampling. Defaults to ``42``.
         hf_token: HuggingFace API token. Falls back to ``HUGGINGFACE_TOKEN``
@@ -84,6 +89,7 @@ class HuggingFaceCyroInput(QuestionInput):
         balance_deciles: bool = False,
         balance_datasets: bool = False,
         target_per_decile: int | None = None,
+        balance_decile_mode: Literal["unweighted", "chunk_weighted"] = "unweighted",
         shuffle: bool = False,
         random_state: int = 42,
         hf_token: str | None = None,
@@ -110,104 +116,122 @@ class HuggingFaceCyroInput(QuestionInput):
         self.balance_deciles = balance_deciles
         self.balance_datasets = balance_datasets
         self.target_per_decile = target_per_decile
+        self.balance_decile_mode = balance_decile_mode
         self.shuffle = shuffle
         self.random_state = random_state
         self.hf_token = hf_token or os.environ.get("HUGGINGFACE_TOKEN")
 
     # ── Load (HuggingFace → filtered parquet) ────────────────────────────────
 
-    def load(self) -> Path:
+    def load(self, *, force: bool = False) -> Path:
         """Stream from HuggingFace, assign deciles, filter, balance, and write parquet.
 
-        Pass 1 — streams each HF sub-dataset as Arrow batches and writes a
-        raw parquet via :class:`~pyarrow.parquet.ParquetWriter`.
+        Pass 1 (HuggingFace fetch) is skipped when the cache parquet already
+        exists and ``force`` is ``False``.  **Pass 2 (decile assignment,
+        filtering, and balancing) always runs** — it reads whatever parquet
+        Pass 1 left behind (or the existing cache) and overwrites it with the
+        balanced result.  This ensures that changing ``balance_decile_mode``,
+        ``target_per_decile``, or any balancing flag always takes effect
+        without needing ``force=True``.
 
-        Pass 2 — if ``corpus_handler`` is set: obtains decile boundaries via
-        :meth:`~src.corpus_handler.base.CorpusHandler.get_boundaries`, builds a
-        ``wikipedia_id → popularity_avg`` lookup by streaming the corpus
-        parquet directly, assigns the ``decile`` column, applies decile
-        filter and balancing in pandas, then atomically replaces the parquet.
+        Pass ``force=True`` to also re-download from HuggingFace (re-runs
+        both passes unconditionally).
+
+        Args:
+            force: Re-download from HuggingFace even if the cache already
+                exists.  Defaults to ``False``.
 
         Returns:
             The path to the written parquet file.
         """
-        from datasets import load_dataset, Dataset
+        # ── Pass 1: stream HF → raw parquet (skipped on cache hit) ───────
+        if not force and self.parquet_path.exists():
+            raw_rows = pq.read_metadata(self.parquet_path).num_rows
+            logger.info(
+                "Pass 1 — cache hit, skipping HuggingFace fetch (%s, %d rows)",
+                self.parquet_path,
+                raw_rows,
+            )
+        else:
+            from datasets import load_dataset, Dataset
 
-        names_to_fetch = (
-            [n for n in self.dataset_names if n in self.datasets_filter]
-            if self.datasets_filter is not None
-            else self.dataset_names
-        )
+            names_to_fetch = (
+                [n for n in self.dataset_names if n in self.datasets_filter]
+                if self.datasets_filter is not None
+                else self.dataset_names
+            )
 
-        # ── Pass 1: stream HF → raw parquet ───────────────────────────────
-        self.parquet_path.parent.mkdir(parents=True, exist_ok=True)
-        writer: pq.ParquetWriter | None = None
-        total_written = 0
+            self.parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            writer: pq.ParquetWriter | None = None
+            total_written = 0
 
-        try:
-            for name in names_to_fetch:
-                logger.info("Fetching %s / %s (split=%s)", HF_REPO, name, self.split)
+            try:
+                for name in names_to_fetch:
+                    logger.info("Pass 1 — fetching %s / %s (split=%s)", HF_REPO, name, self.split)
 
-                ds = load_dataset(
-                    HF_REPO,
-                    name,
-                    split=self.split,
-                    cache_dir=self.cache_dir,
-                    token=self.hf_token,
-                )
-
-                if not isinstance(ds, Dataset):
-                    raise ValueError(f"Expected a Dataset for {name!r}, got {type(ds)}")
-                assert isinstance(ds, Dataset)
-
-                for batch in ds.data.to_batches(max_chunksize=_BATCH_SIZE):
-                    batch = batch.append_column(
-                        pa.field("dataset", pa.string()),
-                        pa.array([name] * len(batch), type=pa.string()),
+                    ds = load_dataset(
+                        HF_REPO,
+                        name,
+                        split=self.split,
+                        cache_dir=self.cache_dir,
+                        token=self.hf_token,
                     )
 
-                    if len(batch) == 0:
-                        continue
+                    if not isinstance(ds, Dataset):
+                        raise ValueError(f"Expected a Dataset for {name!r}, got {type(ds)}")
+                    assert isinstance(ds, Dataset)
 
-                    if writer is None:
-                        writer = pq.ParquetWriter(self.parquet_path, batch.schema)
-                    writer.write_batch(batch)
-                    total_written += len(batch)
+                    for batch in ds.data.to_batches(max_chunksize=_BATCH_SIZE):
+                        batch = batch.append_column(
+                            pa.field("dataset", pa.string()),
+                            pa.array([name] * len(batch), type=pa.string()),
+                        )
 
-                del ds
-                gc.collect()
+                        if len(batch) == 0:
+                            continue
 
-        finally:
-            if writer is not None:
-                writer.close()
+                        if writer is None:
+                            writer = pq.ParquetWriter(self.parquet_path, batch.schema)
+                        writer.write_batch(batch)
+                        total_written += len(batch)
 
-        logger.info("Pass 1 complete: %d rows written", total_written)
+                    del ds
+                    gc.collect()
 
-        if total_written == 0:
-            return self.parquet_path
+            finally:
+                if writer is not None:
+                    writer.close()
 
-        # ── Pass 2: assign deciles + filter + balance ──────────────────────
+            logger.info("Pass 1 complete — %d raw rows written to %s", total_written, self.parquet_path)
+
+            if total_written == 0:
+                return self.parquet_path
+
+        # ── Pass 2: assign deciles + filter + balance (always runs) ───────
         if self.corpus_handler is not None:
             import pandas as pd
             from src.metrics.decile_utils import (
                 assign_decile,
                 COL_POPULARITY,
+                COL_DECILE_UNWEIGHTED,
+                COL_DECILE_CHUNK_WEIGHTED,
             )
 
-            # Read full parquet written in pass 1
+            logger.info("Pass 2 — starting (decile_mode=%s, balance_deciles=%s, target_per_decile=%s, balance_datasets=%s)",
+                        self.balance_decile_mode, self.balance_deciles, self.target_per_decile, self.balance_datasets)
+
+            # Read parquet (either freshly written by Pass 1, or existing cache)
             df: pd.DataFrame = pq.read_table(self.parquet_path).to_pandas()  # type: ignore[assignment]
+            logger.info("Pass 2 — loaded %d rows from parquet", len(df))
 
             # ── Boundaries from corpus handler ─────────────────────────────
-            boundaries_uw, _ = self.corpus_handler.get_boundaries()
+            boundaries_uw, boundaries_cw = self.corpus_handler.get_boundaries()
 
-            # ── Build wikipedia_id → popularity lookup (stream corpus) ────
-            logger.info("Building popularity lookup from corpus…")
+            # ── Build wikipedia_id → popularity lookup (stream corpus) ─────
+            logger.info("Pass 2 — building popularity lookup from corpus…")
             qa_ids = set(df["wikipedia_id"].dropna().astype(int).unique())
             id_to_pop: dict[int, float] = {}
 
-            # Access the underlying parquet directly for efficient streaming.
-            # CorpusHandler.get_documents() is for point-lookups; a full scan
-            # here uses the parquet file directly via the handler's corpus_path.
             from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
             if isinstance(self.corpus_handler, ParquetCorpusHandler):
                 corpus_pf = pq.ParquetFile(self.corpus_handler.corpus_path)
@@ -224,7 +248,6 @@ class HuggingFaceCyroInput(QuestionInput):
                         if wid in qa_ids and wid not in id_to_pop:
                             id_to_pop[wid] = float(pop)
             else:
-                # Generic fallback: fetch matching documents via the handler
                 docs = self.corpus_handler.get_documents(list(qa_ids))
                 for doc in docs:
                     wid = doc.metadata.get("wikipedia_id")
@@ -233,41 +256,65 @@ class HuggingFaceCyroInput(QuestionInput):
                         id_to_pop[int(wid)] = float(pop)
 
             gc.collect()
-            logger.info("Popularity lookup: %d / %d QA ids matched", len(id_to_pop), len(qa_ids))
+            logger.info("Pass 2 — popularity lookup: %d / %d QA ids matched", len(id_to_pop), len(qa_ids))
 
-            # ── Assign decile column ───────────────────────────────────────
+            # ── Assign both decile columns ─────────────────────────────────
             pop_series = df["wikipedia_id"].dropna().astype(int).map(id_to_pop)  # type: ignore[arg-type]
-            df["decile"] = assign_decile(np.asarray(pop_series, dtype=np.float64), boundaries_uw)  # type: ignore[arg-type]
+            pop_arr = np.asarray(pop_series, dtype=np.float64)
+            df[COL_DECILE_UNWEIGHTED]     = assign_decile(pop_arr, boundaries_uw)  # type: ignore[arg-type]
+            df[COL_DECILE_CHUNK_WEIGHTED] = assign_decile(pop_arr, boundaries_cw)  # type: ignore[arg-type]
 
-            unmapped = df["decile"].isna().sum()
+            # ── Select balancing column based on mode ──────────────────────
+            # Both decile columns are always written to the parquet.
+            # balance_decile_mode controls which one drives balancing/filtering.
+            _balance_col = (
+                COL_DECILE_CHUNK_WEIGHTED
+                if self.balance_decile_mode == "chunk_weighted"
+                else COL_DECILE_UNWEIGHTED
+            )
+            logger.info("Pass 2 — balancing column: %s", _balance_col)
+
+            unmapped = df[COL_DECILE_UNWEIGHTED].isna().sum()
             if unmapped:
-                logger.warning("%d questions have no corpus match — dropping", unmapped)
-                df = df.dropna(subset=["decile"])
-            df["decile"] = df["decile"].astype(int)
+                logger.warning("Pass 2 — %d questions have no corpus match — dropping", unmapped)
+                df = df.dropna(subset=[COL_DECILE_UNWEIGHTED, COL_DECILE_CHUNK_WEIGHTED])
+            df[COL_DECILE_UNWEIGHTED]     = df[COL_DECILE_UNWEIGHTED].astype(int)
+            df[COL_DECILE_CHUNK_WEIGHTED] = df[COL_DECILE_CHUNK_WEIGHTED].astype(int)
+            df["decile"] = df[_balance_col]
 
-            dist = df["decile"].value_counts().sort_index().to_dict()
-            logger.info("Decile distribution: %s", dist)
+            dist_uw = df[COL_DECILE_UNWEIGHTED].value_counts().sort_index().to_dict()
+            dist_cw = df[COL_DECILE_CHUNK_WEIGHTED].value_counts().sort_index().to_dict()
+            logger.info("Pass 2 — pre-balance decile distribution (unweighted):     %s", dist_uw)
+            logger.info("Pass 2 — pre-balance decile distribution (chunk_weighted): %s", dist_cw)
+            logger.info("Pass 2 — %d rows total before balancing", len(df))
 
             # ── Decile filter ──────────────────────────────────────────────
             if self.deciles is not None:
                 before = len(df)
                 df = df.loc[df["decile"].isin(self.deciles)].copy()
-                logger.info("Decile filter %s: %d → %d rows", self.deciles, before, len(df))
+                logger.info("Pass 2 — decile filter %s: %d → %d rows", self.deciles, before, len(df))
 
-            # ── Balancing ──────────────────────────────────────────────────
+            # ── Shuffle before sampling so balance is random ───────────────
             if self.shuffle:
                 df = df.sample(frac=1, random_state=self.random_state).reset_index(drop=True)
+                logger.info("Pass 2 — shuffled %d rows (random_state=%d)", len(df), self.random_state)
 
+            # ── Dataset balancing ──────────────────────────────────────────
             if self.balance_datasets and "dataset" in df.columns:
                 df = _balance_per_dataset(df, self.target_per_decile, self.random_state)
 
+            # ── Decile balancing ───────────────────────────────────────────
             if self.balance_deciles:
                 df = _balance_by_decile(df, self.target_per_decile, self.random_state)
 
             if self.max_items is not None:
+                before = len(df)
                 df = df.iloc[: self.max_items].copy()
+                logger.info("Pass 2 — max_items cap: %d → %d rows", before, len(df))
 
-            logger.info("Pass 2 complete: %d rows", len(df))
+            dist_final = df["decile"].value_counts().sort_index().to_dict()
+            logger.info("Pass 2 — final decile distribution (%s): %s", _balance_col, dist_final)
+            logger.info("Pass 2 complete — %d rows total", len(df))
 
             tmp_path = self.parquet_path.with_suffix(".tmp.parquet")
             pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp_path)
@@ -281,13 +328,17 @@ class HuggingFaceCyroInput(QuestionInput):
             import pandas as pd
 
             df = pq.read_table(self.parquet_path).to_pandas()  # type: ignore[assignment]
+            logger.info("Pass 2 — no corpus handler, %d rows loaded", len(df))
 
             if self.shuffle:
                 df = df.sample(frac=1, random_state=self.random_state).reset_index(drop=True)
+                logger.info("Pass 2 — shuffled %d rows", len(df))
             if self.max_items is not None:
+                before = len(df)
                 df = df.iloc[: self.max_items].copy()
+                logger.info("Pass 2 — max_items cap: %d → %d rows", before, len(df))
 
-            logger.info("Pass 2 complete: %d rows", len(df))
+            logger.info("Pass 2 complete — %d rows", len(df))
 
             tmp_path = self.parquet_path.with_suffix(".tmp.parquet")
             pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp_path)
@@ -295,6 +346,9 @@ class HuggingFaceCyroInput(QuestionInput):
 
             del df
             gc.collect()
+
+        else:
+            logger.info("Pass 2 — skipped (no corpus_handler, shuffle=False, max_items=None)")
 
         logger.info("Saved to %s", self.parquet_path)
         return self.parquet_path
@@ -371,16 +425,19 @@ def _batch_to_items(
     question_texts = batch.column("question_text").to_pylist()   if "question_text"   in schema_names else [None] * len(batch)
     answer_texts   = batch.column("answer_texts").to_pylist()    if "answer_texts"    in schema_names else [None] * len(batch)
     wikipedia_ids  = batch.column("wikipedia_id").to_pylist()    if "wikipedia_id"    in schema_names else [None] * len(batch)
+    popularities   = batch.column("popularity_avg").to_pylist()  if "popularity_avg"  in schema_names else [None] * len(batch)
     wiki_titles    = batch.column("wikipedia_title").to_pylist() if "wikipedia_title" in schema_names else [None] * len(batch)
-    deciles        = batch.column("decile").to_pylist()          if "decile"          in schema_names else [None] * len(batch)
-    datasets       = batch.column("dataset").to_pylist()         if "dataset"         in schema_names else [None] * len(batch)
+    deciles        = batch.column("decile").to_pylist()                        if "decile"                        in schema_names else [None] * len(batch)
+    deciles_uw     = batch.column("pop_decile_unweighted").to_pylist()         if "pop_decile_unweighted"         in schema_names else [None] * len(batch)
+    deciles_cw     = batch.column("pop_decile_chunk_weighted").to_pylist()     if "pop_decile_chunk_weighted"     in schema_names else [None] * len(batch)
+    datasets       = batch.column("dataset").to_pylist()                       if "dataset"                       in schema_names else [None] * len(batch)
 
     _content_map = content_map or {}
 
     items = []
-    for qid, qt, at, wid, wtitle, dec, ds in zip(
+    for qid, qt, at, wid, pop, wtitle, dec, dec_uw, dec_cw, ds in zip(
         question_ids, question_texts, answer_texts,
-        wikipedia_ids, wiki_titles, deciles, datasets,
+        wikipedia_ids, popularities, wiki_titles, deciles, deciles_uw, deciles_cw, datasets,
     ):
         wid_int = int(wid) if wid is not None else None
         items.append(QuestionItem(
@@ -388,8 +445,11 @@ def _batch_to_items(
             question_text=str(qt) if qt is not None else "",
             answer_texts=at if isinstance(at, list) else [],
             wikipedia_id=str(wid_int) if wid_int is not None else "",
+            popularity_avg=float(pop) if pop is not None else None,
             wikipedia_title=str(wtitle) if wtitle is not None else "",
             decile=int(dec) if dec is not None else -1,
+            decile_unweighted=int(dec_uw) if dec_uw is not None else -1,
+            decile_chunk_weighted=int(dec_cw) if dec_cw is not None else -1,
             dataset=str(ds) if ds is not None else "",
             page_content=_content_map.get(wid_int, "") if wid_int is not None else "",
         ))

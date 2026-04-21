@@ -75,8 +75,8 @@ QUESTIONS_PATH  = COLLECTION_ROOT / "all_qa_8k.parquet"
 CORPUS_PATH     = COLLECTION_ROOT / "wiki_corpus.parquet"
 
 STRATEGIES         = ["approximation", "bm25"]
-TOP_K              = 10
-K_VALUES_DETAILED  = [1, 3, 5, 10]
+TOP_K              = 5
+K_VALUES_DETAILED  = [1, 3, 5, 5]
 
 DECILE_MODE   = "chunk_weighted"   # "chunk_weighted" or "unweighted"
 OUTPUT_FOLDER = OUTPUT_NAME
