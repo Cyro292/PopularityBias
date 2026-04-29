@@ -80,17 +80,25 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
         prompts: list[str],
         *,
         checkpoint_path: str | Path | None = None,
+        question_ids: list[str] | None = None,
     ) -> list[str]:
         if not prompts:
             return []
 
         ckpt_path = Path(checkpoint_path) if checkpoint_path else None
-        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        completed = self._load_checkpoint(ckpt_path, question_ids) if ckpt_path else []
         pending = prompts[len(completed):]
         results: list[str] = list(completed)
 
         if not pending:
+            logger.info("✓ All %d prompts already completed (checkpoint fully reused)", len(results))
             return results
+        
+        if len(completed) != len(prompts):
+            logger.warning(
+                "⚠ Checkpoint length mismatch (checkpoint=%d, prompts=%d), generating %d new responses",
+                len(completed), len(prompts), len(pending)
+            )
 
         batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
 
@@ -105,9 +113,12 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
         except Exception as e:
             logger.error("Mistral batch_generate failed: %s", e)
             if ckpt_path:
-                self._save_checkpoint(ckpt_path, results)
+                self._save_checkpoint(ckpt_path, results, question_ids)
                 logger.error("Checkpoint saved with %d completed results", len(results))
             raise
+
+        if ckpt_path:
+            self._save_checkpoint(ckpt_path, results, question_ids)
 
         return results
 

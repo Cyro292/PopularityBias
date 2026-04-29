@@ -31,29 +31,95 @@ class LLMBase:
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 
-    def _load_checkpoint(self, ckpt_path: Path) -> list[str]:
-        """Load completed prompt results from a .jsonl checkpoint file.
+    def _load_checkpoint(self, ckpt_path: Path, question_ids: list[str] | None = None) -> list[str]:
+        """Load completed prompt results from a checkpoint file (.csv or .jsonl).
 
         Returns a list of result strings in the order they were saved.
+        
+        Args:
+            ckpt_path: Path to checkpoint file.
+            question_ids: Optional list of question IDs to filter and order results.
         """
+        import pandas as pd
+        
         results: list[str] = []
         if not ckpt_path.exists():
+            logger.debug("Checkpoint: no checkpoint file at %s", ckpt_path)
             return results
+        
+        # Support both CSV and JSONL formats
+        if ckpt_path.suffix == ".csv":
+            try:
+                df = pd.read_csv(ckpt_path)
+                if "answer" in df.columns and "question_id" in df.columns:
+                    # If question_ids provided, filter and order by them
+                    if question_ids is not None:
+                        # Build mapping from question_id to answer
+                        id_to_answer = dict(zip(df["question_id"], df["answer"].fillna("")))
+                        # Return answers in the order of question_ids
+                        results = [id_to_answer.get(qid, "") for qid in question_ids]
+                    else:
+                        # Legacy: sort by question_idx if it exists, otherwise maintain CSV order
+                        if "question_idx" in df.columns:
+                            df = df.sort_values("question_idx")
+                        results = df["answer"].fillna("").tolist()
+                    logger.info("✓ Checkpoint: loaded %d completed results from %s", len(results), ckpt_path.name)
+                    return results
+                else:
+                    logger.warning("CSV checkpoint missing required columns (question_id, answer)")
+                    return []
+            except Exception as e:
+                logger.error("Failed to load CSV checkpoint %s: %s", ckpt_path, e)
+                return []
+        
+        # JSONL format (legacy support)
         with ckpt_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 try:
-                    results.append(json.loads(line.strip()))
+                    data = json.loads(line.strip())
+                    # Handle both old format (plain string) and new format (dict with 'answer' key)
+                    if isinstance(data, dict) and "answer" in data:
+                        results.append(data["answer"])
+                    elif isinstance(data, str):
+                        results.append(data)
+                    else:
+                        # Fallback: convert to string
+                        results.append(str(data))
                 except Exception:
                     pass
-        logger.info("Checkpoint: loaded %d completed results", len(results))
+        logger.info("✓ Checkpoint: loaded %d completed results from %s", len(results), ckpt_path.name)
         return results
 
-    def _save_checkpoint(self, ckpt_path: Path, results: list[str]) -> None:
-        """Write all completed results to a .jsonl checkpoint file."""
+    def _save_checkpoint(self, ckpt_path: Path, results: list[str], question_ids: list[str] | None = None) -> None:
+        """Write all completed results to a checkpoint file (.csv or .jsonl).
+        
+        Args:
+            ckpt_path: Path to checkpoint file.
+            results: List of answer strings.
+            question_ids: Optional list of question IDs corresponding to results.
+        """
+        import pandas as pd
+        
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        with ckpt_path.open("w", encoding="utf-8") as fh:
-            for r in results:
-                fh.write(json.dumps(r) + "\n")
+        
+        # Support both CSV and JSONL formats based on file extension
+        if ckpt_path.suffix == ".csv":
+            data = {"answer": results}
+            if question_ids is not None and len(question_ids) == len(results):
+                data["question_id"] = question_ids
+            else:
+                # Fallback to index-based
+                data["question_idx"] = range(len(results))
+            df = pd.DataFrame(data)
+            df.to_csv(ckpt_path, index=False)
+        else:
+            # JSONL format (legacy)
+            with ckpt_path.open("w", encoding="utf-8") as fh:
+                for idx, r in enumerate(results):
+                    entry = {"question_idx": idx, "answer": r}
+                    if question_ids is not None and idx < len(question_ids):
+                        entry["question_id"] = question_ids[idx]
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     # ── Single-item interface ─────────────────────────────────────────────────
 
@@ -70,6 +136,7 @@ class LLMBase:
         prompts: list[str],
         *,
         checkpoint_path: str | Path | None = None,
+        question_ids: list[str] | None = None,
     ) -> list[str]:
         raise NotImplementedError("batch_generate is not implemented")
 

@@ -95,7 +95,8 @@ class BinaryEvaluator(EvaluatorBase):
         evaluation_service: LLMBase,
         prompt_template: str = _PROMPT_TEMPLATE,
     ) -> None:
-        super().__init__(evaluation_service=evaluation_service)
+        super().__init__()
+        self.evaluation_service = evaluation_service
         self.prompt_template = prompt_template
 
     # ── Internal helpers ──────────────────────────────────────────────────────

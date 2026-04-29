@@ -155,17 +155,25 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         batch_size: int = 50,
         *,
         checkpoint_path: str | Path | None = None,
+        question_ids: list[str] | None = None,
     ) -> list[str]:
         if not prompts:
             return []
 
         ckpt_path = Path(checkpoint_path) if checkpoint_path else None
-        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        completed = self._load_checkpoint(ckpt_path, question_ids) if ckpt_path else []
         pending = prompts[len(completed):]
         results: list[str] = list(completed)
 
         if not pending:
+            logger.info("✓ All %d prompts already completed (checkpoint fully reused)", len(results))
             return results
+        
+        if len(completed) != len(prompts):
+            logger.warning(
+                "⚠ Checkpoint length mismatch (checkpoint=%d, prompts=%d), generating %d new responses",
+                len(completed), len(prompts), len(pending)
+            )
 
         try:
             for i in tqdm(range(0, len(pending), batch_size), desc="Generating responses", unit="batch"):
@@ -175,9 +183,12 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
         except Exception as e:
             logger.error("OpenAI batch_generate failed: %s", e)
             if ckpt_path:
-                self._save_checkpoint(ckpt_path, results)
+                self._save_checkpoint(ckpt_path, results, question_ids)
                 logger.error("Checkpoint saved with %d completed results", len(results))
             raise
+
+        if ckpt_path:
+            self._save_checkpoint(ckpt_path, results, question_ids)
 
         return results
 

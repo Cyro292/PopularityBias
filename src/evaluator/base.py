@@ -32,8 +32,8 @@ class EvaluationResult:
     metadata: dict | None = None
 
 class EvaluatorBase:
-    def __init__(self, evaluation_service: LLMBase) -> None:
-        self.evaluation_service = evaluation_service
+    def __init__(self) -> None:
+        pass
 
     def evaluate(self, evaluation_objects: list[EvaluationObjects], *, checkpoint_path: str | Path | None = None) -> list[EvaluationResult]:
         """Evaluate the given evaluation objects and return a list of results."""

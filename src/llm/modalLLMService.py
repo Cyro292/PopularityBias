@@ -123,7 +123,14 @@ class ModalLLMService(LLMBase):  # type: ignore[misc]
     def generate(self, prompt: str) -> str:
         return self._call([prompt])[0]
 
-    def batch_generate(self, prompts: list[str], batch_size: int | None = None) -> list[str]:
+    def batch_generate(
+        self,
+        prompts: list[str],
+        batch_size: int | None = None,
+        *,
+        checkpoint_path: str | Path | None = None,
+        question_ids: list[str] | None = None,
+    ) -> list[str]:
         if not prompts:
             return []
         bs = batch_size or self._request_batch_size
