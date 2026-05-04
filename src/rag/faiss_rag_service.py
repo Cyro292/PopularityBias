@@ -1,12 +1,34 @@
-"""FAISS RAG service — memory-efficient vector retrieval for huge datasets.
+"""FAISS RAG service — memory-efficient local vector retrieval.
 
-Optimised for low-RAM environments with:
-  - Memory-mapped index loading (search without loading full index into RAM)
-  - Streaming IVF_PQ training (train on batches, not all vectors at once)
-  - OPQ pre-transform for better compression
-  - On-disk inverted lists (IndexIVFPQDisk) for billion-scale search
-  - Configurable memory limits and queue sizes
-  - Index sharding for parallel indexing and search
+Optimised for large datasets with configurable memory constraints:
+
+Index strategies
+----------------
+``vector``      Exact brute-force (``IndexFlatL2``).  Perfect recall, high RAM.
+``hnsw``        Approximate kNN via HNSW graph.  Medium RAM, fast search.
+``ivfpq``       Compressed IVF_PQ.  Low RAM, ~90 % recall.
+``opq_ivfpq``   OPQ pre-transform + IVF_PQ.  Better accuracy, same size.
+``ivfpq_disk``  IVF_PQ with on-disk inverted lists.  Minimal RAM.
+
+Memory optimisations
+--------------------
+- Memory-mapped index loading (search without loading into RAM).
+- Streaming IVF training (sample-based, not full dataset).
+- On-disk inverted lists for IVF indexes (``ivfpq_disk``).
+- SQLite docstore — documents stay on disk, not in RAM.
+- Configurable queue sizes and GC frequency in the indexing pipeline.
+- Index sharding (optional, for parallel indexing).
+
+Unified interface
+-----------------
+Implements the full ``RagService`` contract:
+``index_from_dataframe``, ``index_from_parquet``,
+``index_from_parquet_batches``, ``load_index``, ``save_index``,
+``delete_index``, ``retrieve_documents``,
+``retrieve_documents_with_scores``, ``batch_retrieve``,
+``batch_retrieve_with_scores``, ``get_doc_count``,
+``get_all_documents``, ``get_index_stats``,
+``embed_prompt``, ``embed_passage``.
 """
 
 from __future__ import annotations
@@ -20,245 +42,286 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Literal, Sequence
+from typing import Any, Iterator, Literal, Sequence
 
 import faiss
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from langchain.schema import Document
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS, DistanceStrategy
 from tqdm import tqdm
 
-from .base import RagService, VectorStoreLike
-from .document_utils import documents_from_dataframe
-from .SqliteDocstore import SqliteDocstore
+from .base import IndexResult, RagService, documents_from_dataframe
+from src.storage.sqlite_docstore import SqliteDocstore
 from .utils import IndexingConfig, build_embeddings
 
 logger = logging.getLogger(__name__)
 
+# FAISS + OpenMP can trigger "Cannot fork a new thread" on macOS.
+# Setting this allows it to proceed with a warning rather than crashing.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+faiss.omp_set_num_threads(1)
 
-# === Memory Configuration ===================================================
+_FAISS_METRIC_MAP: dict[str, DistanceStrategy] = {
+    "cosine":      DistanceStrategy.COSINE,
+    "dot_product": DistanceStrategy.MAX_INNER_PRODUCT,
+    "euclidean":   DistanceStrategy.EUCLIDEAN,
+}
+
+
+# ── Memory configuration ──────────────────────────────────────────────────────
 
 @dataclass
 class MemoryConfig:
-    """Configuration for memory-efficient FAISS operations.
+    """Tuning knobs for memory-efficient FAISS operations.
 
-    Args:
+    Attributes:
         max_ram_mb: Approximate RAM budget in MB for indexing/search.
         use_mmap: Memory-map the index file instead of loading into RAM.
-        use_ondisk_ivf: Store inverted lists on disk (for IVF indexes).
-        training_sample_size: Max vectors to sample for IVF training.
-        queue_maxsize: Max items in producer/consumer queues.
-        gc_every_n_batches: Force garbage collection every N batches.
-        prefetch_batches: Number of batches to prefetch from parquet.
-        shard_size: Max vectors per shard (0 = no sharding).
+        use_ondisk_ivf: Store inverted lists on disk (IVF indexes only).
+        training_sample_size: Max vectors sampled for IVF training.
+        queue_maxsize: Max items held in producer/consumer queues.
+        gc_every_n_batches: Force GC every N indexing batches.
+        prefetch_batches: Parquet batches to read ahead.
+        shard_size: Max vectors per shard (0 = disabled).
     """
 
-    max_ram_mb: int = 4096
+    max_ram_mb: int = 4_096
     use_mmap: bool = True
     use_ondisk_ivf: bool = False
     training_sample_size: int = 500_000
     queue_maxsize: int = 2
     gc_every_n_batches: int = 1
     prefetch_batches: int = 1
-    shard_size: int = 0  # 0 = disabled, e.g. 10_000_000 for 10M vectors/shard
+    shard_size: int = 0
 
 
 DEFAULT_MEMORY_CONFIG = MemoryConfig()
 
-# FAISS + OpenMP can have issues with "RuntimeError: OpenMP error: Cannot fork a new thread" on some platforms (e.g., macOS). Setting this env var allows it to proceed with a warning instead of crashing. See
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-faiss.omp_set_num_threads(1)
 
-_FAISS_METRIC_MAP = {
-    "cosine": DistanceStrategy.COSINE,
-    "dot_product": DistanceStrategy.MAX_INNER_PRODUCT,
-    "euclidean": DistanceStrategy.EUCLIDEAN,
-}
-
-
-# === FAISS OpenMP Settings ==================================================
-
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-faiss.omp_set_num_threads(1)
-
+# ── FAISS RAG service ─────────────────────────────────────────────────────────
 
 class FaissRagService(RagService):
-    """Memory-efficient FAISS / BM25 retrieval service for huge datasets.
+    """Memory-efficient FAISS vector retrieval service.
 
-    Strategies:
-        * ``vector``  – exact brute-force search (``IndexFlatL2`` /
-          ``IndexFlatIP``). High RAM usage.
-        * ``hnsw`` – approximate kNN via HNSW (``IndexHNSWFlat``).
-          Medium RAM, fast search.
-        * ``ivfpq`` – compressed approximate search (``IndexIVFPQ``).
-          **Low RAM**, good for huge datasets.
-        * ``ivfpq_disk`` – IVF_PQ with on-disk inverted lists.
-          **Minimal RAM**, for billion-scale.
-        * ``opq_ivfpq`` – OPQ pre-transform + IVF_PQ for better accuracy
-          at same compression.
-        * ``bm25`` – lexical BM25 retrieval (``rank_bm25``).
+    Args:
+        config: ``IndexingConfig`` specifying the embedding provider and model.
+            Required for all vector strategies.
+        strategy: Index strategy — see module docstring for options.
+        distance_strategy: Vector distance metric (``"cosine"``,
+            ``"dot_product"``, or ``"euclidean"``).
+        memory_config: Memory tuning.  Defaults to ``MemoryConfig()``.
+        hnsw_m: HNSW graph connectivity parameter.
+        hnsw_ef_construction: HNSW build-time search width.
+        hnsw_ef_search: HNSW query-time search width.
+        normalize_l2: Apply L2 normalisation inside the FAISS store.
+        ivfpq_nlist: IVF number of Voronoi cells.
+        ivfpq_m: Number of sub-quantisers (must divide embedding dim).
+        ivfpq_nbits: Bits per sub-quantiser code (usually 8).
+        ivfpq_nprobe: Cells visited per query (higher = better recall).
+        opq_m: OPQ rotation matrix sub-dimension.
 
-    Memory Optimizations:
-        * Memory-mapped index loading (``use_mmap=True``)
-        * Streaming IVF training (sample-based, not full dataset)
-        * On-disk inverted lists for IVF indexes
-        * Configurable queue sizes and GC frequency
-        * SQLite docstore (documents on disk, not RAM)
+    Example::
+
+        config = IndexingConfig(
+            embedding_provider="modal",
+            embedding_model="Lajavaness/bilingual-embedding-small",
+            gpu_batch_size=512,
+            request_batch_size=2048,
+            normalise_embeddings=True,
+        )
+        service = FaissRagService(config=config, strategy="ivfpq")
+        service.index_from_parquet_batches(
+            Path("data/wiki_full_bil/wiki_corpus.parquet"),
+            text_field="text",
+            metadata_fields=["wikipedia_id", "wikipedia_title"],
+            collection_name="data/faiss_wiki",
+        )
+        docs = service.retrieve_documents("Who is Reza Pahlavi?", top_k=10)
     """
 
-    # ── Construction ─────────────────────────────────────────────────────
+    # ── Construction ──────────────────────────────────────────────────────
 
     def __init__(
         self,
-        config: IndexingConfig | None = None,
+        config: IndexingConfig,
         *,
         strategy: Literal[
-            "vector", "hnsw", "ivfpq", "ivfpq_disk", "opq_ivfpq", "bm25"
+            "vector", "hnsw", "ivfpq", "ivfpq_disk", "opq_ivfpq"
         ] = "ivfpq",
         distance_strategy: Literal["cosine", "dot_product", "euclidean"] = "cosine",
         memory_config: MemoryConfig | None = None,
-        # HNSW tuning
+        # HNSW
         hnsw_m: int = 32,
         hnsw_ef_construction: int = 200,
         hnsw_ef_search: int = 128,
         normalize_l2: bool = False,
-        # IVF_PQ tuning (for ivfpq, ivfpq_disk, opq_ivfpq strategies)
-        ivfpq_nlist: int = 4096,
+        # IVF_PQ
+        ivfpq_nlist: int = 4_096,
         ivfpq_m: int = 48,
         ivfpq_nbits: int = 8,
         ivfpq_nprobe: int = 64,
-        # OPQ tuning (for opq_ivfpq strategy)
+        # OPQ
         opq_m: int = 48,
-    ):
+    ) -> None:
+        if strategy not in {*_FAISS_METRIC_MAP, "hnsw", "ivfpq", "ivfpq_disk", "opq_ivfpq", "vector"}:
+            raise ValueError(f"Unsupported strategy: {strategy!r}")
+        if distance_strategy not in _FAISS_METRIC_MAP:
+            raise ValueError(
+                f"Unsupported distance_strategy: {distance_strategy!r}. "
+                f"Choose from {list(_FAISS_METRIC_MAP)}"
+            )
+
+        self.config = config
         self.strategy = strategy
-        self._normalize_l2 = normalize_l2
+        self.distance_strategy = _FAISS_METRIC_MAP[distance_strategy]
         self.memory_config = memory_config or DEFAULT_MEMORY_CONFIG
+        self._normalize_l2 = normalize_l2
 
-        # Current in-memory stores
-        self._faiss_store: FAISS | None = None
-        self._bm25_retriever: BM25Retriever | None = None
-        self._current_index_path: Path | None = None
-        self._is_mmap_loaded: bool = False
-
-        # HNSW parameters
+        # HNSW
         self.hnsw_m = hnsw_m
         self.hnsw_ef_construction = hnsw_ef_construction
         self.hnsw_ef_search = hnsw_ef_search
 
-        # IVF_PQ parameters
+        # IVF_PQ
         self.ivfpq_nlist = ivfpq_nlist
         self.ivfpq_m = ivfpq_m
         self.ivfpq_nbits = ivfpq_nbits
         self.ivfpq_nprobe = ivfpq_nprobe
 
-        # OPQ parameters
+        # OPQ
         self.opq_m = opq_m
 
-        # Training state (for streaming training)
+        # State
+        self._faiss_store: FAISS | None = None
+        self._current_index_path: Path | None = None
+        self._is_mmap_loaded: bool = False
+
+        # Streaming training state (reset between indexing runs)
         self._training_vectors: list[np.ndarray] = []
         self._training_vectors_count: int = 0
         self._is_trained: bool = False
 
-        # Backwards compatibility
-        self.connected_graph_notes = hnsw_m
+        # Build embeddings
+        self._embeddings = build_embeddings(
+            provider=config.embedding_provider,
+            model=config.embedding_model,
+            trust_remote_code=config.trust_remote_code,
+            rate_limiter=config.rate_limiter,
+            requests_per_second=config.requests_per_second,
+            check_interval=config.rate_limit_check_interval,
+            bucket_size=config.rate_limit_bucket_size,
+            gpu_batch_size=config.gpu_batch_size,
+            request_batch_size=config.request_batch_size,
+            normalise_embeddings=config.normalise_embeddings,
+        )
 
-        # Load prompt templates
-        self._passage_prompt, self._query_prompt = self._load_prompts()
-
-        if strategy == "bm25":
-            raise ValueError("FAISS RAG Service cannot be indexed with BM25 strategy")
-        else:
-            if config is None:
-                raise ValueError(f"IndexingConfig required for '{strategy}' strategy")
-            self.config = config
-            self._embeddings = build_embeddings(
-                provider=config.embedding_provider,
-                model=config.embedding_model,
-                trust_remote_code=config.trust_remote_code,
-                rate_limiter=config.rate_limiter,
-                requests_per_second=config.requests_per_second,
-                check_interval=config.rate_limit_check_interval,
-                bucket_size=config.rate_limit_bucket_size,
-                gpu_batch_size=config.gpu_batch_size,
-                request_batch_size=config.request_batch_size,
-                normalise_embeddings=config.normalise_embeddings,
-            )
-
-            if distance_strategy not in _FAISS_METRIC_MAP:
-                raise ValueError(f"Unsupported distance function: {distance_strategy}")
-
-            self.distance_strategy = _FAISS_METRIC_MAP[distance_strategy]
-
-        # Pre-create text splitter once (reused across all batches)
-        cfg = self.config if hasattr(self, 'config') else (config or IndexingConfig())
-        if cfg.chunk_size:
+        # Text splitter (reused across batches)
+        if config.chunk_size:
             from langchain_text_splitters import RecursiveCharacterTextSplitter
             self._text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=cfg.chunk_size,
-                chunk_overlap=cfg.chunk_overlap,
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
             )
         else:
             self._text_splitter = None
 
+        # Prompt templates
+        self._passage_prompt, self._query_prompt = self._load_prompts(
+            getattr(config, "passage_prompt_file", None),
+            getattr(config, "query_prompt_file", None),
+        )
+
         logger.info(
             f"FAISS {strategy} strategy ready "
             f"(mmap={self.memory_config.use_mmap}, "
-            f"max_ram={self.memory_config.max_ram_mb}MB)"
+            f"max_ram={self.memory_config.max_ram_mb} MB)"
         )
 
-    # ── Prompt helpers ───────────────────────────────────────────────────
+    # ── Prompt helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _load_prompts() -> tuple[str, str]:
-        """Load passage and query prompt templates from disk."""
-        from config import DATA_DIR
+    def _load_prompts(
+        passage_file: str | None,
+        query_file: str | None,
+    ) -> tuple[str, str]:
+        """Load passage and query prompt templates from disk.
 
+        Args:
+            passage_file: Override path for the passage prompt file.
+            query_file: Override path for the query prompt file.
+
+        Returns:
+            Tuple of ``(passage_template, query_template)``.
+        """
+        from config import DATA_DIR
         prompts_dir = Path(DATA_DIR) / "prompts"
 
-        def _read(filename: str, default: str) -> str:
-            path = prompts_dir / filename
-            if path.exists():
-                return path.read_text().strip()
-            logger.warning(f"Prompt {path} not found, using default")
+        def _read(override: str | None, name: str, default: str) -> str:
+            if override:
+                p = Path(override)
+                if p.exists():
+                    return p.read_text().strip()
+                logger.warning(f"Custom prompt {p} not found, falling back to default")
+            p = prompts_dir / name
+            if p.exists():
+                return p.read_text().strip()
+            logger.warning(f"Prompt {p} not found, using built-in default")
             return default
 
         return (
-            _read("embeding_promt.txt", "passage: {passage}"),
-            _read("query_promt.txt", "query: {query}"),
+            _read(passage_file, "embeding_promt.txt", "passage: {passage}"),
+            _read(query_file,   "query_promt.txt",    "query: {query}"),
         )
 
+    def embed_prompt(self, text: str) -> str:
+        """Apply the query prompt template to *text*.
+
+        Args:
+            text: Raw query string.
+
+        Returns:
+            Prompt-wrapped query string.
+        """
+        return self._query_prompt.format(query=text)
+
+    def embed_passage(self, text: str) -> str:
+        """Apply the passage prompt template to *text*.
+
+        Args:
+            text: Raw passage string.
+
+        Returns:
+            Prompt-wrapped passage string.
+        """
+        return self._passage_prompt.format(passage=text)
+
     def _prepare_query(self, query: str) -> str:
-        """Wrap query with prompt template (skipped for BM25)."""
-        return self._query_prompt.format(query=query)
+        return self.embed_prompt(query)
 
     def _prepare_documents(
-        self, documents: list[Document], log_details: bool = False
+        self, documents: list[Document], *, log_details: bool = False
     ) -> list[Document]:
-        """Chunk documents and apply embedding prompt."""
-        original_count = len(documents)
+        """Optionally chunk and apply the passage prompt to *documents*.
 
+        Args:
+            documents: Input document list.
+            log_details: Log first-document preview.
+
+        Returns:
+            Processed document list (chunked + prompt-wrapped).
+        """
         if log_details and documents:
-            first = documents[0].page_content[:100].replace("\n", " ")
-            logger.info(f"Processing {original_count} documents, first doc start: '{first}...'")
-            if len(documents) > 1:
-                second = documents[1].page_content[:100].replace("\n", " ")
-                logger.info(f"Second doc start: '{second}...'")
+            preview = documents[0].page_content[:100].replace("\n", " ")
+            logger.info(f"[Prepare] {len(documents):,} docs, first: '{preview}…'")
 
         if self._text_splitter is not None:
             documents = self._text_splitter.split_documents(documents)
             if log_details:
-                logger.info(
-                    f"Split {original_count} documents into {len(documents)} chunks "
-                    f"(chunk_size={self.config.chunk_size}, overlap={self.config.chunk_overlap})"
-                )
+                logger.info(f"[Prepare] Split into {len(documents):,} chunks")
 
-        if self._embeddings is None:
-            return documents
-
-        prepared = [
+        return [
             Document(
                 page_content=self._passage_prompt.format(passage=d.page_content),
                 metadata=d.metadata,
@@ -266,374 +329,275 @@ class FaissRagService(RagService):
             for d in documents
         ]
 
-        if log_details:
-            logger.info(f"Applied embedding prompts to {len(prepared)} documents")
-            first_p = prepared[0].page_content[:100].replace("\n", " ")
-            logger.info(f"First prepared doc start: '{first_p}...'")
-            if len(prepared) > 1:
-                second_p = prepared[1].page_content[:100].replace("\n", " ")
-                logger.info(f"Second prepared doc start: '{second_p}...'")
+    # ── FAISS index construction ──────────────────────────────────────────
 
-        return prepared
+    def _build_raw_index(self, dim: int) -> faiss.Index:
+        """Create an (untrained) FAISS index for the configured strategy.
 
-    # ── FAISS index helpers ──────────────────────────────────────────────
+        IVF-family indexes are returned untrained.  Call
+        ``_finalize_training`` before adding vectors.
 
-    def _build_faiss_index(self, dim: int, connected_graph_notes: int | None = None) -> faiss.Index:
-        """Create a raw FAISS index matching the chosen strategy/distance.
+        Args:
+            dim: Embedding dimension.
 
-        Memory-efficient index types:
-            - ivfpq: ~48 bytes per vector (vs 6144 for flat with 1536-dim)
-            - opq_ivfpq: OPQ pre-transform for better accuracy at same size
-            - ivfpq_disk: Inverted lists on disk, minimal RAM
+        Returns:
+            A FAISS index object.
 
-        IVF indexes are returned **untrained** — call ``_train_faiss_index``
-        or ``_accumulate_training_vectors`` + ``_finalize_training`` before
-        adding any vectors.
+        Raises:
+            ValueError: For unsupported strategy or invalid IVF_PQ params.
         """
-        m = connected_graph_notes or self.hnsw_m
-
         if self.strategy == "vector":
-            # Exact brute-force — high RAM, perfect recall
-            index = faiss.IndexFlatL2(dim)
-            logger.info(f"[Index] Created IndexFlatL2 (dim={dim})")
+            idx = faiss.IndexFlatL2(dim)
+            logger.info(f"[Index] IndexFlatL2 (dim={dim})")
 
-        elif self.strategy in ("hnsw", "approximation"):
-            # HNSW graph — medium RAM, fast search, ~95% recall
-            index = faiss.IndexHNSWFlat(dim, m, faiss.METRIC_L2)
-            index.hnsw.efConstruction = self.hnsw_ef_construction
-            index.hnsw.efSearch = self.hnsw_ef_search
+        elif self.strategy == "hnsw":
+            idx = faiss.IndexHNSWFlat(dim, self.hnsw_m, faiss.METRIC_L2)
+            idx.hnsw.efConstruction = self.hnsw_ef_construction
+            idx.hnsw.efSearch = self.hnsw_ef_search
             logger.info(
-                f"[Index] Created IndexHNSWFlat (dim={dim}, M={m}, "
-                f"efConstruction={self.hnsw_ef_construction})"
+                f"[Index] IndexHNSWFlat "
+                f"(dim={dim}, M={self.hnsw_m}, efC={self.hnsw_ef_construction})"
             )
 
-        elif self.strategy == "ivfpq":
-            # IVF_PQ — low RAM, ~90% recall
-            self._validate_ivfpq_params(dim)
+        elif self.strategy in ("ivfpq", "ivfpq_disk"):
+            self._validate_ivfpq(dim)
             quantizer = faiss.IndexFlatL2(dim)
-            index = faiss.IndexIVFPQ(
+            idx = faiss.IndexIVFPQ(
                 quantizer, dim,
-                self.ivfpq_nlist,
-                self.ivfpq_m,
-                self.ivfpq_nbits,
+                self.ivfpq_nlist, self.ivfpq_m, self.ivfpq_nbits,
             )
-            index.nprobe = self.ivfpq_nprobe
-            bytes_per_vec = self.ivfpq_m * self.ivfpq_nbits // 8
+            idx.nprobe = self.ivfpq_nprobe
             logger.info(
-                f"[Index] Created IndexIVFPQ (dim={dim}, nlist={self.ivfpq_nlist}, "
-                f"m={self.ivfpq_m}, nbits={self.ivfpq_nbits}, ~{bytes_per_vec} bytes/vec)"
+                f"[Index] IndexIVFPQ "
+                f"(dim={dim}, nlist={self.ivfpq_nlist}, "
+                f"m={self.ivfpq_m}, nbits={self.ivfpq_nbits})"
             )
 
         elif self.strategy == "opq_ivfpq":
-            # OPQ pre-transform + IVF_PQ — better accuracy at same compression
-            self._validate_ivfpq_params(dim)
+            self._validate_ivfpq(dim)
             opq = faiss.OPQMatrix(dim, self.opq_m)
             quantizer = faiss.IndexFlatL2(dim)
             ivfpq = faiss.IndexIVFPQ(
                 quantizer, dim,
-                self.ivfpq_nlist,
-                self.ivfpq_m,
-                self.ivfpq_nbits,
+                self.ivfpq_nlist, self.ivfpq_m, self.ivfpq_nbits,
             )
             ivfpq.nprobe = self.ivfpq_nprobe
-            index = faiss.IndexPreTransform(opq, ivfpq)
+            idx = faiss.IndexPreTransform(opq, ivfpq)
             logger.info(
-                f"[Index] Created OPQ({self.opq_m}) + IndexIVFPQ "
-                f"(dim={dim}, nlist={self.ivfpq_nlist}, m={self.ivfpq_m})"
-            )
-
-        elif self.strategy == "ivfpq_disk":
-            # IVF_PQ with on-disk inverted lists — minimal RAM for huge datasets
-            self._validate_ivfpq_params(dim)
-            quantizer = faiss.IndexFlatL2(dim)
-            index = faiss.IndexIVFPQ(
-                quantizer, dim,
-                self.ivfpq_nlist,
-                self.ivfpq_m,
-                self.ivfpq_nbits,
-            )
-            index.nprobe = self.ivfpq_nprobe
-            # On-disk inverted lists are set up after training in _setup_ondisk_ivf()
-            logger.info(
-                f"[Index] Created IndexIVFPQ for on-disk mode "
+                f"[Index] OPQ({self.opq_m}) + IndexIVFPQ "
                 f"(dim={dim}, nlist={self.ivfpq_nlist}, m={self.ivfpq_m})"
             )
 
         else:
-            raise ValueError(f"Unsupported strategy: {self.strategy}")
+            raise ValueError(f"Unsupported strategy: {self.strategy!r}")
 
-        return index
+        return idx
 
-    def _validate_ivfpq_params(self, dim: int) -> None:
-        """Validate IVF_PQ parameters against embedding dimension."""
+    def _validate_ivfpq(self, dim: int) -> None:
+        """Raise if IVF_PQ sub-quantiser count does not divide dimension.
+
+        Args:
+            dim: Embedding dimension.
+
+        Raises:
+            ValueError: If ``dim % ivfpq_m != 0``.
+        """
         if dim % self.ivfpq_m != 0:
+            suggestion = next(
+                (m for m in (48, 32, 64, 24, 16, 8) if dim % m == 0), dim
+            )
             raise ValueError(
                 f"IVF_PQ: dim ({dim}) must be divisible by ivfpq_m ({self.ivfpq_m}). "
-                f"Try ivfpq_m={self._suggest_m(dim)}"
+                f"Try ivfpq_m={suggestion}."
             )
 
-    @staticmethod
-    def _suggest_m(dim: int) -> int:
-        """Suggest a valid ivfpq_m value for the given dimension."""
-        # Common dimensions: 384, 768, 1024, 1536, 3072
-        for m in [48, 32, 64, 24, 16, 8]:
-            if dim % m == 0:
-                return m
-        return dim  # fallback: no compression
+    # ── Streaming IVF training ────────────────────────────────────────────
 
-    def _train_faiss_index(self, index: faiss.Index, embeddings: list[list[float]]) -> None:
-        """Train an IVF/OPQ index on embeddings (no-op for flat/HNSW)."""
-        if not hasattr(index, 'is_trained') or index.is_trained:
-            return
+    def _accumulate_training_vectors(self, embeddings: list[list[float]]) -> bool:
+        """Buffer embedding vectors for streaming IVF training.
 
-        vectors = np.array(embeddings, dtype=np.float32)
-        n = len(vectors)
-        min_train = self.ivfpq_nlist * 39  # FAISS recommendation
+        Args:
+            embeddings: Batch of embedding vectors.
 
-        if n < min_train:
-            logger.warning(
-                f"[Train] Only {n:,} vectors for training; recommended >= {min_train:,} "
-                f"(nlist={self.ivfpq_nlist}). Recall may be reduced."
-            )
-
-        logger.info(f"[Train] Training index on {n:,} vectors...")
-        index.train(vectors)
-        logger.info(f"[Train] ✓ Index trained")
-
-        del vectors
-        gc.collect()
-
-    # ── Streaming training (memory-efficient for huge datasets) ──────────
-
-    def _accumulate_training_vectors(
-        self,
-        embeddings: list[list[float]],
-    ) -> bool:
-        """Accumulate vectors for streaming IVF training.
-
-        Returns True if we have enough vectors to train.
+        Returns:
+            ``True`` if enough vectors have been collected for training.
         """
         max_samples = self.memory_config.training_sample_size
-        current = self._training_vectors_count
+        if self._training_vectors_count >= max_samples:
+            return True
 
-        if current >= max_samples:
-            return True  # Already have enough
-
-        # Sample from this batch to avoid memory explosion
         n = len(embeddings)
-        remaining = max_samples - current
-
+        remaining = max_samples - self._training_vectors_count
         if n <= remaining:
-            # Take all
             self._training_vectors.append(np.array(embeddings, dtype=np.float32))
             self._training_vectors_count += n
         else:
-            # Random sample
             indices = np.random.choice(n, remaining, replace=False)
             sample = np.array([embeddings[i] for i in indices], dtype=np.float32)
             self._training_vectors.append(sample)
             self._training_vectors_count += remaining
 
         min_train = self.ivfpq_nlist * 39
-        have_enough = self._training_vectors_count >= min_train
-
-        logger.debug(
-            f"[Train] Accumulated {self._training_vectors_count:,}/{max_samples:,} "
-            f"training vectors (need {min_train:,})"
-        )
-
-        return have_enough
+        return self._training_vectors_count >= min_train
 
     def _finalize_training(self, index: faiss.Index) -> None:
-        """Train the index on accumulated vectors and clear the buffer."""
+        """Train *index* on accumulated vectors and clear the buffer.
+
+        Args:
+            index: The FAISS index to train (no-op if already trained).
+        """
         if self._is_trained or not self._training_vectors:
             return
-
-        # Concatenate all accumulated vectors
-        all_vectors = np.vstack(self._training_vectors)
-        logger.info(
-            f"[Train] Training index on {len(all_vectors):,} sampled vectors..."
-        )
-
-        index.train(all_vectors)
+        all_vecs = np.vstack(self._training_vectors)
+        logger.info(f"[Train] Training on {len(all_vecs):,} vectors…")
+        index.train(all_vecs)
         self._is_trained = True
-
-        # Clear training buffer to free RAM
-        del all_vectors
+        del all_vecs
         self._training_vectors.clear()
         self._training_vectors_count = 0
         gc.collect()
+        logger.info("[Train] ✓ Index trained")
 
-        logger.info(f"[Train] ✓ Index trained, training buffer cleared")
+    def _reset_training_state(self) -> None:
+        """Clear streaming training buffers."""
+        self._training_vectors.clear()
+        self._training_vectors_count = 0
+        self._is_trained = False
 
-    def _setup_ondisk_ivf(self, index: faiss.Index, path: Path) -> faiss.Index:
+    def _setup_ondisk_ivf(self, index: faiss.Index, save_path: Path) -> faiss.Index:
         """Convert trained IVF index to use on-disk inverted lists.
 
-        This dramatically reduces RAM usage for huge indexes by keeping
-        the inverted lists on disk instead of in memory.
+        Args:
+            index: Trained IVF index.
+            save_path: Root directory for the index files.
+
+        Returns:
+            Modified index (inverted lists now on disk).
+
+        Raises:
+            ValueError: If the index is not yet trained.
         """
-        if self.strategy != "ivfpq_disk":
-            return index
-
         if not index.is_trained:
-            raise ValueError("Index must be trained before setting up on-disk IVF")
-
-        ivlists_path = path / "faiss" / "ivlists.bin"
+            raise ValueError("Index must be trained before setting up on-disk IVF.")
+        ivlists_path = save_path / "faiss" / "ivlists.bin"
         ivlists_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Create on-disk inverted lists
         ivf_index = faiss.extract_index_ivf(index)
         invlists = faiss.OnDiskInvertedLists(
-            ivf_index.nlist,
-            ivf_index.code_size,
-            str(ivlists_path),
+            ivf_index.nlist, ivf_index.code_size, str(ivlists_path)
         )
         ivf_index.replace_invlists(invlists, True)
-
-        logger.info(f"[Index] Set up on-disk inverted lists at {ivlists_path}")
+        logger.info(f"[Index] On-disk inverted lists → {ivlists_path}")
         return index
 
-    def load_faiss_store(
-        self,
-        path: str | Path,
-        *,
-        use_mmap: bool | None = None,
-    ) -> FAISS | None:
-        """Load a previously-saved FAISS index from *path*.
-
-        Args:
-            path: Directory containing the faiss/ subdirectory.
-            use_mmap: If True, memory-map the index file instead of loading
-                into RAM. Defaults to ``self.memory_config.use_mmap``.
-
-        Memory-mapping allows searching huge indexes (100GB+) with minimal
-        RAM usage. The OS loads pages on-demand during search.
-        """
-        path = Path(path)
-        faiss_dir = path / "faiss"
-        if not faiss_dir.exists():
-            logger.warning(f"FAISS index directory not found at {faiss_dir}")
-            raise FileNotFoundError(f"FAISS index directory not found at {faiss_dir}")
-
-        faiss_file = faiss_dir / "index.faiss"
-        db_file = faiss_dir / "docstore.sqlite"
-
-        if not faiss_file.exists():
-            raise FileNotFoundError(f"index.faiss missing in {faiss_dir}")
-
-        # Determine whether to use memory-mapping
-        mmap = use_mmap if use_mmap is not None else self.memory_config.use_mmap
-
-        if mmap:
-            logger.info(f"Loading FAISS index with memory-mapping...")
-            raw_index = faiss.read_index(str(faiss_file), faiss.IO_FLAG_MMAP)
-            self._is_mmap_loaded = True
-        else:
-            logger.info(f"Loading FAISS index into RAM...")
-            raw_index = faiss.read_index(str(faiss_file))
-            self._is_mmap_loaded = False
-
-        # Restore IVF query-time probe count if applicable
-        if hasattr(raw_index, 'nprobe'):
-            raw_index.nprobe = self.ivfpq_nprobe
-
-        # Restore HNSW search parameters
-        if hasattr(raw_index, 'hnsw'):
-            raw_index.hnsw.efSearch = self.hnsw_ef_search
-
-        logger.info(
-            f"✓ {raw_index.ntotal:,} vectors loaded "
-            f"({'mmap' if mmap else 'RAM'})"
-        )
-
-        docstore = SqliteDocstore(db_file)
-        index_to_docstore_id = docstore.load_id_map()
-        if not index_to_docstore_id:
-            raise ValueError(f"id_map is empty in {db_file} — index may be corrupt")
-
-        self._faiss_store = FAISS(
-            embedding_function=self._embeddings,
-            index=raw_index,
-            docstore=docstore,
-            index_to_docstore_id=index_to_docstore_id,
-            normalize_L2=self._normalize_l2,
-        )
-        self._current_index_path = path
-        return self._faiss_store
-    
-    def load_index(self, path: str | Path) -> FAISS:
-        return self.load_faiss_store(path)
-
-    def save_faiss_index(self, path: str | Path) -> None:
-        """Save current FAISS index to *path* (no pickle — fast, no RAM spike).
-
-        Layout under ``<path>/faiss/`` (two files only):
-          index.faiss     – raw FAISS binary
-          docstore.sqlite – text + metadata + id_map table (integer→UUID)
-        """
-        if self._faiss_store is None:
-            raise ValueError("No FAISS index to save")
-
-        faiss_dir = Path(path) / "faiss"
-        faiss_dir.mkdir(parents=True, exist_ok=True)
-
-        # ── FAISS binary (atomic via tmp rename) ─────────────────────────
-        tmp_faiss = faiss_dir / "index.faiss.tmp"
-        faiss.write_index(self._faiss_store.index, str(tmp_faiss))
-        tmp_faiss.rename(faiss_dir / "index.faiss")
-
-        # ── Integer → docstore-ID map stored inside SQLite ────────────────
-        self._faiss_store.docstore.save_id_map(self._faiss_store.index_to_docstore_id)
-
-        n = len(self._faiss_store.index_to_docstore_id)
-        logger.info(f"FAISS index saved to {faiss_dir} ({n:,} vectors)")
-
-    def save_index(self, path: str | Path) -> None:
-        self.save_faiss_index(path)
+    # ── Indexing ──────────────────────────────────────────────────────────
 
     def index_from_dataframe(
         self,
         df: pd.DataFrame,
         text_field: str,
-        html_field: str | None = None,
         *,
         metadata_fields: Sequence[str] | None = None,
+        collection_name: str = "faiss_index",
         output_dir: Path | None = None,
-        collection_name: str = "rag",
-        progress_bar: bool | None = None,
-    ) -> tuple[FAISS | BM25Retriever | None, int]:
-        """Build a FAISS (or BM25) index from a pandas DataFrame."""
-        raise NotImplementedError("index_from_dataframe is not implemented; use index_from_parquet_batches for large datasets")
+        **kwargs: Any,
+    ) -> IndexResult:
+        """Build a FAISS index from a pandas DataFrame.
+
+        This is a convenience wrapper — for large DataFrames prefer
+        ``index_from_parquet_batches``.
+
+        Args:
+            df: Source DataFrame.
+            text_field: Column containing document text.
+            metadata_fields: Extra columns to store as metadata.
+            collection_name: Output path for the index when ``output_dir``
+                is provided.
+            output_dir: Directory to persist the index.  If ``None`` the
+                index is kept in memory only.
+            **kwargs: Passed to the LangChain ``FAISS.from_documents`` call.
+
+        Returns:
+            ``IndexResult`` with the ``FAISS`` store and chunk count.
+        """
+        documents = documents_from_dataframe(df, text_field, metadata_fields)
+        prepared = self._prepare_documents(documents)
+        texts = [d.page_content for d in prepared]
+        metadatas = [d.metadata for d in prepared]
+
+        logger.info(f"[Index] Embedding {len(texts):,} documents…")
+        embeddings = self._embeddings.embed_documents(texts)
+
+        save_path = (
+            Path(output_dir) / collection_name if output_dir else Path(collection_name)
+        )
+        db_dir = save_path / "faiss"
+        db_dir.mkdir(parents=True, exist_ok=True)
+
+        dim = len(embeddings[0])
+        raw_index = self._build_raw_index(dim)
+        if not raw_index.is_trained:
+            self._reset_training_state()
+            self._accumulate_training_vectors(embeddings)
+            self._finalize_training(raw_index)
+
+        docstore = SqliteDocstore(db_dir / "docstore.sqlite")
+        self._faiss_store = FAISS(
+            embedding_function=self._embeddings,
+            index=raw_index,
+            docstore=docstore,
+            index_to_docstore_id={},
+            normalize_L2=self._normalize_l2,
+        )
+        self._faiss_store.add_embeddings(
+            text_embeddings=list(zip(texts, embeddings)),
+            metadatas=metadatas,
+        )
+        self._current_index_path = save_path
+        self.save_index(save_path)
+
+        n = len(texts)
+        logger.info(f"[Index] ✓ {n:,} chunks indexed → {save_path}")
+        return IndexResult(self._faiss_store, n)
 
     def index_from_parquet(
         self,
         parquet_path: Path,
-        output_dir: Path,
         *,
-        text_field: str | None = None,
-        html_field: str | None = None,
+        text_field: str = "text",
         metadata_fields: Sequence[str] | None = None,
-        collection_name: str = "rag",
-    ) -> tuple[FAISS | BM25Retriever | None, int]:
-        """Convenience: read entire Parquet into DataFrame, then index."""
-        raise NotImplementedError("index_from_parquet is not implemented; use index_from_parquet_batches for large datasets")
+        collection_name: str = "faiss_index",
+        output_dir: Path | None = None,
+        **kwargs: Any,
+    ) -> IndexResult:
+        """Build a FAISS index from a Parquet file (loads the whole file).
 
-    # ── Sparese Indexing  ──────────────────────────────────────────
+        For large files (> a few GB) use ``index_from_parquet_batches``.
 
-    def index_from_parquet_sparse(
-        self,
-        parquet_path: Path,
-        output_dir: Path,
-        *,
-        text_field: str | None = None,
-        html_field: str | None = None,
-        metadata_fields: Sequence[str] | None = None,
-        collection_name: str = "rag",
-    ) -> tuple[FAISS | BM25Retriever | None, int]:
-        """Build a sparse BM25 index from a Parquet file."""
-        raise NotImplementedError("Sparse BM25 indexing is not implemented; use index_from_parquet_batches with strategy='bm25'")
+        Args:
+            parquet_path: Path to the ``.parquet`` file.
+            text_field: Column containing document text.
+            metadata_fields: Extra columns to store as metadata.
+            collection_name: Output path / logical name.
+            output_dir: Optional parent directory for the index.
+            **kwargs: Ignored.
 
-    # ── Batched dense indexing from Parquet (producer → embed → insert) ────────
+        Returns:
+            ``IndexResult`` with the ``FAISS`` store and chunk count.
+
+        Raises:
+            FileNotFoundError: If ``parquet_path`` does not exist.
+        """
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
+        columns = [text_field] + list(metadata_fields or [])
+        df = pq.read_table(parquet_path, columns=columns).to_pandas()
+        return self.index_from_dataframe(
+            df,
+            text_field,
+            metadata_fields=metadata_fields,
+            collection_name=collection_name,
+            output_dir=output_dir,
+        )
 
     def index_from_parquet_batches(
         self,
@@ -641,45 +605,50 @@ class FaissRagService(RagService):
         *,
         text_field: str = "text",
         metadata_fields: Sequence[str] | None = None,
-        collection_name: str | None = None,
-        progress_bar: bool | None = None,
-        batch_size: int = 5000,
+        collection_name: str = "faiss_index",
+        batch_size: int = 5_000,
         skip_rows: int = 0,
         checkpoint: bool = True,
+        progress_bar: bool = True,
         memory_config: MemoryConfig | None = None,
-    ) -> tuple[FAISS, int]:
-        """Memory-efficient three-stage indexing pipeline.
+        **kwargs: Any,
+    ) -> IndexResult:
+        """Memory-efficient three-stage indexing pipeline from a Parquet file.
 
         Pipeline stages:
             Producer thread  →  Main thread (embed)  →  Insert thread
             read + chunk         GPU/API-bound            FAISS add
 
-        Memory optimizations:
-            - Streaming IVF training (samples vectors, doesn't load all at once)
-            - Configurable queue sizes (default: 2 items max)
-            - Aggressive garbage collection between batches
-            - SQLite docstore (documents on disk, not RAM)
-            - Optional on-disk inverted lists (ivfpq_disk strategy)
+        Memory optimisations:
+            - Streaming IVF training (samples, no full dataset in RAM).
+            - Configurable queue sizes (default: 2).
+            - Aggressive GC between batches.
+            - SQLite docstore (documents on disk).
+            - Optional on-disk inverted lists (``ivfpq_disk`` strategy).
 
         Args:
-            parquet_path: Path to the parquet file to index.
-            text_field: Column name for document text.
-            metadata_fields: Additional columns to store as metadata.
+            parquet_path: Path to the ``.parquet`` file.
+            text_field: Column containing document text.
+            metadata_fields: Extra columns to store as metadata.
             collection_name: Output directory name for the index.
-            progress_bar: Show progress bar.
-            batch_size: Rows per parquet batch. Smaller = less RAM.
+            batch_size: Parquet rows per batch.  Smaller = less RAM.
             skip_rows: Resume from this row offset.
-            checkpoint: Save after each batch (recommended for huge datasets).
+            checkpoint: Save the index after every batch.
+            progress_bar: Show tqdm progress bar.
             memory_config: Override service-level memory settings.
+            **kwargs: Ignored.
 
         Returns:
-            Tuple of (FAISS store, total chunks indexed).
+            ``IndexResult`` with the ``FAISS`` store and total chunks indexed.
+
+        Raises:
+            FileNotFoundError: If ``parquet_path`` does not exist.
+            ValueError: If embeddings are not configured.
         """
         if not parquet_path.exists():
             raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
-        if self._embeddings is None:
-            raise ValueError("Embeddings required for parquet batch indexing")
 
+        self._reset_training_state()
         mem_cfg = memory_config or self.memory_config
         total_chunks = 0
         rows_processed = 0
@@ -687,33 +656,25 @@ class FaissRagService(RagService):
 
         parquet_file = pq.ParquetFile(parquet_path)
         total_rows = parquet_file.metadata.num_rows
-        rows_to_index = total_rows - skip_rows
-
         columns = [text_field] + list(metadata_fields or [])
-        if skip_rows > 0:
-            logger.info(f"Skipping first {skip_rows:,} rows")
+        save_path = Path(collection_name)
 
         logger.info(
-            f"Indexing {rows_to_index:,} rows (of {total_rows:,} total) | "
-            f"batch={batch_size:,} | strategy={self.strategy} | "
-            f"queue_size={mem_cfg.queue_maxsize}"
+            f"Indexing {total_rows - skip_rows:,} rows "
+            f"(of {total_rows:,} total) | "
+            f"batch={batch_size:,} | strategy={self.strategy}"
         )
 
-        # ── Shared state ─────────────────────────────────────────────────
-        prepare_queue: queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
-        insert_queue: queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
-        exception_holder: list[Exception] = []
+        # ── Shared state ──────────────────────────────────────────────────
+        prepare_q: queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
+        insert_q:  queue.Queue = queue.Queue(maxsize=mem_cfg.queue_maxsize)
+        errors: list[Exception] = []
         cancel = threading.Event()
         store_lock = threading.Lock()
+        training_done = threading.Event()
+        pending_index: list[faiss.Index] = []   # holds index before training finishes
 
-        # Training state for streaming training
-        training_complete = threading.Event()
-        raw_index_holder: list[faiss.Index] = []
-
-        # Checkpoint state
-        save_path = Path(collection_name) if collection_name else None
-
-        def _safe_put(q: queue.Queue, item):
+        def _safe_put(q: queue.Queue, item: Any) -> bool:
             while not cancel.is_set():
                 try:
                     q.put(item, timeout=2)
@@ -722,7 +683,7 @@ class FaissRagService(RagService):
                     continue
             return False
 
-        def _safe_get(q: queue.Queue):
+        def _safe_get(q: queue.Queue) -> tuple[Any, bool]:
             while not cancel.is_set():
                 try:
                     return q.get(timeout=2), True
@@ -730,51 +691,43 @@ class FaissRagService(RagService):
                     continue
             return None, False
 
-        # ── Stage 1 – Producer: read → chunk ─────────────────────────────
-        def producer():
+        # ── Stage 1: Producer ─────────────────────────────────────────────
+        def producer() -> None:
             try:
                 rows_seen = 0
-                for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+                for batch in parquet_file.iter_batches(
+                    batch_size=batch_size, columns=columns
+                ):
                     if cancel.is_set():
                         break
                     batch_len = batch.num_rows
-
                     if rows_seen + batch_len <= skip_rows:
                         rows_seen += batch_len
-                        logger.debug(f"[Prepare] Skipped batch ({rows_seen:,}/{skip_rows:,})")
                         continue
-
                     df = batch.to_pandas()
                     if rows_seen < skip_rows:
-                        drop = skip_rows - rows_seen
-                        df = df.iloc[drop:]
-                        logger.info(f"[Prepare] Partial skip: dropped first {drop:,} rows of batch")
+                        df = df.iloc[skip_rows - rows_seen:]
                     rows_seen += batch_len
 
-                    n_rows = len(df)
-                    logger.info(f"[Prepare] {n_rows:,} rows from parquet")
-
-                    documents = documents_from_dataframe(df, text_field, metadata_fields)
-                    chunks = self._prepare_documents(documents, log_details=False)
-                    logger.info(f"[Prepare] {len(chunks):,} chunks (from {n_rows:,} rows)")
-                    del documents, df
-
-                    if not _safe_put(prepare_queue, (chunks, n_rows)):
+                    docs = documents_from_dataframe(df, text_field, metadata_fields)
+                    chunks = self._prepare_documents(docs)
+                    del docs, df
+                    if not _safe_put(prepare_q, (chunks, batch_len)):
                         break
                     del chunks
                     gc.collect()
             except Exception as e:
-                exception_holder.append(e)
+                errors.append(e)
                 cancel.set()
             finally:
-                _safe_put(prepare_queue, None)
+                _safe_put(prepare_q, None)
 
-        # ── Stage 3 – Insert thread: add to FAISS ────────────────────────
-        def inserter():
+        # ── Stage 3: Inserter ─────────────────────────────────────────────
+        def inserter() -> None:
             nonlocal total_chunks, rows_processed, batches_since_gc
             try:
                 while True:
-                    item, ok = _safe_get(insert_queue)
+                    item, ok = _safe_get(insert_q)
                     if not ok or item is None:
                         break
 
@@ -782,73 +735,61 @@ class FaissRagService(RagService):
                     n = len(texts)
                     logger.info(f"[Insert] {n:,} docs → FAISS")
 
-                    text_embedding_pairs = list(zip(texts, embeddings))
-
                     with store_lock:
                         if self._faiss_store is None:
-                            # First batch — create index + docstore
                             dim = len(embeddings[0])
-                            raw_index = self._build_faiss_index(dim)
+                            raw_index = self._build_raw_index(dim)
 
-                            # For IVF indexes: use streaming training
                             if not raw_index.is_trained:
-                                have_enough = self._accumulate_training_vectors(embeddings)
-                                if have_enough or self.strategy == "vector":
+                                has_enough = self._accumulate_training_vectors(embeddings)
+                                if has_enough:
                                     self._finalize_training(raw_index)
-                                    training_complete.set()
-
-                                    # Set up on-disk IVF if requested
-                                    if self.strategy == "ivfpq_disk" and save_path:
+                                    training_done.set()
+                                    if self.strategy == "ivfpq_disk":
                                         raw_index = self._setup_ondisk_ivf(raw_index, save_path)
                                 else:
-                                    # Store index for later training
-                                    raw_index_holder.append(raw_index)
+                                    pending_index.append(raw_index)
                                     logger.info(
-                                        f"[Insert] Accumulating training vectors... "
+                                        f"[Insert] Accumulating training vectors… "
                                         f"({self._training_vectors_count:,} so far)"
                                     )
-                                    # Skip adding this batch, it will be re-embedded or lost
-                                    # This is a tradeoff for memory efficiency
-                                    continue
+                                    continue  # skip — not trained yet
+                            else:
+                                training_done.set()
 
-                            db_dir = Path(save_path) / "faiss" if save_path else Path("faiss_index") / "faiss"
+                            db_dir = save_path / "faiss"
                             db_dir.mkdir(parents=True, exist_ok=True)
                             self._faiss_store = FAISS(
                                 embedding_function=self._embeddings,
                                 index=raw_index,
-                                docstore=SqliteDocstore(db_path=db_dir / "docstore.sqlite"),
+                                docstore=SqliteDocstore(db_dir / "docstore.sqlite"),
                                 index_to_docstore_id={},
                                 normalize_L2=self._normalize_l2,
                             )
 
                         # Handle deferred training completion
-                        if raw_index_holder and not training_complete.is_set():
-                            have_enough = self._accumulate_training_vectors(embeddings)
-                            if have_enough:
-                                self._finalize_training(raw_index_holder[0])
-                                training_complete.set()
-
-                                if self.strategy == "ivfpq_disk" and save_path:
-                                    raw_index_holder[0] = self._setup_ondisk_ivf(
-                                        raw_index_holder[0], save_path
-                                    )
-
-                                # Create the store with trained index
-                                db_dir = Path(save_path) / "faiss" if save_path else Path("faiss_index") / "faiss"
-                                db_dir.mkdir(parents=True, exist_ok=True)
-                                self._faiss_store = FAISS(
-                                    embedding_function=self._embeddings,
-                                    index=raw_index_holder[0],
-                                    docstore=SqliteDocstore(db_path=db_dir / "docstore.sqlite"),
-                                    index_to_docstore_id={},
-                                    normalize_L2=self._normalize_l2,
+                        elif pending_index and not training_done.is_set():
+                            has_enough = self._accumulate_training_vectors(embeddings)
+                            if not has_enough:
+                                continue  # still collecting
+                            self._finalize_training(pending_index[0])
+                            training_done.set()
+                            if self.strategy == "ivfpq_disk":
+                                pending_index[0] = self._setup_ondisk_ivf(
+                                    pending_index[0], save_path
                                 )
-                            else:
-                                # Still collecting training vectors
-                                continue
+                            db_dir = save_path / "faiss"
+                            db_dir.mkdir(parents=True, exist_ok=True)
+                            self._faiss_store = FAISS(
+                                embedding_function=self._embeddings,
+                                index=pending_index[0],
+                                docstore=SqliteDocstore(db_dir / "docstore.sqlite"),
+                                index_to_docstore_id={},
+                                normalize_L2=self._normalize_l2,
+                            )
 
                         self._faiss_store.add_embeddings(
-                            text_embeddings=text_embedding_pairs,
+                            text_embeddings=list(zip(texts, embeddings)),
                             metadatas=metadatas,
                         )
 
@@ -856,37 +797,29 @@ class FaissRagService(RagService):
                     rows_processed += batch_rows
                     batches_since_gc += 1
                     pbar.update(batch_rows)
-                    logger.info(
-                        f"[Insert] ✓ +{n:,} chunks / {batch_rows:,} rows "
-                        f"(cumulative: {total_chunks:,} chunks, {rows_processed:,} rows)"
-                    )
 
-                    # ── Checkpoint save after every batch ────────────────
-                    if checkpoint and save_path:
+                    if checkpoint:
                         try:
-                            logger.info(f"[Checkpoint] Saving index at {rows_processed:,} rows...")
                             self.save_index(save_path)
                             logger.info(
-                                f"[Checkpoint] Saved at {rows_processed:,} rows "
-                                f"({total_chunks:,} chunks) → {save_path}"
+                                f"[Checkpoint] {rows_processed:,} rows / "
+                                f"{total_chunks:,} chunks → {save_path}"
                             )
                         except Exception as ckpt_err:
                             logger.warning(f"[Checkpoint] Save failed: {ckpt_err}")
 
-                    # ── Aggressive GC for memory efficiency ──────────────
-                    del texts, embeddings, metadatas, text_embedding_pairs
+                    del texts, embeddings, metadatas
                     if batches_since_gc >= mem_cfg.gc_every_n_batches:
                         gc.collect()
                         batches_since_gc = 0
 
             except Exception as e:
-                exception_holder.append(e)
+                errors.append(e)
                 cancel.set()
 
-        # ── Start threads ────────────────────────────────────────────────
-        producer_thread = threading.Thread(target=producer, name="Prepare")
-        insert_thread = threading.Thread(target=inserter, name="Insert")
-
+        # ── Start threads ─────────────────────────────────────────────────
+        prod_t   = threading.Thread(target=producer,  name="FAISSProd",   daemon=True)
+        insert_t = threading.Thread(target=inserter,  name="FAISSInsert", daemon=True)
         pbar = tqdm(
             total=total_rows,
             initial=skip_rows,
@@ -895,255 +828,432 @@ class FaissRagService(RagService):
             disable=not progress_bar,
         )
 
-        producer_thread.start()
-        insert_thread.start()
+        prod_t.start()
+        insert_t.start()
 
-        # ── Stage 2 – Main thread: embed ─────────────────────────────────
+        # ── Stage 2: Embedder (main thread) ───────────────────────────────
         try:
             while True:
-                item, ok = _safe_get(prepare_queue)
+                item, ok = _safe_get(prepare_q)
                 if not ok or item is None:
                     break
-
-                chunk_batch, chunk_batch_rows = item
-                texts = [doc.page_content for doc in chunk_batch]
-                metadatas = [doc.metadata for doc in chunk_batch]
-
-                del chunk_batch
-
-                logger.info(f"[Embed] {len(texts):,} chunks...")
+                chunks, batch_rows = item
+                texts     = [d.page_content for d in chunks]
+                metadatas = [d.metadata     for d in chunks]
+                del chunks
                 embeddings = self._embeddings.embed_documents(texts)
-
-                if not _safe_put(insert_queue, (texts, embeddings, metadatas, chunk_batch_rows)):
+                if not _safe_put(insert_q, (texts, embeddings, metadatas, batch_rows)):
                     break
                 del texts, embeddings, metadatas
                 gc.collect()
         except Exception as e:
-            exception_holder.append(e)
+            errors.append(e)
             cancel.set()
         finally:
-            _safe_put(insert_queue, None)
+            _safe_put(insert_q, None)
 
-        # ── Wait for completion ──────────────────────────────────────────
-        producer_thread.join()
-        insert_thread.join()
+        prod_t.join()
+        insert_t.join()
         pbar.close()
 
-        # Save whatever we have even if there was an error
-        if save_path is not None and self._faiss_store is not None:
+        # Final save
+        if self._faiss_store is not None:
             try:
                 self.save_index(save_path)
-                logger.info(f"[Save] Final save at {rows_processed:,} rows → {save_path}")
+                logger.info(f"[Save] Final save → {save_path}")
             except Exception as save_err:
                 logger.error(f"[Save] Final save failed: {save_err}")
+        self._current_index_path = save_path
 
-        if exception_holder:
-            raise exception_holder[0]
+        if errors:
+            raise errors[0]
 
-        logger.info(f"\n=== Indexing Complete ===")
-        logger.info(f"Total chunks indexed: {total_chunks:,} (from {total_rows:,} rows)")
-        return self._faiss_store, total_chunks
+        logger.info(
+            f"=== Indexing complete — "
+            f"{total_chunks:,} chunks from {total_rows:,} rows ==="
+        )
+        return IndexResult(self._faiss_store, total_chunks)
 
-    # ── Add documents to existing index ──────────────────────────────────
+    # ── Index lifecycle ───────────────────────────────────────────────────
 
-    def add_documents(
-        self, index: FAISS | None, documents: Sequence[Document]
+    def load_index(
+        self,
+        path_or_name: str | Path,
+        *,
+        use_mmap: bool | None = None,
+        **kwargs: Any,
     ) -> FAISS:
-        """Add documents to an existing FAISS index."""
-        store = index or self._faiss_store
-        if store is None:
-            raise ValueError("No FAISS index loaded")
-        store.add_documents(list(documents))
-        self._faiss_store = store
-        return store
+        """Load a FAISS index from *path_or_name*.
 
-    # ── Delete index ─────────────────────────────────────────────────────
+        Expects a directory with the layout::
 
-    def delete_index(self, index: FAISS | None = None) -> None:
-        """Drop in-memory index (and delete persisted files if saved)."""
-        if self._current_index_path and self._current_index_path.exists():
-            shutil.rmtree(self._current_index_path)
-            logger.info(f"Deleted saved index at {self._current_index_path}")
+            <path>/faiss/index.faiss
+            <path>/faiss/docstore.sqlite
 
+        Args:
+            path_or_name: Root directory of the saved index.
+            use_mmap: If ``True``, memory-map the index file.  Defaults to
+                ``self.memory_config.use_mmap``.
+            **kwargs: Ignored.
+
+        Returns:
+            The loaded ``FAISS`` store.
+
+        Raises:
+            FileNotFoundError: If the index directory or files are missing.
+            ValueError: If the id_map in the docstore is empty.
+        """
+        path = Path(path_or_name)
+        faiss_dir = path / "faiss"
+        faiss_file = faiss_dir / "index.faiss"
+        db_file    = faiss_dir / "docstore.sqlite"
+
+        if not faiss_dir.exists():
+            raise FileNotFoundError(f"FAISS index directory not found: {faiss_dir}")
+        if not faiss_file.exists():
+            raise FileNotFoundError(f"index.faiss missing in {faiss_dir}")
+
+        mmap = use_mmap if use_mmap is not None else self.memory_config.use_mmap
+        if mmap:
+            logger.info("Loading FAISS index with memory-mapping…")
+            raw = faiss.read_index(str(faiss_file), faiss.IO_FLAG_MMAP)
+            self._is_mmap_loaded = True
+        else:
+            logger.info("Loading FAISS index into RAM…")
+            raw = faiss.read_index(str(faiss_file))
+            self._is_mmap_loaded = False
+
+        if hasattr(raw, "nprobe"):
+            raw.nprobe = self.ivfpq_nprobe
+        if hasattr(raw, "hnsw"):
+            raw.hnsw.efSearch = self.hnsw_ef_search
+
+        logger.info(f"✓ {raw.ntotal:,} vectors ({'mmap' if mmap else 'RAM'})")
+
+        docstore = SqliteDocstore(db_file)
+        id_map = docstore.load_id_map()
+        if not id_map:
+            raise ValueError(f"id_map is empty in {db_file} — index may be corrupt")
+
+        self._faiss_store = FAISS(
+            embedding_function=self._embeddings,
+            index=raw,
+            docstore=docstore,
+            index_to_docstore_id=id_map,
+            normalize_L2=self._normalize_l2,
+        )
+        self._current_index_path = path
+        return self._faiss_store
+
+    def save_index(self, path: str | Path, **kwargs: Any) -> None:
+        """Persist the current FAISS index to *path*.
+
+        Writes two files under ``<path>/faiss/``::
+
+            index.faiss      – raw FAISS binary
+            docstore.sqlite  – text, metadata, and id_map
+
+        The FAISS file is written atomically via a tmp-rename.
+
+        Args:
+            path: Destination root directory.
+            **kwargs: Ignored.
+
+        Raises:
+            ValueError: If no index is currently loaded.
+        """
+        if self._faiss_store is None:
+            raise ValueError("No FAISS index to save.")
+
+        faiss_dir = Path(path) / "faiss"
+        faiss_dir.mkdir(parents=True, exist_ok=True)
+
+        tmp = faiss_dir / "index.faiss.tmp"
+        faiss.write_index(self._faiss_store.index, str(tmp))
+        tmp.rename(faiss_dir / "index.faiss")
+
+        self._faiss_store.docstore.save_id_map(
+            self._faiss_store.index_to_docstore_id
+        )
+        n = len(self._faiss_store.index_to_docstore_id)
+        logger.info(f"FAISS index saved → {faiss_dir} ({n:,} vectors)")
+
+    def delete_index(self, *, delete_files: bool = False, **kwargs: Any) -> None:
+        """Drop the current index from memory and optionally from disk.
+
+        Args:
+            delete_files: If ``True`` and the index was loaded from / saved
+                to disk, delete the entire ``<path>/faiss/`` directory.
+            **kwargs: Ignored.
+        """
+        if delete_files and self._current_index_path:
+            faiss_dir = self._current_index_path / "faiss"
+            if faiss_dir.exists():
+                shutil.rmtree(faiss_dir)
+                logger.info(f"Deleted FAISS index files at {faiss_dir}")
         self._faiss_store = None
-        self._bm25_retriever = None
         self._current_index_path = None
-        logger.info("In-memory index cleared")
+        self._is_mmap_loaded = False
+        logger.info("FAISS index cleared from memory")
 
-    # ── Strategy context manager ─────────────────────────────────────────
+    # ── Retrieval ─────────────────────────────────────────────────────────
 
-    @contextmanager
-    def _strategy_context(self, strategy: str | None):
-        """Temporarily switch retrieval strategy."""
-        if strategy is None or strategy == self.strategy:
-            yield self.strategy
-            return
+    def _require_store(self) -> FAISS:
+        """Return the current FAISS store or raise if not loaded.
 
-        original = self.strategy
-        try:
-            self.strategy = strategy
-            yield strategy
-        finally:
-            self.strategy = original
+        Returns:
+            The active ``FAISS`` store.
 
-    # ── Retrieval ────────────────────────────────────────────────────────
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        if self._faiss_store is None:
+            raise ValueError(
+                "No FAISS index loaded. "
+                "Call load_index() or index_from_parquet_batches() first."
+            )
+        return self._faiss_store
 
     def retrieve_documents(
         self,
-        text: str,
+        query: str,
+        *,
         top_k: int = 5,
-        strategy: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> list[Document]:
-        """Retrieve documents using the configured (or overridden) strategy."""
-        results = self.retrieve_documents_with_scores(
-            text, top_k=top_k, strategy=strategy, **kwargs
-        )
-        return [doc for doc, _score in results]
+        """Return the top-k documents most relevant to *query*.
+
+        Args:
+            query: Free-text query string.
+            top_k: Number of documents to return.
+            **kwargs: Ignored.
+
+        Returns:
+            Ranked list of ``Document`` objects.
+
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        return [doc for doc, _ in self.retrieve_documents_with_scores(query, top_k=top_k)]
 
     def retrieve_documents_with_scores(
         self,
-        text: str,
+        query: str,
+        *,
         top_k: int = 5,
-        strategy: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        """Retrieve documents with relevance scores."""
-        with self._strategy_context(strategy) as strat:
-            if strat == "bm25":
-                return self._retrieve_bm25(text, top_k)
-            else:
-                return self._retrieve_vector(text, top_k)
+        """Return the top-k documents with cosine similarity scores.
 
-    def _retrieve_vector(self, text: str, top_k: int) -> list[tuple[Document, float]]:
-        if self._faiss_store is None:
-            raise ValueError("No FAISS index loaded. Use load_index() or index first.")
-        query = self._prepare_query(text)
-        return self._faiss_store.similarity_search_with_score(query, k=top_k)
+        Args:
+            query: Free-text query string.
+            top_k: Number of results to return.
+            **kwargs: Ignored.
 
-    def _retrieve_bm25(self, text: str, top_k: int) -> list[tuple[Document, float]]:
-        if self._bm25_retriever is None:
-            raise ValueError(
-                "No BM25 retriever loaded. "
-                "Call load_index() — it will build one from the FAISS docstore automatically."
-            )
-        self._bm25_retriever.k = top_k
-        docs = self._bm25_retriever.invoke(text)
-        # BM25Retriever doesn't expose raw scores — assign rank-based scores
-        return [(doc, 1.0 / (i + 1)) for i, doc in enumerate(docs)]
+        Returns:
+            List of ``(Document, score)`` tuples, best-first.
 
-    # ── Batch retrieval ──────────────────────────────────────────────────
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        store = self._require_store()
+        prepared = self._prepare_query(query)
+
+        # Over-fetch so we still return top_k real docs even if some FAISS
+        # positions land on training-only vectors (e.g. IVF train_ slots)
+        # that have no entry in index_to_docstore_id or in the docstore.
+        fetch_k = top_k * 2 + 256
+        embedding = store.embedding_function.embed_query(prepared)
+        vec = np.array([embedding], dtype=np.float32)
+        if store._normalize_L2:
+            faiss.normalize_L2(vec)
+        scores, indices = store.index.search(vec, fetch_k)
+
+        results: list[tuple[Document, float]] = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            uid = store.index_to_docstore_id.get(int(idx))
+            if uid is None:
+                continue
+            doc = store.docstore.search(uid)
+            if not isinstance(doc, Document):
+                # uid exists in id_map but not in docs table (e.g. train_ vectors)
+                continue
+            results.append((doc, float(score)))
+            if len(results) >= top_k:
+                break
+
+        return results
 
     def batch_retrieve(
         self,
-        questions: list[str],
+        queries: list[str],
         *,
         top_k: int = 5,
-        strategy: str | None = None,
         progress_bar: bool = True,
-        **kwargs,
+        **kwargs: Any,
+    ) -> list[list[Document]]:
+        """Retrieve documents for multiple queries.
+
+        Args:
+            queries: List of query strings.
+            top_k: Results per query.
+            progress_bar: Show tqdm progress bar.
+            **kwargs: Ignored.
+
+        Returns:
+            One list of Documents per query.
+
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        self._require_store()
+        return [
+            self.retrieve_documents(q, top_k=top_k)
+            for q in tqdm(
+                queries, desc=f"Retrieving ({self.strategy})", disable=not progress_bar
+            )
+        ]
+
+    def batch_retrieve_with_scores(
+        self,
+        queries: list[str],
+        *,
+        top_k: int = 5,
+        progress_bar: bool = True,
+        **kwargs: Any,
     ) -> list[list[tuple[Document, float]]]:
-        """Retrieve for multiple queries, optionally switching strategy."""
-        results = []
-        for q in tqdm(questions, desc=f"Retrieving ({strategy or self.strategy})", disable=not progress_bar):
-            results.append(self.retrieve_documents_with_scores(q, top_k=top_k, strategy=strategy, **kwargs))
-        return results
+        """Retrieve scored documents for multiple queries.
 
-    # ── Convenience accessors ────────────────────────────────────────────
+        Args:
+            queries: List of query strings.
+            top_k: Results per query.
+            progress_bar: Show tqdm progress bar.
+            **kwargs: Ignored.
 
-    def get_store(self) -> FAISS:
-        """Return the underlying FAISS vector store."""
-        if self._faiss_store is None:
-            raise ValueError("No FAISS index loaded. Use load_index() first.")
-        return self._faiss_store
-    
-    def get_indexed_doc_count(self) -> int:
-        """Return the number of documents currently indexed in FAISS."""
+        Returns:
+            One list of ``(Document, score)`` tuples per query.
+
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        self._require_store()
+        return [
+            self.retrieve_documents_with_scores(q, top_k=top_k)
+            for q in tqdm(
+                queries, desc=f"Retrieving ({self.strategy})", disable=not progress_bar
+            )
+        ]
+
+    # ── Inspection ────────────────────────────────────────────────────────
+
+    def get_doc_count(self) -> int:
+        """Return the number of vectors currently indexed.
+
+        Returns:
+            Vector count, or 0 if no index is loaded.
+        """
         if self._faiss_store is None:
             return 0
         return len(self._faiss_store.index_to_docstore_id)
 
-    def retrieve_all_documents(
+    def get_all_documents(
         self,
-        batch_size: int = 1000,
+        *,
+        batch_size: int = 1_000,
         progress_bar: bool = True,
     ) -> list[Document]:
-        """Retrieve every document from the FAISS docstore.
+        """Return every document from the SQLite docstore.
 
-        FAISS stores all documents in its ``InMemoryDocstore``, so this
-        is O(n) in-memory and does not need scrolling.
+        Iterates the ``index_to_docstore_id`` map and fetches each
+        document from ``SqliteDocstore`` in batches.
+
+        Args:
+            batch_size: Number of docstore IDs to fetch per SQLite query.
+            progress_bar: Show tqdm progress bar.
+
+        Returns:
+            List of all stored ``Document`` objects.
+
+        Raises:
+            ValueError: If no index is loaded.
         """
-        raise NotImplementedError("retrieve_all_documents is not implemented yet; access the FAISS docstore directly for now")
+        store = self._require_store()
+        id_map = store.index_to_docstore_id
+        docstore: SqliteDocstore = store.docstore
+        all_uids = list(id_map.values())
+        results: list[Document] = []
 
-    def retrieve_all_documents_sparse(
-        self,
-        batch_size: int = 1000,
-        progress_bar: bool = True,
-    ) -> list[Document]:
-        """Retrieve every document from the BM25 retriever."""
-        
-        tbar = tqdm(total=len(self._bm25_retriever._docstore._dict), desc="Retrieving all BM25 documents", disable=not progress_bar)
-        results = []
-
-        for batch in self._bm25_retriever._docstore._dict.values():
-            for doc in batch:
-                results.append(doc)
-            tbar.update(len(batch))
+        for start in tqdm(
+            range(0, len(all_uids), batch_size),
+            desc="Fetching documents",
+            unit="batch",
+            disable=not progress_bar,
+        ):
+            uid_batch = all_uids[start : start + batch_size]
+            for uid in uid_batch:
+                doc = docstore.search(uid)
+                if doc is not None and not isinstance(doc, str):
+                    results.append(doc)
 
         return results
 
-    # ── Memory estimation helpers ────────────────────────────────────────
+    def get_index_stats(self) -> dict[str, Any]:
+        """Return statistics about the current FAISS index.
+
+        Returns:
+            Dict with keys: ``loaded``, ``is_mmap``, ``n_vectors``,
+            ``strategy``, and optionally ``nlist``, ``nprobe``,
+            ``hnsw_m``, ``hnsw_ef_search``.
+        """
+        if self._faiss_store is None:
+            return {"loaded": False}
+
+        raw = self._faiss_store.index
+        stats: dict[str, Any] = {
+            "loaded":    True,
+            "is_mmap":   self._is_mmap_loaded,
+            "n_vectors": raw.ntotal,
+            "strategy":  self.strategy,
+        }
+        if hasattr(raw, "nlist"):
+            stats["nlist"]  = raw.nlist
+            stats["nprobe"] = raw.nprobe
+        if hasattr(raw, "hnsw"):
+            stats["hnsw_m"]         = self.hnsw_m
+            stats["hnsw_ef_search"] = raw.hnsw.efSearch
+        return stats
+
+    # ── Memory estimation helpers ─────────────────────────────────────────
 
     def estimate_index_memory(
-        self,
-        n_vectors: int,
-        dim: int = 1536,
+        self, n_vectors: int, *, dim: int = 1_024
     ) -> dict[str, float]:
-        """Estimate RAM usage for different index strategies.
+        """Estimate RAM usage (MB) for each index strategy.
 
         Args:
             n_vectors: Number of vectors to index.
-            dim: Embedding dimension (default: 1536 for OpenAI).
+            dim: Embedding dimension.
 
         Returns:
             Dict mapping strategy name to estimated RAM in MB.
         """
-        bytes_per_float = 4
-
-        estimates = {}
-
-        # Flat index: full vectors in RAM
-        flat_bytes = n_vectors * dim * bytes_per_float
-        estimates["vector"] = flat_bytes / (1024 * 1024)
-
-        # HNSW: vectors + graph (~2x flat)
-        hnsw_bytes = flat_bytes * 2.2
-        estimates["hnsw"] = hnsw_bytes / (1024 * 1024)
-
-        # IVF_PQ: compressed codes + centroids
-        # Each vector compressed to ivfpq_m bytes (with nbits=8)
-        pq_bytes_per_vec = self.ivfpq_m
-        centroids_bytes = self.ivfpq_nlist * dim * bytes_per_float
-        ivfpq_bytes = (n_vectors * pq_bytes_per_vec) + centroids_bytes
-        estimates["ivfpq"] = ivfpq_bytes / (1024 * 1024)
-
-        # OPQ + IVF_PQ: same as IVF_PQ + OPQ matrix
-        opq_matrix_bytes = dim * dim * bytes_per_float
-        estimates["opq_ivfpq"] = (ivfpq_bytes + opq_matrix_bytes) / (1024 * 1024)
-
-        # IVF_PQ with on-disk: only centroids + metadata in RAM
-        ivfpq_disk_bytes = centroids_bytes + (n_vectors * 8)  # 8 bytes per ID
-        estimates["ivfpq_disk"] = ivfpq_disk_bytes / (1024 * 1024)
-
-        return estimates
+        f32 = 4
+        flat_bytes = n_vectors * dim * f32
+        centroids  = self.ivfpq_nlist * dim * f32
+        return {
+            "vector":     flat_bytes / 1e6,
+            "hnsw":       flat_bytes * 2.2 / 1e6,
+            "ivfpq":      (n_vectors * self.ivfpq_m + centroids) / 1e6,
+            "opq_ivfpq":  (n_vectors * self.ivfpq_m + centroids + dim * dim * f32) / 1e6,
+            "ivfpq_disk": (centroids + n_vectors * 8) / 1e6,
+        }
 
     def recommend_strategy(
-        self,
-        n_vectors: int,
-        available_ram_mb: int,
-        dim: int = 1536,
+        self, n_vectors: int, available_ram_mb: int, *, dim: int = 1_024
     ) -> str:
-        """Recommend the best indexing strategy for your constraints.
+        """Recommend the best strategy within the RAM budget.
 
         Args:
             n_vectors: Number of vectors to index.
@@ -1153,43 +1263,9 @@ class FaissRagService(RagService):
         Returns:
             Recommended strategy name.
         """
-        estimates = self.estimate_index_memory(n_vectors, dim)
-
-        # Add safety margin (80% of available RAM)
         budget = available_ram_mb * 0.8
-
-        # Prefer accuracy when possible
-        if estimates["vector"] < budget:
-            return "vector"
-        if estimates["hnsw"] < budget:
-            return "hnsw"
-        if estimates["ivfpq"] < budget:
-            return "ivfpq"
-        if estimates["opq_ivfpq"] < budget:
-            return "opq_ivfpq"
+        estimates = self.estimate_index_memory(n_vectors, dim=dim)
+        for strategy in ("vector", "hnsw", "ivfpq", "opq_ivfpq", "ivfpq_disk"):
+            if estimates.get(strategy, float("inf")) < budget:
+                return strategy
         return "ivfpq_disk"
-
-    def get_index_stats(self) -> dict:
-        """Return statistics about the current index."""
-        if self._faiss_store is None:
-            return {"loaded": False}
-
-        index = self._faiss_store.index
-        stats = {
-            "loaded": True,
-            "is_mmap": self._is_mmap_loaded,
-            "n_vectors": index.ntotal,
-            "strategy": self.strategy,
-        }
-
-        # IVF-specific stats
-        if hasattr(index, 'nlist'):
-            stats["nlist"] = index.nlist
-            stats["nprobe"] = index.nprobe
-
-        # HNSW-specific stats
-        if hasattr(index, 'hnsw'):
-            stats["hnsw_m"] = self.hnsw_m
-            stats["hnsw_ef_search"] = index.hnsw.efSearch
-
-        return stats

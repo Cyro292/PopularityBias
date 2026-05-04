@@ -57,11 +57,11 @@ from langchain.schema import Document
 from tqdm import tqdm
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import DATA_DIR
 from src.rag.faiss_rag_service import FaissRagService, MemoryConfig
-from src.rag.SqliteDocstore import SqliteDocstore
+from src.storage.sqlite_docstore import SqliteDocstore
 from src.rag.utils import IndexingConfig
 
 # Configure logging
@@ -147,10 +147,19 @@ def get_index_doc_count(client: Elasticsearch, index: str) -> int:
 def stream_es_documents(
     client: Elasticsearch,
     config: MigrationConfig,
+    *,
+    resume_search_after: list | None = None,
 ) -> Generator[dict, None, None]:
     """Stream all documents from ES using PIT + search_after.
 
     Yields dicts with keys: _id, text, metadata, vector (if present).
+
+    Args:
+        client: Elasticsearch client.
+        config: Migration configuration.
+        resume_search_after: If provided, skip directly to this PIT cursor
+            position instead of scanning from the beginning. Obtained from
+            a previous run's checkpoint via ``migration_state["search_after"]``.
     """
     seen_hashes: set[str] = set() if config.deduplicate else None
     skipped = 0
@@ -164,7 +173,11 @@ def stream_es_documents(
     pit_id = pit_resp["id"]
     logger.info(f"Opened PIT: {pit_id[:40]}...")
 
-    search_after: list | None = None
+    # Jump directly to the stored cursor position if resuming
+    search_after: list | None = resume_search_after
+    if search_after:
+        logger.info(f"Resuming from search_after cursor: {search_after}")
+
     page = 0
 
     try:
@@ -199,11 +212,6 @@ def stream_es_documents(
 
                 source = doc["_source"]
 
-                # Skip documents if resuming
-                total_seen = (page - 1) * config.page_size + hits.index(doc)
-                if total_seen < config.skip_docs:
-                    continue
-
                 # Deduplication
                 if seen_hashes is not None:
                     raw_text = source.get("text", "")
@@ -218,8 +226,6 @@ def stream_es_documents(
                     seen_hashes.add(dedup_key)
 
                 # Prefer vector from _source; fall back to fields response
-                # (dense_vector may not be in _source depending on ES version
-                # and index settings, but is always available via fields).
                 vector = source.get("vector")
                 if vector is None:
                     fields = doc.get("fields", {})
@@ -231,6 +237,7 @@ def stream_es_documents(
                     "text": source.get("text", ""),
                     "metadata": source.get("metadata", {}),
                     "vector": vector,
+                    "_sort": doc["sort"],   # expose cursor for checkpointing
                 }
 
             search_after = hits[-1]["sort"]
@@ -315,6 +322,124 @@ def create_faiss_service(config: MigrationConfig) -> FaissRagService:
     )
 
 
+def resolve_resume_cursor(
+    faiss_dir: Path,
+    es_client: Elasticsearch,
+    es_index: str,
+) -> tuple[int, list | None]:
+    """Derive the true resume position from on-disk data — never trusts the state file.
+
+    Algorithm:
+    1. Read ``faiss_index.ntotal`` from ``index.faiss`` — this is the authoritative
+       count of vectors on disk.
+    2. Find the id_map entry at position ``ntotal - 1`` in SQLite to get the UID of
+       the last vector that was flushed to disk.
+    3. Trim any SQLite rows that are *ahead* of the FAISS checkpoint (written to
+       SQLite after the last ``faiss.write_index`` call but before the crash).
+    4. Look up the ``wikipedia_id`` from the last doc, query ES for its
+       ``_shard_doc`` sort value, and return that as the PIT ``search_after`` cursor.
+
+    Returns:
+        ``(total_indexed, search_after)`` where ``total_indexed`` is
+        ``faiss_index.ntotal`` and ``search_after`` is the ES PIT cursor list.
+    """
+    import faiss
+    import sqlite3 as _sqlite3
+
+    index_path = faiss_dir / "index.faiss"
+    db_path = faiss_dir / "docstore.sqlite"
+
+    if not index_path.exists() or not db_path.exists():
+        logger.info("No existing checkpoint found — starting fresh")
+        return 0, None
+
+    # ── Step 1: how many vectors are actually on disk ─────────────────────
+    logger.info(f"Loading existing FAISS index to determine checkpoint position...")
+    idx = faiss.read_index(str(index_path))
+    ntotal = idx.ntotal
+    del idx  # free RAM — will be re-loaded in the main function
+    logger.info(f"FAISS on disk: {ntotal:,} vectors")
+
+    # ── Step 2: trim SQLite to match FAISS ────────────────────────────────
+    conn = _sqlite3.connect(str(db_path))
+    id_map_count = conn.execute("SELECT COUNT(*) FROM id_map").fetchone()[0]
+    doc_count = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    logger.info(f"SQLite before trim — id_map: {id_map_count:,}, docs: {doc_count:,}")
+
+    if id_map_count > ntotal:
+        excess = id_map_count - ntotal
+        logger.info(f"Trimming {excess:,} id_map rows ahead of FAISS checkpoint...")
+        conn.execute("DELETE FROM id_map WHERE pos >= ?", (ntotal,))
+        conn.commit()
+
+    # Trim docs table: any uid with numeric suffix >= ntotal that refers to a
+    # regular doc (not a training vector) may have been written after the last
+    # faiss.write_index call — remove them so docstore stays in sync.
+    # Training vector uids (train_*) are always within the FAISS snapshot.
+    conn.execute(
+        "DELETE FROM docs WHERE CAST(SUBSTR(uid, 5) AS INTEGER) >= ?",
+        (ntotal,)
+    )
+    conn.commit()
+
+    id_map_after = conn.execute("SELECT COUNT(*) FROM id_map").fetchone()[0]
+    doc_after = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    logger.info(f"SQLite after trim  — id_map: {id_map_after:,}, docs: {doc_after:,}")
+
+    # ── Step 3: find the last real doc's wikipedia_id ─────────────────────
+    # Walk backwards from ntotal-1 to find a non-training-vector entry
+    last_wikipedia_id: int | None = None
+    for offset in range(min(1000, ntotal)):
+        pos = ntotal - 1 - offset
+        row = conn.execute(
+            "SELECT uid FROM id_map WHERE pos = ?", (pos,)
+        ).fetchone()
+        if row is None:
+            continue
+        uid = row[0]
+        if not uid.startswith("doc_"):
+            continue  # skip train_* entries
+        doc_row = conn.execute(
+            "SELECT metadata FROM docs WHERE uid = ?", (uid,)
+        ).fetchone()
+        if doc_row is None:
+            continue
+        import json as _json
+        meta = _json.loads(doc_row[0])
+        last_wikipedia_id = meta.get("wikipedia_id")
+        if last_wikipedia_id is not None:
+            logger.info(f"Last doc uid={uid}, wikipedia_id={last_wikipedia_id}")
+            break
+
+    conn.close()
+
+    if last_wikipedia_id is None:
+        logger.warning("Could not find a last wikipedia_id — resuming without cursor (full re-stream)")
+        return ntotal, None
+
+    # ── Step 4: query ES for the _shard_doc sort value ────────────────────
+    resp = es_client.search(
+        index=es_index,
+        body={
+            "size": 1,
+            "query": {"term": {"metadata.wikipedia_id": last_wikipedia_id}},
+            "sort": [{"_shard_doc": "asc"}],
+            "_source": False,
+        },
+    )
+    hits = resp["hits"]["hits"]
+    if not hits:
+        logger.warning(
+            f"wikipedia_id {last_wikipedia_id} not found in ES — "
+            "resuming without cursor (full re-stream)"
+        )
+        return ntotal, None
+
+    search_after = hits[0]["sort"]
+    logger.info(f"ES resume cursor (search_after): {search_after}")
+    return ntotal, search_after
+
+
 def migrate_with_existing_vectors(
     config: MigrationConfig,
     es_client: Elasticsearch,
@@ -326,15 +451,9 @@ def migrate_with_existing_vectors(
     compatible with the FAISS index configuration.
     """
     import faiss
-    from src.rag.SqliteDocstore import SqliteDocstore
+    from src.storage.sqlite_docstore import SqliteDocstore
 
     logger.info("Migration mode: Using existing vectors from Elasticsearch")
-
-    # Load state for resuming
-    state = load_migration_state(config.output_dir) if config.resume else {}
-    skip_docs = state.get("docs_processed", 0)
-    if skip_docs > 0:
-        logger.info(f"Resuming from document {skip_docs:,}")
 
     # Setup output directory
     faiss_dir = config.output_dir / "faiss"
@@ -343,35 +462,47 @@ def migrate_with_existing_vectors(
     # Initialize or load docstore
     docstore = SqliteDocstore(faiss_dir / "docstore.sqlite")
 
+    # ── Resume: derive ground truth from on-disk data ─────────────────────
+    # Never trust migration_state.json — reconcile FAISS + SQLite directly.
+    faiss_index = None
+    total_indexed = 0
+    resume_search_after: list | None = None
+
+    if config.resume and (faiss_dir / "index.faiss").exists():
+        total_indexed, resume_search_after = resolve_resume_cursor(
+            faiss_dir, es_client, config.es_index
+        )
+        if total_indexed > 0:
+            logger.info(f"Loading existing FAISS index ({total_indexed:,} vectors)...")
+            faiss_index = faiss.read_index(str(faiss_dir / "index.faiss"))
+            logger.info("FAISS index loaded — resuming from checkpoint")
+    else:
+        logger.info("Starting fresh migration")
+
     # Accumulators for batch processing
     vectors_buffer: list[np.ndarray] = []
     texts_buffer: list[str] = []
     metadatas_buffer: list[dict] = []
-    id_map: dict[int, str] = {}
-
-    # FAISS index (created after we know dimension)
-    faiss_index: faiss.Index | None = None
-    dim: int | None = None
-    total_indexed = skip_docs
-    training_vectors: list[np.ndarray] = []
+    # id_map is written incrementally to SQLite — no in-memory dict needed
+    last_sort: list | None = None  # tracks ES PIT cursor for checkpoint resume
+    training_vectors: list[np.ndarray] = []  # only used before IVF_PQ is trained
 
     # Stream documents
-    config_copy = MigrationConfig(**vars(config))
-    config_copy.skip_docs = skip_docs
-
     pbar = tqdm(
         total=total_docs,
-        initial=skip_docs,
+        initial=total_indexed,
         desc="Migrating",
         unit="docs",
     )
 
     try:
-        for doc in stream_es_documents(es_client, config_copy):
+        for doc in stream_es_documents(es_client, config, resume_search_after=resume_search_after):
             vector = doc.get("vector")
             if vector is None:
                 logger.warning(f"Document {doc['_id']} has no vector, skipping")
                 continue
+
+            last_sort = doc.get("_sort")  # save cursor before processing
 
             # Convert to numpy
             vec = np.array(vector, dtype=np.float32)
@@ -419,9 +550,8 @@ def migrate_with_existing_vectors(
 
                     # Add training vectors to index
                     faiss_index.add(train_data)
-                    for i, v in enumerate(training_vectors):
-                        uid = f"train_{i}"
-                        id_map[len(id_map)] = uid
+                    id_map_batch = {i: f"train_{i}" for i in range(len(training_vectors))}
+                    docstore.append_id_map(id_map_batch)
 
                     del train_data, training_vectors
                     training_vectors = []
@@ -443,11 +573,13 @@ def migrate_with_existing_vectors(
 
                 # Add to docstore
                 docs_to_add = {}
+                id_map_batch = {}
                 for i, (text, meta) in enumerate(zip(texts_buffer, metadatas_buffer)):
                     uid = f"doc_{start_idx + i}"
-                    id_map[start_idx + i] = uid
+                    id_map_batch[start_idx + i] = uid
                     docs_to_add[uid] = Document(page_content=text, metadata=meta)
                 docstore.add(docs_to_add)
+                docstore.append_id_map(id_map_batch)
 
                 total_indexed += len(vectors_buffer)
                 pbar.update(len(vectors_buffer))
@@ -456,9 +588,10 @@ def migrate_with_existing_vectors(
                 if total_indexed % config.checkpoint_every == 0:
                     logger.info(f"Checkpoint at {total_indexed:,} docs")
                     faiss.write_index(faiss_index, str(faiss_dir / "index.faiss"))
-                    docstore.save_id_map(id_map)
+                    # id_map is already persisted incrementally — no full rewrite
                     save_migration_state(config.output_dir, {
                         "docs_processed": total_indexed,
+                        "search_after": last_sort,
                         "completed": False,
                     })
 
@@ -480,20 +613,21 @@ def migrate_with_existing_vectors(
                 logger.info(f"Training index on {len(train_data):,} vectors (final)...")
                 faiss_index.train(train_data)
                 faiss_index.add(train_data)
-                # Update id_map for all
-                for i in range(len(train_data)):
-                    id_map[i] = f"doc_{i}"
+                id_map_batch = {i: f"doc_{i}" for i in range(len(train_data))}
+                docstore.append_id_map(id_map_batch)
                 del train_data, all_train
             else:
                 start_idx = faiss_index.ntotal
                 faiss_index.add(batch_vectors)
 
                 docs_to_add = {}
+                id_map_batch = {}
                 for i, (text, meta) in enumerate(zip(texts_buffer, metadatas_buffer)):
                     uid = f"doc_{start_idx + i}"
-                    id_map[start_idx + i] = uid
+                    id_map_batch[start_idx + i] = uid
                     docs_to_add[uid] = Document(page_content=text, metadata=meta)
                 docstore.add(docs_to_add)
+                docstore.append_id_map(id_map_batch)
 
             total_indexed += len(vectors_buffer)
 
@@ -503,7 +637,7 @@ def migrate_with_existing_vectors(
     # Final save
     logger.info(f"Saving final index with {faiss_index.ntotal:,} vectors...")
     faiss.write_index(faiss_index, str(faiss_dir / "index.faiss"))
-    docstore.save_id_map(id_map)
+    docstore.flush()  # ensure any pending doc inserts are committed
     save_migration_state(config.output_dir, {
         "docs_processed": total_indexed,
         "completed": True,

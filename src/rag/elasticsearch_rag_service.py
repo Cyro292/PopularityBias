@@ -10,7 +10,7 @@ import queue
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import pandas as pd
 import pyarrow as pa
@@ -21,9 +21,8 @@ from langchain_elasticsearch.vectorstores import DenseVectorStrategy, DenseVecto
 
 from tqdm import tqdm
 
-from .base import RagService, IndexResult, VectorStore
-from .document_utils import documents_from_dataframe
-from .utils import IndexingConfig, build_embeddings, split_documents
+from .base import RagService, IndexResult, documents_from_dataframe, split_documents
+from .utils import IndexingConfig, build_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -226,10 +225,117 @@ class ElasticsearchRagService(RagService):
 
         return ElasticsearchStore(**kwargs)
     
-    def load_index(self, index_name: str) -> ElasticsearchStore:
+    def load_index(self, index_name: str, **kwargs: Any) -> ElasticsearchStore:
         """Load an existing index by name."""
         self._current_index_name = index_name
         return self._create_store(index_name)
+
+    def save_index(self, path: str | Path, **kwargs: Any) -> None:
+        """Not supported — Elasticsearch manages its index server-side.
+
+        Raises:
+            NotImplementedError: Always. Use Elasticsearch's own snapshot /
+                restore API to persist the index.
+        """
+        raise NotImplementedError(
+            "ElasticsearchRagService does not support save_index(). "
+            "The index is stored server-side. Use the Elasticsearch snapshot API."
+        )
+
+    def delete_index(self, **kwargs: Any) -> None:
+        """Delete the currently loaded index from Elasticsearch.
+
+        Args:
+            **kwargs: Unused.
+
+        Raises:
+            ValueError: If no index is currently loaded.
+        """
+        if not self._current_index_name:
+            raise ValueError("No index loaded. Call load_index() first.")
+        store = self._create_store(self._current_index_name)
+        store.client.indices.delete(index=self._current_index_name, ignore_unavailable=True)
+        logger.info(f"Deleted ES index '{self._current_index_name}'")
+        self._current_index_name = None
+
+    # ── Indexing from DataFrame / Parquet ─────────────────────────────────
+
+    def index_from_dataframe(
+        self,
+        df: pd.DataFrame,
+        text_field: str,
+        *,
+        metadata_fields: Sequence[str] | None = None,
+        collection_name: str = "rag",
+        batch_size: int = 2_000,
+        show_progress: bool = True,
+        **kwargs: Any,
+    ) -> IndexResult:
+        """Build an Elasticsearch index from a pandas DataFrame.
+
+        For BM25 strategy the documents are inserted directly without
+        embedding. For vector strategies they are first embedded.
+
+        Args:
+            df: Source DataFrame.
+            text_field: Column containing document text.
+            metadata_fields: Extra columns to store as document metadata.
+            collection_name: Elasticsearch index name to create / append to.
+            batch_size: Documents per ES bulk-insert batch.
+            show_progress: Display a tqdm progress bar.
+            **kwargs: Forwarded to ``_prepare_documents``.
+
+        Returns:
+            ``IndexResult`` with the ES store and indexed document count.
+        """
+        documents = documents_from_dataframe(df, text_field, metadata_fields)
+        prepared = self._prepare_documents(documents)
+        store = self._create_store(collection_name)
+        self._current_index_name = collection_name
+        indexed = self._bulk_insert(store, prepared, batch_size, show_progress)
+        return IndexResult(index=store, indexed_count=indexed)
+
+    def index_from_parquet(
+        self,
+        parquet_path: Path,
+        *,
+        text_field: str = "text",
+        metadata_fields: Sequence[str] | None = None,
+        collection_name: str = "rag",
+        batch_size: int = 2_000,
+        show_progress: bool = True,
+        **kwargs: Any,
+    ) -> IndexResult:
+        """Build an Elasticsearch index from a Parquet file (whole file).
+
+        For large files prefer ``index_from_parquet_batches``.
+
+        Args:
+            parquet_path: Path to the ``.parquet`` file.
+            text_field: Column containing document text.
+            metadata_fields: Extra columns to store as document metadata.
+            collection_name: Elasticsearch index name.
+            batch_size: Documents per ES bulk-insert batch.
+            show_progress: Display a tqdm progress bar.
+            **kwargs: Ignored (kept for interface compatibility).
+
+        Returns:
+            ``IndexResult`` with the ES store and indexed document count.
+
+        Raises:
+            FileNotFoundError: If ``parquet_path`` does not exist.
+        """
+        if not parquet_path.exists():
+            raise FileNotFoundError(parquet_path)
+        df = pd.read_parquet(parquet_path)
+        return self.index_from_dataframe(
+            df,
+            text_field,
+            metadata_fields=metadata_fields,
+            collection_name=collection_name,
+            batch_size=batch_size,
+            show_progress=show_progress,
+        )
 
     def _bulk_insert(
         self,
@@ -570,7 +676,8 @@ class ElasticsearchRagService(RagService):
 
     def batch_retrieve_with_scores(
         self,
-        questions: list[str],
+        queries: list[str],
+        *,
         top_k: int = 5,
         strategy: str | None = None,
         num_candidates: int | None = None,
@@ -579,6 +686,7 @@ class ElasticsearchRagService(RagService):
         search_workers: int = 16,
         request_timeout: int | None = None,
         msearch_batch_size: int = 100,
+        **kwargs: Any,
     ) -> list[list[tuple[Document, float]]]:
         """Retrieve for multiple queries using batched _msearch (vector) or threaded BM25.
 
@@ -593,7 +701,7 @@ class ElasticsearchRagService(RagService):
 
         with self._strategy_context(strategy) as strat:
             is_bm25 = strat == "bm25" or self._embeddings is None
-            prepared = [self._prepare_query(q) for q in questions]
+            prepared = [self._prepare_query(q) for q in queries]
             n = len(prepared)
             timeout = request_timeout or self._request_timeout
 
@@ -698,6 +806,174 @@ class ElasticsearchRagService(RagService):
                     results[idx] = hits
 
             return results  # type: ignore[return-value]
+
+    def retrieve_documents(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        strategy: str | None = None,
+        num_candidates: int | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Return the top-k documents most relevant to *query*.
+
+        Args:
+            query: Free-text query string.
+            top_k: Maximum number of documents to return.
+            strategy: Override the instance strategy for this call.
+            num_candidates: kNN candidate pool size (approximate vector only).
+            **kwargs: Ignored.
+
+        Returns:
+            List of ``Document`` objects ranked by relevance (best first).
+
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        pairs = self.retrieve_documents_with_scores(
+            query, top_k=top_k, strategy=strategy, num_candidates=num_candidates
+        )
+        return [doc for doc, _ in pairs]
+
+    def retrieve_documents_with_scores(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        strategy: str | None = None,
+        num_candidates: int | None = None,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Return the top-k documents together with their relevance scores.
+
+        Args:
+            query: Free-text query string.
+            top_k: Maximum number of results to return.
+            strategy: Override the instance strategy for this call.
+            num_candidates: kNN candidate pool size (approximate vector only).
+            **kwargs: Ignored.
+
+        Returns:
+            List of ``(Document, score)`` tuples ranked best-first.
+
+        Raises:
+            ValueError: If no index is loaded.
+        """
+        if not self._current_index_name:
+            raise ValueError("No index loaded. Call load_index() first.")
+        results = self.batch_retrieve_with_scores(
+            [query],
+            top_k=top_k,
+            strategy=strategy,
+            num_candidates=num_candidates,
+            progress_bar=False,
+        )
+        return results[0]
+
+    def batch_retrieve(
+        self,
+        queries: list[str],
+        *,
+        top_k: int = 5,
+        progress_bar: bool = True,
+        **kwargs: Any,
+    ) -> list[list[Document]]:
+        """Retrieve documents for multiple queries.
+
+        Args:
+            queries: List of query strings.
+            top_k: Maximum results per query.
+            progress_bar: Display a tqdm progress bar.
+            **kwargs: Forwarded to ``batch_retrieve_with_scores``.
+
+        Returns:
+            List of result lists — one per query, each a list of Documents.
+        """
+        scored = self.batch_retrieve_with_scores(
+            queries, top_k=top_k, progress_bar=progress_bar, **kwargs
+        )
+        return [[doc for doc, _ in pairs] for pairs in scored]
+
+    # ── Inspection ────────────────────────────────────────────────────────
+
+    def get_doc_count(self) -> int:
+        """Return the number of documents in the current index.
+
+        Returns:
+            Document count, or 0 if no index is loaded.
+        """
+        if not self._current_index_name:
+            return 0
+        try:
+            store = self._create_store(self._current_index_name)
+            resp = store.client.count(index=self._current_index_name)
+            return int(resp["count"])
+        except Exception as e:
+            logger.warning(f"get_doc_count failed: {e}")
+            return 0
+
+    def get_all_documents(
+        self,
+        *,
+        batch_size: int = 1_000,
+        progress_bar: bool = True,
+    ) -> list[Document]:
+        """Not supported for Elasticsearch — index may be millions of docs.
+
+        Raises:
+            NotImplementedError: Always. Use ES scroll / PIT API directly for
+                full iteration.
+        """
+        raise NotImplementedError(
+            "ElasticsearchRagService does not support get_all_documents(). "
+            "The index is remote and potentially very large. "
+            "Use the Elasticsearch scroll or Point-In-Time API directly."
+        )
+
+    def get_index_stats(self) -> dict[str, Any]:
+        """Return statistics about the current Elasticsearch index.
+
+        Returns:
+            Dict with keys ``loaded``, ``index_name``, ``strategy``,
+            ``doc_count``, and ``es_url``.
+        """
+        loaded = bool(self._current_index_name)
+        stats: dict[str, Any] = {
+            "loaded": loaded,
+            "index_name": self._current_index_name,
+            "strategy": self.strategy,
+            "es_url": self.es_url,
+        }
+        if loaded:
+            stats["doc_count"] = self.get_doc_count()
+        return stats
+
+    # ── Embedding helpers ─────────────────────────────────────────────────
+
+    def embed_prompt(self, text: str) -> str:
+        """Apply the query prompt template to *text*.
+
+        Args:
+            text: Raw query string.
+
+        Returns:
+            Prompt-wrapped query string ready for embedding.
+        """
+        return self._prepare_query(text)
+
+    def embed_passage(self, text: str) -> str:
+        """Apply the passage prompt template to *text*.
+
+        Args:
+            text: Raw passage string.
+
+        Returns:
+            Prompt-wrapped passage string ready for embedding.
+        """
+        if self._embeddings is None:
+            return text
+        return self._passage_prompt.format(passage=text)
 
     def get_store(self) -> ElasticsearchStore:
         """

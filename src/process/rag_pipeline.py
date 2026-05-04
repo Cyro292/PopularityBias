@@ -28,6 +28,7 @@ from src.llm.modalLLMService import ModalLLMService
 from src.llm.mistralLLMService import MistralLLMService
 from src.llm.qwenLLMService import QwenLLMService
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
+from src.rag.faiss_rag_service import FaissRagService
 from src.evaluator.binary_evaluator import BinaryEvaluator
 from src.evaluator.substring_evaluator import SubstringEvaluator
 from src.evaluator.base import EvaluationObjects, EvaluationResult
@@ -228,6 +229,7 @@ class PipelineConfig:
     # Values: "none" (use all checkpoints), "retrieval", "answers", "evaluation", "all" (full rerun).
     # Any unrecognised value is treated as "none".
     restart_from: str = "evaluation"  # Stage from which to restart the pipeline (default: "evaluation")
+    faiss_index_path: str = "faiss_migrated"  # Subdirectory under DATA_DIR containing the FAISS index
 
 
 def main():
@@ -271,6 +273,20 @@ def main():
         es_password=config.es_password,
         bm25_b=0
     )
+    rag_service_2 = FaissRagService(
+        config=IndexingConfig(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            embedding_model=config.embedding_model,
+            embedding_provider=config.embedding_provider,
+            request_batch_size=config.embeddings_request_batch_size,
+            gpu_batch_size=config.gpu_batch_size,
+            normalise_embeddings=True,
+            trust_remote_code=True,
+        ),
+        strategy="ivfpq",
+        distance_strategy="cosine",
+    )
     llm_service_2 = QwenLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
     llm_service = OpenAIService(model_name="text-davinci-003", requests_per_second=10)
 
@@ -285,6 +301,7 @@ def main():
     logger.info("Loaded %d questions", len(question_data))
 
     rag_service.load_index(config.collection_name)
+    rag_service_2.load_index(DATA_DIR / config.faiss_index_path)
 
     for strategy in ["zero_shot", "approximation", "bm25"]:
 

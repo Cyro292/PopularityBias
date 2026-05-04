@@ -32,8 +32,9 @@ import matplotlib.axes
 # "inverse"    : proximity = 1 / (1 + score)  (score ≥ 0, lower = closer)
 # "auto"       : infer from value range at runtime
 TRANSFORMS: dict[str, str] = {
-    "approximation": "auto",
+    "approximation": "similarity",
     "bm25":          "inverse",
+    "ivfpq":         "similarity",
 }
 
 

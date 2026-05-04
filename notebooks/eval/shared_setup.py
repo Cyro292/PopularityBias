@@ -3,18 +3,18 @@
 Import this at the top of every eval notebook with:
 
     import sys, pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-    from eval.shared_setup import *
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
+    from notebooks.eval.shared_setup import *
 
 It exports:
   - All standard imports (os, Path, pd, np, plt, sns, tqdm, warnings)
   - Config constants: COLLECTION_NAME, COLLECTION_ROOT, QUESTIONS_PATH,
-    CORPUS_PATH, STRATEGIES, TOP_K, K_VALUES_DETAILED, DECILE_MODE,
-    OUTPUT_FOLDER, RESULTS_DIR
-  - Loaded data: results_by_strategy, ALL_STRATEGIES, metrics_by_strategy,
+    CORPUS_PATH, BACKENDS, ALL_STRATEGIES, TOP_K, K_VALUES_DETAILED,
+    DECILE_MODE, OUTPUT_FOLDER, RESULTS_DIR, GROUP_COL
+  - Loaded data: results_by_strategy, metrics_by_strategy,
     decile_metrics_by_strategy, boundaries_uw, boundaries_cw, corpus_stats,
     corpus_docs, corpus_chunks, corpus_avg_doc_length, metadata_path
-  - Helper functions: _pick_group_col, strategy_colors, markers
+  - Helper functions: pick_group_col, strategy_colors, markers, strategy_label
   - Metric helper functions: compute_metrics, get_found_rank, get_wrong_pops
 """
 from __future__ import annotations
@@ -37,9 +37,7 @@ warnings.filterwarnings("ignore")
 
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Path bootstrap: make the repo root importable regardless of cwd
-# ---------------------------------------------------------------------------
+# ── Repo root on sys.path ─────────────────────────────────────────────────────
 _REPO_ROOT = Path(__file__).parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -65,23 +63,33 @@ from src.metrics.metrics import (
 
 load_dotenv()
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── CONFIGURATION — edit here to switch backends / strategies ─────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
-OUTPUT_NAME = "all_qa_8k"
+# Map each backend name to the list of strategy keys it produced.
+# Results must exist as:  RESULTS_DIR / f"results_{strategy}.parquet"
+# Remove a backend or strategy by commenting it out.
+BACKENDS: dict[str, list[str]] = {
+    "elasticsearch": ["approximation", "bm25"],
+    "faiss":         ["ivfpq"],
+}
 
+OUTPUT_NAME   = "test_1"
 COLLECTION_NAME = "wiki_full_bil"
 COLLECTION_ROOT = Path(DATA_DIR) / COLLECTION_NAME
 QUESTIONS_PATH  = COLLECTION_ROOT / "all_qa_8k.parquet"
 CORPUS_PATH     = COLLECTION_ROOT / "wiki_corpus.parquet"
 
-STRATEGIES         = ["approximation", "bm25"]
-TOP_K              = 5
-K_VALUES_DETAILED  = [1, 3, 5, 5]
-
-DECILE_MODE   = "chunk_weighted"   # "chunk_weighted" or "unweighted"
-OUTPUT_FOLDER = OUTPUT_NAME
-RESULTS_DIR   = COLLECTION_ROOT / OUTPUT_FOLDER
+TOP_K              = 100
+K_VALUES_DETAILED  = [1, 3, 5, 10]
+DECILE_MODE        = "chunk_weighted"   # "chunk_weighted" or "unweighted"
+OUTPUT_FOLDER      = "test_1"            # Folder name for storing all results (must match indexing output folder)
+RESULTS_DIR        = COLLECTION_ROOT / OUTPUT_FOLDER
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Flat list of all active strategies (order: backend order, then strategy order)
+ALL_STRATEGIES: list[str] = [s for strats in BACKENDS.values() for s in strats]
 
 # Set to True to ignore any cached files and recompute everything from scratch.
 FORCE_RECOMPUTE = False
@@ -89,33 +97,56 @@ FORCE_RECOMPUTE = False
 _CACHE_DIR = RESULTS_DIR / "_cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ═════════════════════════════════════════════════════════════════════════════
 # ── Plotting helpers ──────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
-strategy_colors: dict[str, str] = {
+# Assign a distinct colour per strategy, respecting legacy names.
+_STRATEGY_COLOR_MAP: dict[str, str] = {
     "approximation": "#3498db",
     "vector":        "#3498db",
     "bm25":          "#e74c3c",
     "hybrid":        "#27ae60",
+    "ivfpq":         "#9b59b6",
+    "hnsw":          "#f39c12",
 }
-markers: dict[str, str] = {
-    "approximation": "o",
-    "vector":        "o",
-    "bm25":          "s",
-    "hybrid":        "D",
-}
+_FALLBACK_COLORS = ["#1abc9c", "#e67e22", "#2c3e50", "#8e44ad", "#16a085"]
 
-# Backward-compatible alias: notebooks that do `from eval.shared_setup import *`
-# still get _pick_group_col under the old name.
+def _assign_colors() -> dict[str, str]:
+    result: dict[str, str] = {}
+    fallback_idx = 0
+    for s in ALL_STRATEGIES:
+        if s in _STRATEGY_COLOR_MAP:
+            result[s] = _STRATEGY_COLOR_MAP[s]
+        else:
+            result[s] = _FALLBACK_COLORS[fallback_idx % len(_FALLBACK_COLORS)]
+            fallback_idx += 1
+    return result
+
+strategy_colors: dict[str, str] = _assign_colors()
+
+markers: dict[str, str] = {s: ("o" if i % 2 == 0 else "s") for i, s in enumerate(ALL_STRATEGIES)}
+
+
+def strategy_label(strategy: str) -> str:
+    """Human-readable label: 'backend / strategy'."""
+    for backend, strats in BACKENDS.items():
+        if strategy in strats:
+            return f"{backend} / {strategy}"
+    return strategy
+
+
+# Backward-compatible alias
 _pick_group_col = pick_group_col
 
-
-# ── Load everything ───────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Load boundaries & corpus metadata ────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 from src.corpus_handler import ParquetCorpusHandler
 
 k_values_full = list(range(1, max(TOP_K, max(K_VALUES_DETAILED)) + 1))
 
-# --- Boundaries & metadata (always fast) ---
 metadata_path = COLLECTION_ROOT / "metadata.json"
 boundaries_uw, boundaries_cw, corpus_stats = load_boundaries_from_metadata(metadata_path)
 print(f"✓ Boundaries loaded (UW: {boundaries_uw[0]:.4f}…{boundaries_uw[-1]:.4f})")
@@ -132,10 +163,11 @@ corpus_docs, corpus_chunks = dists
 
 decile_col = decile_col_for(DECILE_MODE)
 
-# ── Helper: check whether cached enriched results are still fresh ─────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Cache validity helpers ────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _cache_is_valid(strategy: str) -> bool:
-    """Return True if the cached enriched parquet exists and is newer than the source."""
     cache_path  = _CACHE_DIR / f"enriched_{strategy}.parquet"
     source_path = RESULTS_DIR / f"results_{strategy}.parquet"
     if not cache_path.exists() or not source_path.exists():
@@ -147,9 +179,8 @@ def _metrics_cache_is_valid() -> bool:
     cache_path = _CACHE_DIR / "metrics_by_strategy.json"
     if not cache_path.exists():
         return False
-    # Valid if every enriched parquet is at least as new as the metrics cache
     mtime = cache_path.stat().st_mtime
-    for s in STRATEGIES:
+    for s in ALL_STRATEGIES:
         ep = _CACHE_DIR / f"enriched_{s}.parquet"
         if not ep.exists() or ep.stat().st_mtime > mtime:
             return False
@@ -161,35 +192,35 @@ def _decile_metrics_cache_is_valid() -> bool:
     if not cache_path.exists():
         return False
     mtime = cache_path.stat().st_mtime
-    for s in STRATEGIES:
+    for s in ALL_STRATEGIES:
         ep = _CACHE_DIR / f"enriched_{s}.parquet"
         if not ep.exists() or ep.stat().st_mtime > mtime:
             return False
     return True
 
-
-# ── Load / compute enriched results ──────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Load / enrich results ─────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 results_by_strategy: dict[str, pd.DataFrame] = {}
 
-for strategy in STRATEGIES:
+for strategy in ALL_STRATEGIES:
     source_path = RESULTS_DIR / f"results_{strategy}.parquet"
     cache_path  = _CACHE_DIR / f"enriched_{strategy}.parquet"
 
     if not source_path.exists():
-        print(f"  ⚠ Missing: {source_path} — run rag_retrieval.ipynb first!")
+        print(f"  ⚠ Missing: {source_path.name} — run the pipeline first!")
         continue
 
     if not FORCE_RECOMPUTE and _cache_is_valid(strategy):
-        print(f"  ✓ {strategy}: loading from cache")
+        print(f"  ✓ {strategy_label(strategy)}: loading from cache")
         results_by_strategy[strategy] = pd.read_parquet(cache_path)
         continue
 
-    print(f"  computing {strategy}…")
+    print(f"  computing {strategy_label(strategy)}…")
     df = pd.read_parquet(source_path)
     print(f"    loaded {len(df):,} rows")
 
-    # — decile columns —
     if COL_POPULARITY not in df.columns:
         raise ValueError(f"{strategy}: missing '{COL_POPULARITY}' column")
 
@@ -202,15 +233,12 @@ for strategy in STRATEGIES:
     df[COL_DECILE_UNWEIGHTED]     = assign_decile(df[COL_POPULARITY], boundaries_uw).astype(int)
     df[COL_DECILE_CHUNK_WEIGHTED] = assign_decile(df[COL_POPULARITY], boundaries_cw).astype(int)
 
-    # — recall@k / MRR / rank columns —
     print("    computing recall@k / MRR…")
     _, df = compute_metrics(df, k_values_full)
 
-    # — found_at_rank / wrong_docs_popularities —
     df["found_at_rank"]           = df.apply(get_found_rank, axis=1)
     df["wrong_docs_popularities"] = df.apply(get_wrong_pops, axis=1)
 
-    # — entropy —
     def _query_entropy(row) -> float:
         scores = row.get("topk_scores")
         if scores is None:
@@ -225,7 +253,6 @@ for strategy in STRATEGIES:
         labels=["Q1_least", "Q2", "Q3", "Q4", "Q5_most"],
     ).astype(str)
 
-    # — doc_length from corpus —
     print("    fetching doc lengths via corpus handler…")
     _corpus_handler = ParquetCorpusHandler(corpus_path=CORPUS_PATH, metadata_path=metadata_path)
     question_ids_str: list[str] = df["wikipedia_id"].unique().tolist()
@@ -247,17 +274,27 @@ for strategy in STRATEGIES:
     del _docs, doc_length_df
     gc.collect()
 
-    # — save cache —
     df.to_parquet(cache_path, index=False)
     print(f"    cached → {cache_path.name}")
-
     results_by_strategy[strategy] = df
 
-ALL_STRATEGIES = list(results_by_strategy.keys())
-if not ALL_STRATEGIES:
-    raise FileNotFoundError("No retrieval results found! Run rag_retrieval.ipynb first.")
+# Restrict ALL_STRATEGIES to only those that actually loaded
+ALL_STRATEGIES = [s for s in ALL_STRATEGIES if s in results_by_strategy]
 
-# ── Aggregate metrics ─────────────────────────────────────────────────────────
+if not ALL_STRATEGIES:
+    raise FileNotFoundError("No retrieval results found! Run the pipeline first.")
+
+# Resolve a single GROUP_COL shared across all loaded strategies
+GROUP_COL: str = ""
+for _s in ALL_STRATEGIES:
+    _gc = pick_group_col(results_by_strategy[_s])
+    if _gc:
+        GROUP_COL = _gc
+        break
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Aggregate metrics ─────────────────────────────────────────────════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 _metrics_cache_path = _CACHE_DIR / "metrics_by_strategy.json"
 
@@ -275,7 +312,6 @@ else:
                 row[f"recall@{k}"] = float(rdf[col].mean())
         if "reciprocal_rank" in rdf.columns:
             row["mrr"] = float(rdf["reciprocal_rank"].mean())
-            found = rdf["reciprocal_rank"].dropna()
         row["median_rank"] = float(rdf["rank"].dropna().median()) if "rank" in rdf.columns else None
         row["mean_rank"]   = float(rdf["rank"].dropna().mean())   if "rank" in rdf.columns else None
         metrics_by_strategy[strategy] = row
@@ -284,7 +320,9 @@ else:
 
 pd.DataFrame(metrics_by_strategy).T.to_csv(RESULTS_DIR / "metrics_comparison.csv")
 
+# ═════════════════════════════════════════════════════════════════════════════
 # ── Per-decile metrics ────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 _decile_cache_path = _CACHE_DIR / "decile_metrics_by_strategy.json"
 
@@ -365,5 +403,7 @@ else:
 print(f"\n✓ shared_setup complete — {len(ALL_STRATEGIES)} strategies ready")
 print(f"  Collection : {COLLECTION_NAME}")
 print(f"  Results dir: {RESULTS_DIR}")
-print(f"  Strategies : {STRATEGIES}")
+print(f"  Backends   : {BACKENDS}")
+print(f"  Strategies : {ALL_STRATEGIES}")
 print(f"  Decile mode: {DECILE_MODE}")
+print(f"  Group col  : {GROUP_COL or '(none found)'}")
