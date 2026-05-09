@@ -30,6 +30,7 @@ from src.llm.qwenLLMService import QwenLLMService
 from src.llm.gptNeo27bLLMService import GPTNeo27bLLMService
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
 from src.rag.faiss_rag_service import FaissRagService
+from src.rag.bm25_rag_service import BM25RagService
 from src.evaluator.binary_evaluator import BinaryEvaluator
 from src.evaluator.substring_evaluator import SubstringEvaluator
 from src.evaluator.base import EvaluationObjects, EvaluationResult
@@ -235,8 +236,9 @@ class PipelineConfig:
     # Restart from a specific stage; all downstream stages are also rerun (cascading).
     # Values: "none" (use all checkpoints), "retrieval", "answers", "evaluation", "all" (full rerun).
     # Any unrecognised value is treated as "none".
-    restart_from: str = "evaluation"  # Stage from which to restart the pipeline ("none" reuses all checkpoints)
+    restart_from: str = "none"  # Stage from which to restart the pipeline ("none" reuses all checkpoints)
     faiss_index_path: str = "faiss_migrated"  # Subdirectory under DATA_DIR containing the FAISS index
+    bm25_index_path: str = "bm25"  # Subdirectory under the collection folder containing the bm25s index
 
 
 def main():
@@ -294,10 +296,16 @@ def main():
         strategy="ivfpq",
         distance_strategy="cosine",
     )
+    rag_service_3 = BM25RagService(
+        chunk=True,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
+    )
     llm_service = GPTNeo27bLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
     # llm_service = OpenAIService(model_name="text-davinci-003", requests_per_second=10)
 
-    llm_evaluation_service = OpenAIService(model_name="gpt-5-nano-2025-08-07", requests_per_second=10)
+    # llm_evaluation_service = OpenAIService(model_name="gpt-5-nano-2025-08-07", requests_per_second=1)
+    llm_evaluation_service = MistralLLMService()
     evaluator = BinaryEvaluator(evaluation_service=llm_evaluation_service)
 
     evaluator_2 = SubstringEvaluator()
@@ -370,6 +378,32 @@ def main():
             
             if strategy == "zero_shot":
                 retrieved_docs = [[] for _ in questions]
+            elif strategy == "bm25":
+                if rag_service_3.get_doc_count() == 0:
+                    logger.error(
+                        "[bm25] BM25 index is not loaded — cannot retrieve. "
+                        "Build the index with BM25RagService.index_from_parquet() first."
+                    )
+                    retrieved_docs = [[] for _ in questions]
+                else:
+                    retrieved_docs_with_scores = rag_service_3.batch_retrieve_with_scores(
+                        questions,
+                        top_k=config.top_k,
+                    )
+                    retrieved_docs = [[doc for doc, _score in docs] for docs in retrieved_docs_with_scores]
+            elif strategy == "ivfpq":
+                if rag_service_2.get_doc_count() == 0:
+                    logger.error(
+                        "[ivfpq] IVFPQ index is not loaded — cannot retrieve. "
+                        "Build the index with IVFPQRagService.index_from_parquet() first."
+                    )
+                    retrieved_docs = [[] for _ in questions]
+                else:
+                    retrieved_docs_with_scores = rag_service_2.batch_retrieve_with_scores(
+                        questions,
+                        top_k=config.top_k,
+                    )
+                    retrieved_docs = [[doc for doc, _score in docs] for docs in retrieved_docs_with_scores]
             else:
                 retrieved_docs_with_scores = rag_service.batch_retrieve_with_scores(
                     questions,

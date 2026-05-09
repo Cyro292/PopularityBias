@@ -1,260 +1,146 @@
-"""BM25-based RAG service for local keyword retrieval.
+"""BM25-based RAG service backed by bm25s.
 
-BM25 (Best Match 25) ranks documents by term frequency and inverse document
-frequency — no embedding model or GPU required.  It is useful as:
-
-- A fast, zero-cost baseline against dense retrieval.
-- A component in hybrid retrieval (BM25 + vector).
-- An exact-keyword retriever for domain-specific terminology.
+Uses bm25s native corpus storage — no SQLite, no custom file formats.
+At query time the score arrays are memory-mapped (low RAM); the corpus
+dictionaries are loaded into RAM only for the top-k results.
 
 Index lifecycle
 ---------------
-The loaded ``BM25Index`` is held on ``self._index`` after any indexing or
-``load_index`` call, so retrieval methods require no ``index`` argument.
-
-Scores
-------
-``rank_bm25`` does not expose its raw BM25 scores through the LangChain
-``BM25Retriever`` interface, so ``retrieve_documents_with_scores`` returns
-rank-based reciprocal scores ``1 / (rank + 1)`` (best result = 1.0).
+Build once with :meth:`index_from_parquet`, then reload cheaply with
+:meth:`load_index`.  The on-disk layout is whatever bm25s writes:
+``scores/`` (vocab + score arrays) and ``corpus.jsonl``.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
-import pickle
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from langchain.schema import Document
-from langchain_community.retrievers import BM25Retriever
 from tqdm import tqdm
 
 from .base import IndexResult, RagService
-from .base import documents_from_dataframe
 
 logger = logging.getLogger(__name__)
 
+# ── Optional stemmer ──────────────────────────────────────────────────────────
+try:
+    import Stemmer as _PyStemmer
+    _stemmer = _PyStemmer.Stemmer("english")
+except ImportError:
+    _stemmer = None
+    logger.warning("PyStemmer not installed — stemming disabled")
 
-# ── BM25Index wrapper ─────────────────────────────────────────────────────────
 
-class BM25Index:
-    """Thin wrapper around ``BM25Retriever`` with persistence support.
+# ── Fast chunker (no LangChain overhead) ─────────────────────────────────────
 
-    Attributes:
-        retriever: The underlying LangChain ``BM25Retriever``.
-    """
-
-    def __init__(self, retriever: BM25Retriever) -> None:
-        """Initialise from an existing retriever.
-
-        Args:
-            retriever: Configured ``BM25Retriever`` instance.
-        """
-        self.retriever = retriever
-
-    # ── Search ────────────────────────────────────────────────────────────
-
-    def similarity_search(self, query: str, k: int = 5) -> list[Document]:
-        """Return the top-k documents matching *query*.
-
-        Args:
-            query: Query string.
-            k: Number of documents to return.
-
-        Returns:
-            Ranked list of matching ``Document`` objects.
-        """
-        self.retriever.k = k
-        return self.retriever.invoke(query)
-
-    def similarity_search_with_score(
-        self, query: str, k: int = 5
-    ) -> list[tuple[Document, float]]:
-        """Return the top-k documents with rank-based reciprocal scores.
-
-        ``rank_bm25`` does not expose raw scores through the LangChain
-        retriever interface, so scores are ``1 / (rank + 1)``:
-        rank 0 → 1.0, rank 1 → 0.5, rank 2 → 0.333, …
-
-        Args:
-            query: Query string.
-            k: Number of results to return.
-
-        Returns:
-            List of ``(Document, score)`` tuples, best-first.
-        """
-        docs = self.similarity_search(query, k=k)
-        return [(doc, 1.0 / (i + 1)) for i, doc in enumerate(docs)]
-
-    # ── Properties ───────────────────────────────────────────────────────
-
-    @property
-    def doc_count(self) -> int:
-        """Number of documents in the index."""
-        return len(self.retriever.docs)
-
-    @property
-    def docs(self) -> list[Document]:
-        """All documents stored in the index."""
-        return list(self.retriever.docs)
-
-    # ── Persistence ──────────────────────────────────────────────────────
-
-    def save(self, path: Path) -> None:
-        """Pickle the retriever to *path*.
-
-        Args:
-            path: Destination file path (typically ``*.pkl``).
-        """
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as fh:
-            pickle.dump(self.retriever, fh)
-        logger.info(f"Saved BM25 index to {path}")
-
-    @classmethod
-    def load(cls, path: Path) -> BM25Index:
-        """Load a pickled retriever from *path*.
-
-        Args:
-            path: Path to the ``.pkl`` file.
-
-        Returns:
-            Loaded ``BM25Index`` instance.
-
-        Raises:
-            FileNotFoundError: If *path* does not exist.
-        """
-        if not path.exists():
-            raise FileNotFoundError(f"BM25 index not found at {path}")
-        with open(path, "rb") as fh:
-            retriever = pickle.load(fh)
-        logger.info(f"Loaded BM25 index from {path} ({len(retriever.docs):,} docs)")
-        return cls(retriever)
+def _chunk(text: str, chunk_size: int, overlap: int) -> list[str]:
+    if not text:
+        return [""]
+    step = max(1, chunk_size - overlap)
+    return [text[i : i + chunk_size] for i in range(0, len(text), step)]
 
 
 # ── BM25RagService ────────────────────────────────────────────────────────────
 
 class BM25RagService(RagService):
-    """RAG service using local BM25 keyword retrieval.
-
-    The active index is stored internally on ``self._index`` after any
-    indexing or ``load_index`` call — retrieval methods do not take an
-    ``index`` argument.
+    """RAG service using local BM25 retrieval via bm25s.
 
     Args:
-        default_top_k: Default number of results for retrieval methods.
-        b: BM25 length-normalisation parameter (0 = off, 1 = full).
-            Defaults to ``0.75``.
-        k1: BM25 term-saturation parameter (typical range 1.2–2.0).
-            Defaults to ``1.5``.
-
-    Example::
-
-        service = BM25RagService()
-        service.index_from_parquet(
-            Path("data/corpus.parquet"),
-            text_field="text",
-            metadata_fields=["wikipedia_id", "wikipedia_title"],
-            collection_name="wiki_bm25",
-        )
-        docs = service.retrieve_documents("Who is Reza Pahlavi?", top_k=10)
+        chunk: Split articles into chunks before indexing.
+        chunk_size: Maximum characters per chunk.
+        chunk_overlap: Character overlap between consecutive chunks.
+        k1: BM25 term-saturation parameter.
+        b: BM25 length-normalisation parameter.
     """
 
     def __init__(
         self,
         *,
-        default_top_k: int = 5,
-        b: float = 0.75,
+        chunk: bool = True,
+        chunk_size: int = 1_000,
+        chunk_overlap: int = 100,
         k1: float = 1.5,
+        b: float = 0.75,
     ) -> None:
-        self.default_top_k = default_top_k
-        self.b = b
+        self.chunk = chunk
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         self.k1 = k1
-        self._index: BM25Index | None = None
-        self._index_path: Path | None = None
+        self.b = b
+        self._retriever: Any = None
+        self._index_dir: Path | None = None
 
-    # ── Internal helpers ──────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _require_index(self) -> BM25Index:
-        """Return the current index or raise if none is loaded.
+    def _require_retriever(self) -> Any:
+        if self._retriever is None:
+            raise ValueError("No index loaded. Call index_from_parquet() or load_index() first.")
+        return self._retriever
 
-        Returns:
-            The active ``BM25Index``.
-
-        Raises:
-            ValueError: If no index has been built or loaded yet.
-        """
-        if self._index is None:
-            raise ValueError(
-                "No BM25 index loaded. Call index_from_parquet(), "
-                "index_from_dataframe(), or load_index() first."
-            )
-        return self._index
-
-    def _build_index(
-        self,
-        documents: list[Document],
-        output_dir: Path | None,
-        collection_name: str,
-    ) -> BM25Index:
-        """Create and optionally persist a ``BM25Index`` from *documents*.
-
-        Args:
-            documents: Pre-built document list.
-            output_dir: If provided, the index is saved here as a ``.pkl``.
-            collection_name: File stem for the saved index file.
-
-        Returns:
-            The constructed ``BM25Index``.
-        """
-        retriever = BM25Retriever.from_documents(
-            documents,
-            bm25_params={"b": self.b, "k1": self.k1},
-        )
-        retriever.k = self.default_top_k
-        index = BM25Index(retriever)
-
-        if output_dir is not None:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            pkl_path = output_dir / f"{collection_name}.pkl"
-            index.save(pkl_path)
-            self._index_path = pkl_path
-
-        return index
+    def _results_to_docs(
+        self, results: np.ndarray, scores: np.ndarray, k: int
+    ) -> list[tuple[Document, float]]:
+        """Convert bm25s result arrays to (Document, score) pairs."""
+        out = []
+        for i in range(min(results.shape[1], k)):
+            entry = results[0, i]
+            score = float(scores[0, i])
+            if isinstance(entry, dict):
+                text = entry.get("text", "")
+                meta = {key: val for key, val in entry.items() if key != "text"}
+            else:
+                text = str(entry)
+                meta = {}
+            out.append((Document(page_content=text, metadata=meta), score))
+        return out
 
     # ── Indexing ──────────────────────────────────────────────────────────
 
     def index_from_dataframe(
         self,
         df: pd.DataFrame,
-        text_field: str,
+        text_field: str = "text",
         *,
         metadata_fields: Sequence[str] | None = None,
         collection_name: str = "bm25",
         output_dir: Path | None = None,
         **kwargs: Any,
     ) -> IndexResult:
-        """Build a BM25 index from a pandas DataFrame.
+        """Build a BM25 index from a DataFrame."""
+        import bm25s
 
-        Args:
-            df: Source DataFrame.
-            text_field: Column containing document text.
-            metadata_fields: Extra columns to store as document metadata.
-            collection_name: Index file stem (used when ``output_dir`` is set).
-            output_dir: Optional directory to persist the index.
-            **kwargs: Ignored (for API compatibility).
+        meta_fields = list(metadata_fields or [])
+        texts_raw: list[str] = df[text_field].fillna("").tolist()
 
-        Returns:
-            ``IndexResult`` with the ``BM25Index`` and document count.
-        """
-        logger.info(f"Building BM25 index from DataFrame ({len(df):,} rows)")
-        documents = documents_from_dataframe(df, text_field, metadata_fields)
-        self._index = self._build_index(documents, output_dir, collection_name)
-        logger.info(f"BM25 index ready — {self._index.doc_count:,} documents")
-        return IndexResult(self._index, self._index.doc_count)
+        corpus_texts: list[str] = []
+        corpus_dicts: list[dict] = []
+
+        for i, text in enumerate(texts_raw):
+            meta = {f: df[f].iloc[i] for f in meta_fields if f in df.columns}
+            chunks = _chunk(text, self.chunk_size, self.chunk_overlap) if self.chunk else [text]
+            for c in chunks:
+                corpus_texts.append(c)
+                corpus_dicts.append({"text": c, **meta})
+
+        logger.info("Tokenising %d chunks …", len(corpus_texts))
+        tokens = bm25s.tokenize(corpus_texts, stopwords="en", stemmer=_stemmer)
+        retriever = bm25s.BM25(k1=self.k1, b=self.b)
+        retriever.index(tokens)
+
+        if output_dir is not None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            retriever.save(str(output_dir), corpus=corpus_dicts)
+            self._index_dir = Path(output_dir)
+
+        self._retriever = retriever
+        self._retriever._corpus = corpus_dicts  # keep corpus attached for retrieval
+        return IndexResult(retriever, len(corpus_texts))
 
     def index_from_parquet(
         self,
@@ -266,220 +152,143 @@ class BM25RagService(RagService):
         output_dir: Path | None = None,
         **kwargs: Any,
     ) -> IndexResult:
-        """Build a BM25 index by loading an entire Parquet file.
+        """Build a BM25 index by streaming a Parquet file.
 
-        For very large files consider ``index_from_parquet_batches`` to
-        keep memory usage bounded.
+        Streams row-group by row-group so pandas RAM stays bounded.
+        All chunk texts are accumulated for tokenisation (bm25s requires
+        the full corpus for IDF computation).
 
         Args:
-            parquet_path: Path to the ``.parquet`` file.
+            parquet_path: Path to the corpus Parquet file.
             text_field: Column containing document text.
-            metadata_fields: Extra columns to store as document metadata.
-            collection_name: Index file stem (used when ``output_dir`` is set).
-            output_dir: Optional directory to persist the index.
+            metadata_fields: Columns stored as document metadata.
+            output_dir: Directory to persist the index.
             **kwargs: Ignored.
 
         Returns:
-            ``IndexResult`` with the ``BM25Index`` and document count.
-
-        Raises:
-            FileNotFoundError: If ``parquet_path`` does not exist.
+            ``IndexResult`` with the bm25s retriever and chunk count.
         """
+        import bm25s
+
+        parquet_path = Path(parquet_path)
         if not parquet_path.exists():
             raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
 
-        columns = [text_field] + list(metadata_fields or [])
-        logger.info(f"Reading {parquet_path}")
-        df = pq.read_table(parquet_path, columns=columns).to_pandas()
-        logger.info(f"Loaded {len(df):,} rows")
-        return self.index_from_dataframe(
-            df,
-            text_field,
-            metadata_fields=metadata_fields,
-            collection_name=collection_name,
-            output_dir=output_dir,
-        )
-
-    def index_from_parquet_batches(
-        self,
-        parquet_path: Path,
-        *,
-        text_field: str = "text",
-        metadata_fields: Sequence[str] | None = None,
-        collection_name: str = "bm25",
-        output_dir: Path | None = None,
-        batch_size: int = 100_000,
-        skip_rows: int = 0,
-        **kwargs: Any,
-    ) -> IndexResult:
-        """Build a BM25 index by streaming a Parquet file in batches.
-
-        All batches are accumulated in memory before building the index —
-        BM25 requires the full corpus for IDF computation.  Use
-        ``batch_size`` to control how many rows are held in each Arrow
-        batch; the full document list is still assembled in RAM.
-
-        Args:
-            parquet_path: Path to the ``.parquet`` file.
-            text_field: Column containing document text.
-            metadata_fields: Extra columns to store as metadata.
-            collection_name: Index file stem (used when ``output_dir`` is set).
-            output_dir: Optional directory to persist the index.
-            batch_size: Rows per Arrow batch (controls peak memory per read).
-            skip_rows: Skip this many leading rows.
-            **kwargs: Ignored.
-
-        Returns:
-            ``IndexResult`` with the ``BM25Index`` and total document count.
-
-        Raises:
-            FileNotFoundError: If ``parquet_path`` does not exist.
-        """
-        if not parquet_path.exists():
-            raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
-
-        columns = [text_field] + list(metadata_fields or [])
+        meta_fields = list(metadata_fields or [])
+        columns = [text_field] + meta_fields
         pf = pq.ParquetFile(parquet_path)
-        total_rows = pf.metadata.num_rows
-        all_documents: list[Document] = []
+        total_rg = pf.metadata.num_row_groups
+
+        logger.info("Streaming %s (%d row-groups) …", parquet_path.name, total_rg)
+
+        corpus_texts: list[str] = []
+        corpus_dicts: list[dict] = []
         rows_seen = 0
 
-        logger.info(
-            f"Streaming {parquet_path.name} — "
-            f"{total_rows - skip_rows:,} rows (batch={batch_size:,})"
-        )
+        with tqdm(
+            total=total_rg,
+            desc="Pass 1/2  reading",
+            unit="rg",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} rg  [{elapsed}<{remaining}, {rate_fmt}]",
+        ) as pbar:
+            for batch in pf.iter_batches(columns=columns):
+                df = batch.to_pandas()
+                rows_seen += len(df)
 
-        for batch in tqdm(
-            pf.iter_batches(batch_size=batch_size, columns=columns),
-            desc="Reading batches",
-            unit="batch",
-        ):
-            batch_len = batch.num_rows
-            if rows_seen + batch_len <= skip_rows:
-                rows_seen += batch_len
-                continue
-            df = batch.to_pandas()
-            if rows_seen < skip_rows:
-                df = df.iloc[skip_rows - rows_seen :]
-            rows_seen += batch_len
+                texts_raw: list[str] = df[text_field].fillna("").tolist()
+                meta_cols = {f: df[f].tolist() for f in meta_fields if f in df.columns}
 
-            docs = documents_from_dataframe(df, text_field, metadata_fields)
-            all_documents.extend(docs)
+                for i, text in enumerate(texts_raw):
+                    meta = {f: meta_cols[f][i] for f in meta_cols}
+                    chunks = _chunk(text, self.chunk_size, self.chunk_overlap) if self.chunk else [text]
+                    for c in chunks:
+                        corpus_texts.append(c)
+                        corpus_dicts.append({"text": c, **meta})
 
-        logger.info(f"Building BM25 index on {len(all_documents):,} documents…")
-        self._index = self._build_index(all_documents, output_dir, collection_name)
-        logger.info(f"BM25 index ready — {self._index.doc_count:,} documents")
-        return IndexResult(self._index, self._index.doc_count)
+                del df
+                pbar.update(1)
+                pbar.set_postfix(
+                    articles=f"{rows_seen:,}",
+                    chunks=f"{len(corpus_texts):,}",
+                    refresh=False,
+                )
+
+        logger.info("Pass 1 done — %d chunks from %d articles", len(corpus_texts), rows_seen)
+
+        logger.info("Pass 2/2  tokenising %d chunks …", len(corpus_texts))
+        tokens = bm25s.tokenize(corpus_texts, stopwords="en", stemmer=_stemmer)
+        del corpus_texts
+        gc.collect()
+
+        logger.info("Building bm25s index …")
+        retriever = bm25s.BM25(k1=self.k1, b=self.b)
+        retriever.index(tokens)
+        del tokens
+        gc.collect()
+
+        if output_dir is not None:
+            save_dir = Path(output_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("Saving index to %s …", save_dir)
+            retriever.save(str(save_dir), corpus=corpus_dicts)
+            self._index_dir = save_dir
+
+        self._retriever = retriever
+        self._retriever._corpus = corpus_dicts
+        return IndexResult(retriever, len(corpus_dicts))
+
+    # alias
+    index_from_parquet_batches = index_from_parquet  # type: ignore[assignment]
 
     # ── Index lifecycle ───────────────────────────────────────────────────
 
-    def load_index(
-        self,
-        path_or_name: str | Path,
-        collection_name: str = "bm25",
-        **kwargs: Any,
-    ) -> BM25Index:
-        """Load a persisted BM25 index from disk.
-
-        Accepts either:
-        - A directory path — loads ``<dir>/<collection_name>.pkl``.
-        - A direct ``.pkl`` file path.
+    def load_index(self, path_or_name: str | Path, **kwargs: Any) -> Any:
+        """Load a persisted index from disk.
 
         Args:
-            path_or_name: Directory or ``.pkl`` file path.
-            collection_name: Index file stem (used when a directory is given).
-            **kwargs: Ignored.
+            path_or_name: Directory written by :meth:`index_from_parquet`.
 
         Returns:
-            The loaded ``BM25Index``.
-
-        Raises:
-            FileNotFoundError: If the index file cannot be found.
+            The loaded bm25s retriever.
         """
-        path = Path(path_or_name)
-        pkl_path = path if path.suffix == ".pkl" else path / f"{collection_name}.pkl"
-        self._index = BM25Index.load(pkl_path)
-        self._index_path = pkl_path
-        return self._index
+        import bm25s
 
-    def save_index(self, path: str | Path, collection_name: str = "bm25", **kwargs: Any) -> None:
-        """Persist the current index to *path*.
+        index_dir = Path(path_or_name)
+        if not index_dir.exists():
+            raise FileNotFoundError(f"Index directory not found: {index_dir}")
 
-        Args:
-            path: Destination directory or ``.pkl`` file path.
-            collection_name: File stem (used when *path* is a directory).
-            **kwargs: Ignored.
+        logger.info("Loading BM25 index from %s …", index_dir)
+        self._retriever = bm25s.BM25.load(str(index_dir), load_corpus=True, mmap=True)
+        self._index_dir = index_dir
+        logger.info("BM25 index loaded")
+        return self._retriever
 
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        index = self._require_index()
-        p = Path(path)
-        pkl_path = p if p.suffix == ".pkl" else p / f"{collection_name}.pkl"
-        index.save(pkl_path)
-        self._index_path = pkl_path
+    def save_index(self, path: str | Path, **kwargs: Any) -> None:
+        """No-op — the index is always saved during build."""
+        logger.warning("save_index() is a no-op; index is saved during index_from_parquet().")
 
     def delete_index(self, *, delete_files: bool = False, **kwargs: Any) -> None:
-        """Drop the current index from memory and optionally from disk.
-
-        Args:
-            delete_files: If ``True`` and the index was loaded from disk,
-                delete the ``.pkl`` file.
-            **kwargs: Ignored.
-        """
-        if delete_files and self._index_path and self._index_path.exists():
-            self._index_path.unlink()
-            logger.info(f"Deleted BM25 index file at {self._index_path}")
-        self._index = None
-        self._index_path = None
-        logger.info("BM25 index cleared from memory")
+        if delete_files and self._index_dir and self._index_dir.exists():
+            import shutil
+            shutil.rmtree(self._index_dir)
+            logger.info("Deleted index directory: %s", self._index_dir)
+        self._retriever = None
+        self._index_dir = None
 
     # ── Retrieval ─────────────────────────────────────────────────────────
 
-    def retrieve_documents(
-        self,
-        query: str,
-        *,
-        top_k: int = 5,
-        **kwargs: Any,
-    ) -> list[Document]:
-        """Return the top-k documents matching *query* via BM25.
-
-        Args:
-            query: Free-text query string.
-            top_k: Number of documents to return.
-            **kwargs: Ignored.
-
-        Returns:
-            Ranked list of ``Document`` objects.
-
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        return self._require_index().similarity_search(query, k=top_k)
+    def retrieve_documents(self, query: str, *, top_k: int = 5, **kwargs: Any) -> list[Document]:
+        return [doc for doc, _ in self.retrieve_documents_with_scores(query, top_k=top_k)]
 
     def retrieve_documents_with_scores(
-        self,
-        query: str,
-        *,
-        top_k: int = 5,
-        **kwargs: Any,
+        self, query: str, *, top_k: int = 5, **kwargs: Any
     ) -> list[tuple[Document, float]]:
-        """Return the top-k documents with rank-based reciprocal scores.
+        import bm25s
 
-        Args:
-            query: Free-text query string.
-            top_k: Number of results to return.
-            **kwargs: Ignored.
-
-        Returns:
-            List of ``(Document, score)`` tuples, best-first.
-            Scores are ``1 / (rank + 1)``.
-
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        return self._require_index().similarity_search_with_score(query, k=top_k)
+        retriever = self._require_retriever()
+        query_tokens = bm25s.tokenize([query], stopwords="en", stemmer=_stemmer)
+        results, scores = retriever.retrieve(query_tokens, k=min(top_k, self.get_doc_count()))
+        return self._results_to_docs(results, scores, top_k)
 
     def batch_retrieve(
         self,
@@ -487,26 +296,14 @@ class BM25RagService(RagService):
         *,
         top_k: int = 5,
         progress_bar: bool = True,
+        batch_size: int = 64,
         **kwargs: Any,
     ) -> list[list[Document]]:
-        """Retrieve documents for multiple queries.
-
-        Args:
-            queries: List of query strings.
-            top_k: Results per query.
-            progress_bar: Show tqdm progress bar.
-            **kwargs: Ignored.
-
-        Returns:
-            One list of Documents per query.
-
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        self._require_index()
         return [
-            self.retrieve_documents(q, top_k=top_k)
-            for q in tqdm(queries, desc="Retrieving (bm25)", disable=not progress_bar)
+            [doc for doc, _ in per_q]
+            for per_q in self.batch_retrieve_with_scores(
+                queries, top_k=top_k, progress_bar=progress_bar, batch_size=batch_size
+            )
         ]
 
     def batch_retrieve_with_scores(
@@ -515,95 +312,57 @@ class BM25RagService(RagService):
         *,
         top_k: int = 5,
         progress_bar: bool = True,
+        batch_size: int = 64,
         **kwargs: Any,
     ) -> list[list[tuple[Document, float]]]:
-        """Retrieve scored documents for multiple queries.
+        import bm25s
 
-        Args:
-            queries: List of query strings.
-            top_k: Results per query.
-            progress_bar: Show tqdm progress bar.
-            **kwargs: Ignored.
+        retriever = self._require_retriever()
+        k = min(top_k, self.get_doc_count())
+        output: list[list[tuple[Document, float]]] = []
 
-        Returns:
-            One list of ``(Document, score)`` tuples per query.
+        for i in tqdm(
+            range(0, len(queries), batch_size),
+            desc="Retrieving (bm25s)",
+            disable=not progress_bar,
+        ):
+            batch = queries[i : i + batch_size]
+            query_tokens = bm25s.tokenize(batch, stopwords="en", stemmer=_stemmer)
+            results, scores = retriever.retrieve(query_tokens, k=k)
+            for q_idx in range(len(batch)):
+                per_q_results = results[q_idx : q_idx + 1]
+                per_q_scores  = scores[q_idx : q_idx + 1]
+                output.append(self._results_to_docs(per_q_results, per_q_scores, top_k))
 
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        self._require_index()
-        return [
-            self.retrieve_documents_with_scores(q, top_k=top_k)
-            for q in tqdm(queries, desc="Retrieving (bm25)", disable=not progress_bar)
-        ]
+        return output
 
     # ── Inspection ────────────────────────────────────────────────────────
 
     def get_doc_count(self) -> int:
-        """Return the number of documents in the current index.
+        if self._retriever is None:
+            return 0
+        # bm25s stores num_docs on the retriever
+        return int(getattr(self._retriever, "num_docs", 0))
 
-        Returns:
-            Document count, or 0 if no index is loaded.
-        """
-        return self._index.doc_count if self._index is not None else 0
-
-    def get_all_documents(
-        self,
-        *,
-        batch_size: int = 1_000,
-        progress_bar: bool = True,
-    ) -> list[Document]:
-        """Return every document in the BM25 index.
-
-        Args:
-            batch_size: Ignored (BM25 documents are all in memory).
-            progress_bar: Ignored.
-
-        Returns:
-            List of all stored ``Document`` objects.
-
-        Raises:
-            ValueError: If no index is loaded.
-        """
-        return self._require_index().docs
+    def get_all_documents(self, **kwargs: Any) -> list[Document]:
+        raise NotImplementedError("Corpus is too large to load fully into memory.")
 
     def get_index_stats(self) -> dict[str, Any]:
-        """Return statistics about the current BM25 index.
-
-        Returns:
-            Dict with keys: ``loaded``, ``doc_count``, ``b``, ``k1``,
-            and optionally ``index_path``.
-        """
-        if self._index is None:
+        if self._retriever is None:
             return {"loaded": False}
         return {
             "loaded": True,
-            "doc_count": self._index.doc_count,
-            "b": self.b,
+            "n_chunks": self.get_doc_count(),
             "k1": self.k1,
-            "index_path": str(self._index_path) if self._index_path else None,
+            "b": self.b,
+            "chunk": self.chunk,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            "index_dir": str(self._index_dir) if self._index_dir else None,
         }
 
-    # ── Embedding helpers ─────────────────────────────────────────────────
-
     def embed_prompt(self, text: str) -> str:
-        """BM25 uses no prompt templates — returns *text* unchanged.
-
-        Args:
-            text: Query string.
-
-        Returns:
-            The original *text* unmodified.
-        """
         return text
 
     def embed_passage(self, text: str) -> str:
-        """BM25 uses no prompt templates — returns *text* unchanged.
-
-        Args:
-            text: Passage string.
-
-        Returns:
-            The original *text* unmodified.
-        """
         return text

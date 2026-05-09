@@ -28,4 +28,5 @@ langchain_elasticsearch>=0.4.0
 modal>=1.2.6
 faiss_cpu>=1.13.0
 outlines>=1.2.3
-vllm>=0.11.0
+vllm>=0.11.0bm25s>=0.3.8
+PyStemmer>=2.2.0

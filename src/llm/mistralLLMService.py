@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, TypeVar, Type
 
@@ -46,22 +48,36 @@ def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: i
 @app.function(gpu="A10G", image=image, timeout=600, max_containers=2)
 def generate_structured(
     prompts: list[str],
-    schema_class: type[BaseModel],
+    schema_json: str,
     *,
     model_name: str = MODEL_NAME,
     max_new_tokens: int = 256,
-) -> list:
+) -> list[dict]:
+    """Generate structured responses constrained to the given JSON schema.
+
+    Args:
+        prompts: List of prompt strings.
+        schema_json: JSON Schema string (produced via ``Model.model_json_schema()``).
+            Passed as a plain string to avoid deserialisation issues with remote workers
+            that do not have the local ``src`` package available.
+        model_name: HuggingFace model identifier.
+        max_new_tokens: Maximum tokens to generate per prompt.
+
+    Returns:
+        List of dicts matching the supplied JSON schema, one per prompt.
+    """
     import outlines
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from tqdm import tqdm
 
-    model = outlines.from_transformers(
+    llm = outlines.from_transformers(
         AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda"),
         AutoTokenizer.from_pretrained(model_name),
     )
+    generator = outlines.Generator(llm, outlines.json_schema(schema_json))
     results = []
     for prompt in tqdm(prompts, desc="Generating structured responses"):
-        results.append(model(prompt, schema_class, max_new_tokens=max_new_tokens))
+        results.append(generator(prompt, max_new_tokens=max_new_tokens))
     return results
 
 
@@ -104,7 +120,7 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
 
         try:
             for batch_result in tqdm(
-                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True),
+                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True, wrap_returned_exceptions=False),
                 total=len(batched), desc="Generating text (parallel)", unit="batch",
             ):
                 if isinstance(batch_result, Exception):
@@ -123,7 +139,9 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
         return results
 
     def generate_structured(self, prompt: str, schema: Type[T]) -> T:
-        return self.generate_structured_fn.remote([prompt], schema_class=schema, model_name=self.model_name, max_new_tokens=256)[0]
+        schema_json = json.dumps(schema.model_json_schema())
+        raw = self.generate_structured_fn.remote([prompt], schema_json=schema_json, model_name=self.model_name, max_new_tokens=256)[0]
+        return schema.model_validate(raw) if isinstance(raw, dict) else schema.model_validate_json(raw)
 
     def batch_generate_structured(
         self,
@@ -136,28 +154,71 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
             return []
 
         ckpt_path = Path(checkpoint_path) if checkpoint_path else None
-        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
-        pending = prompts[len(completed):]
-        results: list[T] = list(completed)
 
+        # Checkpoint stores raw JSON strings; convert back to model instances on load.
+        raw_completed: list[str] = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        results: list[T] = []
+        for raw in raw_completed:
+            try:
+                results.append(schema.model_validate_json(raw) if isinstance(raw, str) else schema.model_validate(raw))
+            except Exception:
+                break  # Truncated / corrupt entry — regenerate from here
+
+        pending = prompts[len(results):]
         if not pending:
             return results
 
         batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
+        schema_json = json.dumps(schema.model_json_schema())
 
         try:
             for batch_result in tqdm(
-                self.generate_structured_fn.map(batched, kwargs={"schema_class": schema, "model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True),
+                self.generate_structured_fn.map(
+                    batched,
+                    kwargs={"schema_json": schema_json, "model_name": self.model_name, "max_new_tokens": 512},
+                    return_exceptions=True,
+                    wrap_returned_exceptions=False,
+                ),
                 total=len(batched), desc="Generating structured (parallel)", unit="batch",
             ):
                 if isinstance(batch_result, Exception):
                     raise batch_result
-                results.extend(batch_result)
+                for item in batch_result:
+                    results.append(self._parse_structured_item(item, schema))
         except Exception as e:
             logger.error("Mistral batch_generate_structured failed: %s", e)
             if ckpt_path:
-                self._save_checkpoint(ckpt_path, results)
+                # Save as raw JSON strings so _save_checkpoint (string-only) works.
+                raw_results = [
+                    r.model_dump_json() if isinstance(r, BaseModel) else str(r)
+                    for r in results
+                ]
+                self._save_checkpoint(ckpt_path, raw_results)
                 logger.error("Checkpoint saved with %d completed results", len(results))
             raise
 
+        if ckpt_path:
+            raw_results = [
+                r.model_dump_json() if isinstance(r, BaseModel) else str(r)
+                for r in results
+            ]
+            self._save_checkpoint(ckpt_path, raw_results)
+
         return results
+
+    @staticmethod
+    def _parse_structured_item(item: Any, schema: Type[T]) -> T:
+        """Parse a single structured output item, recovering from truncated JSON."""
+        if isinstance(item, dict):
+            return schema.model_validate(item)
+        raw: str = item
+        try:
+            return schema.model_validate_json(raw)
+        except Exception:
+            # Attempt to recover verdict from truncated JSON via regex
+            match = re.search(r'"verdict"\s*:\s*(true|false)', raw, re.IGNORECASE)
+            if match:
+                verdict = match.group(1).lower() == "true"
+                logger.warning("Truncated JSON recovered (verdict=%s): %.80s…", verdict, raw)
+                return schema.model_validate({"verdict": verdict, "reasoning": raw[:200]})
+            raise

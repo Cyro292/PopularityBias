@@ -8,14 +8,14 @@ Import this at the top of every eval notebook with:
 
 It exports:
   - All standard imports (os, Path, pd, np, plt, sns, tqdm, warnings)
-  - Config constants: COLLECTION_NAME, COLLECTION_ROOT, QUESTIONS_PATH,
-    CORPUS_PATH, BACKENDS, ALL_STRATEGIES, TOP_K, K_VALUES_DETAILED,
-    DECILE_MODE, OUTPUT_FOLDER, RESULTS_DIR, GROUP_COL
+  - Config dataclasses: BackendEntry, EvalConfig
+  - Derived constants: ALL_STRATEGIES, RESULTS_DIR, IMAGES_DIR, GROUP_COL,
+    TOP_K, K_VALUES_DETAILED, DECILE_MODE, EXCLUDED_DATASETS
   - Loaded data: results_by_strategy, metrics_by_strategy,
     decile_metrics_by_strategy, boundaries_uw, boundaries_cw, corpus_stats,
     corpus_docs, corpus_chunks, corpus_avg_doc_length, metadata_path
   - Helper functions: pick_group_col, strategy_colors, markers, strategy_label
-  - Metric helper functions: compute_metrics, get_found_rank, get_wrong_pops
+  - Metric helpers: compute_metrics, get_found_rank, get_wrong_pops
 """
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ import json
 import os
 import sys
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -64,48 +65,205 @@ from src.metrics.metrics import (
 load_dotenv()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ── CONFIGURATION — edit here to switch backends / strategies ─────────────
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Map each backend name to the list of strategy keys it produced.
-# Results must exist as:  RESULTS_DIR / f"results_{strategy}.parquet"
-# Remove a backend or strategy by commenting it out.
-BACKENDS: dict[str, list[str]] = {
-    "elasticsearch": ["approximation", "bm25"],
-    "faiss":         ["ivfpq"],
-}
 
-OUTPUT_NAME   = "all_qa_8k"        # Folder name for results (must match indexing output folder)
-COLLECTION_NAME = "wiki_full_bil"
-COLLECTION_ROOT = Path(DATA_DIR) / COLLECTION_NAME
-QUESTIONS_PATH  = COLLECTION_ROOT / "all_qa_8k.parquet"
-CORPUS_PATH     = COLLECTION_ROOT / "wiki_corpus.parquet"
+@dataclass
+class BackendEntry:
+    """One retrieval strategy to load and compare.
 
-TOP_K              = 1
-K_VALUES_DETAILED  = [1, 3, 5, 10]
-DECILE_MODE        = "chunk_weighted"   # "chunk_weighted" or "unweighted"
-OUTPUT_FOLDER      = "all_qa_8k"            # Folder name for storing all results (must match indexing output folder)
-RESULTS_DIR        = COLLECTION_ROOT / OUTPUT_FOLDER
+    Attributes:
+        label:        Human-readable name shown in plots and tables.
+        results_path: Path to the ``results_{key}.parquet`` file produced by
+                      the pipeline.
+        key:          Unique identifier used as the dict key in
+                      ``results_by_strategy`` and for cache filenames.
+                      Defaults to the results parquet stem (e.g. ``"results_ivfpq"``
+                      → ``"ivfpq"``).
+        corpus_path:  Path to the corpus parquet (for doc-length enrichment).
+                      Defaults to ``wiki_corpus.parquet`` alongside results.
+        index_path:   FAISS index directory. Only needed if the notebooks need
+                      to query the index directly.
+
+    Example — two FAISS indexes::
+
+        BackendEntry(
+            label        = "FAISS high-pop",
+            results_path = DATA_DIR / "wiki_full_bil/all_qa_8k/results_ivfpq.parquet",
+            key          = "ivfpq_high",
+            index_path   = DATA_DIR / "wiki_full_bil/faiss_high",
+        ),
+        BackendEntry(
+            label        = "FAISS low-pop",
+            results_path = DATA_DIR / "wiki_full_bil/all_qa_8k/results_ivfpq.parquet",
+            key          = "ivfpq_low",
+            index_path   = DATA_DIR / "wiki_full_bil/faiss_low",
+        ),
+    """
+
+    label:        str
+    results_path: Path
+    key:          str | None  = None
+    corpus_path:  Path | None = None
+    index_path:   Path | None = None
+
+    def __post_init__(self) -> None:
+        self.results_path = Path(self.results_path)
+        if self.key is None:
+            # Strip leading "results_" from stem → e.g. "results_ivfpq" → "ivfpq"
+            stem = self.results_path.stem
+            self.key = stem[len("results_"):] if stem.startswith("results_") else stem
+        if self.corpus_path is None:
+            self.corpus_path = self.results_path.parent.parent / "wiki_corpus.parquet"
+        if self.index_path is not None:
+            self.index_path = Path(self.index_path)
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.corpus_path.parent / "metadata.json"
+
+
+@dataclass
+class EvalConfig:
+    """Top-level evaluation configuration.
+
+    Attributes:
+        backends:          Ordered list of retrieval strategies to compare.
+        results_dir:       Where pipeline outputs and eval results live.
+                           Defaults to the parent folder of the first backend's
+                           results parquet.
+        corpus_root:       Root folder for corpus/boundary metadata loading.
+                           Defaults to the grandparent of the first results parquet.
+        top_k:             Primary recall cut-off used in summary tables.
+        k_values_detailed: All K values computed and plotted.
+        decile_mode:       Popularity-decile weighting scheme.
+        excluded_datasets: Dataset names to drop from all analyses.
+        force_recompute:   Ignore caches and recompute everything from scratch.
+
+    Example::
+
+        _ROOT = DATA_DIR / "wiki_full_bil"
+        _OUT  = _ROOT / "all_qa_8k"
+
+        CFG = EvalConfig(
+            results_dir = _OUT,
+            corpus_root = _ROOT,
+            backends    = [
+                BackendEntry("Dense (ES)",   _OUT / "results_approximation.parquet"),
+                BackendEntry("Sparse (BM25)", _OUT / "results_bm25.parquet"),
+                BackendEntry("FAISS high",   _OUT / "results_ivfpq.parquet",
+                             key="ivfpq_high", index_path=_ROOT / "faiss_high"),
+            ],
+        )
+    """
+
+    backends:    list[BackendEntry] = field(default_factory=list)
+    results_dir: Path | None        = None
+    corpus_root: Path | None        = None
+
+    top_k:             int       = 1
+    k_values_detailed: list[int] = field(default_factory=lambda: [1, 3, 5, 10])
+    decile_mode: Literal["chunk_weighted", "unweighted"] = "chunk_weighted"
+    excluded_datasets: list[str] = field(default_factory=lambda: ["hotpot_qa", "trex"])
+    force_recompute:   bool      = False
+
+    def __post_init__(self) -> None:
+        if not self.backends:
+            raise ValueError("EvalConfig.backends must contain at least one BackendEntry.")
+        if self.results_dir is None:
+            self.results_dir = self.backends[0].results_path.parent
+        if self.corpus_root is None:
+            self.corpus_root = self.backends[0].results_path.parent.parent
+        self.results_dir = Path(self.results_dir)
+        self.corpus_root = Path(self.corpus_root)
+
+    @property
+    def images_dir(self) -> Path:
+        return self.results_dir / "eval_results"
+
+    @property
+    def all_keys(self) -> list[str]:
+        """Unique result keys in declaration order — used as dict keys everywhere."""
+        return [b.key for b in self.backends]
+
+    @property
+    def entry_by_key(self) -> dict[str, BackendEntry]:
+        return {b.key: b for b in self.backends}
+
+    @property
+    def label_by_key(self) -> dict[str, str]:
+        return {b.key: b.label for b in self.backends}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── USER SETTINGS — edit here ─────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ROOT = Path(DATA_DIR) / "wiki_full_bil"
+_OUT  = _ROOT / "all_qa_8k"
+
+CFG = EvalConfig(
+    results_dir = _OUT,
+    corpus_root = _ROOT,
+    backends    = [
+        BackendEntry(
+            label        = "Dense Retrieval (ES approximation)",
+            results_path = _OUT / "results_approximation.parquet",
+        ),
+        BackendEntry(
+            label        = "Sparse Retrieval (BM25)",
+            results_path = _OUT / "results_bm25.parquet",
+        ),
+        BackendEntry(
+            label        = "Dense Retrieval (FAISS high ivfpq)",
+            results_path = _OUT / "results_ivfpq.parquet",
+            index_path   = _ROOT / "faiss_high",
+        ),
+    ],
+    top_k             = 1,
+    k_values_detailed = [1, 3, 5, 10],
+    decile_mode       = "chunk_weighted",
+    excluded_datasets = ["hotpot_qa", "trex"],
+    force_recompute   = False,
+)
+
+# ── Unpack into module-level names (used by notebooks) ────────────────────────
+
+BACKENDS:        list[BackendEntry]      = CFG.backends
+ALL_STRATEGIES:  list[str]              = CFG.all_keys
+_STRATEGY_ENTRY: dict[str, BackendEntry] = CFG.entry_by_key
+_STRATEGY_LABEL: dict[str, str]         = CFG.label_by_key
+
+COLLECTION_ROOT:   Path = CFG.corpus_root
+COLLECTION_NAME:   str  = CFG.corpus_root.name
+QUESTIONS_PATH:    Path = CFG.corpus_root / "all_qa_8k.parquet"
+CORPUS_PATH:       Path = CFG.corpus_root / "wiki_corpus.parquet"
+RESULTS_DIR:       Path = CFG.results_dir
+IMAGES_DIR:        Path = CFG.images_dir
+
+TOP_K:             int       = CFG.top_k
+K_VALUES_DETAILED: list[int] = CFG.k_values_detailed
+DECILE_MODE:       str       = CFG.decile_mode
+EXCLUDED_DATASETS: list[str] = CFG.excluded_datasets
+FORCE_RECOMPUTE:   bool      = CFG.force_recompute
+
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Flat list of all active strategies (order: backend order, then strategy order)
-ALL_STRATEGIES: list[str] = [s for strats in BACKENDS.values() for s in strats]
-
-# Datasets to exclude from all analyses. Set to [] to include everything.
-# Example: ["hotpot_qa", "trex"]
-EXCLUDED_DATASETS: list[str] = ["hotpot_qa", "trex"]
-
-# Set to True to ignore any cached files and recompute everything from scratch.
-FORCE_RECOMPUTE = False
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 _CACHE_DIR = RESULTS_DIR / "_cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+def strategy_label(strategy: str) -> str:
+    """Human-readable label for a strategy key."""
+    return _STRATEGY_LABEL.get(strategy, strategy)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Assign a distinct colour per strategy, respecting legacy names.
 _STRATEGY_COLOR_MAP: dict[str, str] = {
     "approximation": "#3498db",
     "vector":        "#3498db",
@@ -128,20 +286,11 @@ def _assign_colors() -> dict[str, str]:
     return result
 
 strategy_colors: dict[str, str] = _assign_colors()
-
 markers: dict[str, str] = {s: ("o" if i % 2 == 0 else "s") for i, s in enumerate(ALL_STRATEGIES)}
-
-
-def strategy_label(strategy: str) -> str:
-    """Human-readable label: 'backend / strategy'."""
-    for backend, strats in BACKENDS.items():
-        if strategy in strats:
-            return f"{backend} / {strategy}"
-    return strategy
-
 
 # Backward-compatible alias
 _pick_group_col = pick_group_col
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Load boundaries & corpus metadata ────────────────────────────────────────
@@ -171,12 +320,12 @@ decile_col = decile_col_for(DECILE_MODE)
 # ── Cache validity helpers ────────────────────────────────────────────────────
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _cache_is_valid(strategy: str) -> bool:
-    cache_path  = _CACHE_DIR / f"enriched_{strategy}.parquet"
-    source_path = RESULTS_DIR / f"results_{strategy}.parquet"
-    if not cache_path.exists() or not source_path.exists():
+def _cache_is_valid(key: str) -> bool:
+    entry      = _STRATEGY_ENTRY[key]
+    cache_path = _CACHE_DIR / f"enriched_{key}.parquet"
+    if not cache_path.exists() or not entry.results_path.exists():
         return False
-    return cache_path.stat().st_mtime >= source_path.stat().st_mtime
+    return cache_path.stat().st_mtime >= entry.results_path.stat().st_mtime
 
 
 def _metrics_cache_is_valid() -> bool:
@@ -184,8 +333,8 @@ def _metrics_cache_is_valid() -> bool:
     if not cache_path.exists():
         return False
     mtime = cache_path.stat().st_mtime
-    for s in ALL_STRATEGIES:
-        ep = _CACHE_DIR / f"enriched_{s}.parquet"
+    for k in ALL_STRATEGIES:
+        ep = _CACHE_DIR / f"enriched_{k}.parquet"
         if not ep.exists() or ep.stat().st_mtime > mtime:
             return False
     return True
@@ -196,8 +345,8 @@ def _decile_metrics_cache_is_valid() -> bool:
     if not cache_path.exists():
         return False
     mtime = cache_path.stat().st_mtime
-    for s in ALL_STRATEGIES:
-        ep = _CACHE_DIR / f"enriched_{s}.parquet"
+    for k in ALL_STRATEGIES:
+        ep = _CACHE_DIR / f"enriched_{k}.parquet"
         if not ep.exists() or ep.stat().st_mtime > mtime:
             return False
     return True
@@ -208,16 +357,19 @@ def _decile_metrics_cache_is_valid() -> bool:
 
 results_by_strategy: dict[str, pd.DataFrame] = {}
 
-for strategy in ALL_STRATEGIES:
-    source_path = RESULTS_DIR / f"results_{strategy}.parquet"
-    cache_path  = _CACHE_DIR / f"enriched_{strategy}.parquet"
+for _key in ALL_STRATEGIES:
+    entry       = _STRATEGY_ENTRY[_key]
+    source_path = entry.results_path
+    cache_path  = _CACHE_DIR / f"enriched_{_key}.parquet"
+    corpus_path = entry.corpus_path
+    meta_path   = entry.metadata_path
 
     if not source_path.exists():
         print(f"  ⚠ Missing: {source_path.name} — run the pipeline first!")
         continue
 
-    if not FORCE_RECOMPUTE and _cache_is_valid(strategy):
-        print(f"  ✓ {strategy_label(strategy)}: loading from cache")
+    if not FORCE_RECOMPUTE and _cache_is_valid(_key):
+        print(f"  ✓ {strategy_label(_key)}: loading from cache")
         _df_cache = pd.read_parquet(cache_path)
         if EXCLUDED_DATASETS:
             _gc = pick_group_col(_df_cache)
@@ -227,15 +379,15 @@ for strategy in ALL_STRATEGIES:
                 _dropped = _before - len(_df_cache)
                 if _dropped:
                     print(f"    excluded {_dropped:,} rows matching EXCLUDED_DATASETS ({EXCLUDED_DATASETS})")
-        results_by_strategy[strategy] = _df_cache
+        results_by_strategy[_key] = _df_cache
         continue
 
-    print(f"  computing {strategy_label(strategy)}…")
+    print(f"  computing {strategy_label(_key)}…")
     df = pd.read_parquet(source_path)
     print(f"    loaded {len(df):,} rows")
 
     if COL_POPULARITY not in df.columns:
-        raise ValueError(f"{strategy}: missing '{COL_POPULARITY}' column")
+        raise ValueError(f"{_key}: missing '{COL_POPULARITY}' column")
 
     before = len(df)
     df = df.dropna(subset=[COL_POPULARITY]).copy()
@@ -267,7 +419,7 @@ for strategy in ALL_STRATEGIES:
     ).astype(str)
 
     print("    fetching doc lengths via corpus handler…")
-    _corpus_handler = ParquetCorpusHandler(corpus_path=CORPUS_PATH, metadata_path=metadata_path)
+    _corpus_handler = ParquetCorpusHandler(corpus_path=corpus_path, metadata_path=meta_path)
     question_ids_str: list[str] = df["wikipedia_id"].unique().tolist()
     question_ids_int: list[int] = []
     for _wid in question_ids_str:
@@ -297,10 +449,10 @@ for strategy in ALL_STRATEGIES:
             dropped = before - len(df)
             if dropped:
                 print(f"    excluded {dropped:,} rows matching EXCLUDED_DATASETS ({EXCLUDED_DATASETS})")
-    results_by_strategy[strategy] = df
+    results_by_strategy[_key] = df
 
 # Restrict ALL_STRATEGIES to only those that actually loaded
-ALL_STRATEGIES = [s for s in ALL_STRATEGIES if s in results_by_strategy]
+ALL_STRATEGIES = [k for k in ALL_STRATEGIES if k in results_by_strategy]
 
 if not ALL_STRATEGIES:
     raise FileNotFoundError("No retrieval results found! Run the pipeline first.")
@@ -339,7 +491,7 @@ else:
     with open(_metrics_cache_path, "w") as _f:
         json.dump(metrics_by_strategy, _f)
 
-pd.DataFrame(metrics_by_strategy).T.to_csv(RESULTS_DIR / "metrics_comparison.csv")
+pd.DataFrame(metrics_by_strategy).T.to_csv(IMAGES_DIR / "metrics_comparison.csv")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Per-decile metrics ────────────────────────────────────────────────────────
@@ -422,9 +574,10 @@ else:
         )
 
 print(f"\n✓ shared_setup complete — {len(ALL_STRATEGIES)} strategies ready")
-print(f"  Collection : {COLLECTION_NAME}")
+print(f"  Corpus root: {COLLECTION_ROOT}")
 print(f"  Results dir: {RESULTS_DIR}")
-print(f"  Backends   : {BACKENDS}")
-print(f"  Strategies : {ALL_STRATEGIES}")
+for b in BACKENDS:
+    idx = f" → index: {b.index_path}" if b.index_path else ""
+    print(f"    {b.label!r} (key={b.key}){idx}")
 print(f"  Decile mode: {DECILE_MODE}")
 print(f"  Group col  : {GROUP_COL or '(none found)'}")

@@ -57,7 +57,7 @@ from langchain.schema import Document
 from tqdm import tqdm
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from config import DATA_DIR
 from src.rag.faiss_rag_service import FaissRagService, MemoryConfig
@@ -747,6 +747,9 @@ def migrate_with_reembedding(
 
 
 def main():
+    # Use MigrationConfig dataclass defaults as the single source of truth
+    _defaults = MigrationConfig()
+
     parser = argparse.ArgumentParser(
         description="Migrate Elasticsearch index to FAISS",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -756,22 +759,22 @@ def main():
     # Elasticsearch options
     parser.add_argument(
         "--es-url",
-        default=os.getenv("ELASTICSEARCH_ENDPOINT", "http://localhost:9200"),
+        default=_defaults.es_url,
         help="Elasticsearch URL",
     )
     parser.add_argument(
         "--es-index",
-        default="wiki_full_l",
+        default=_defaults.es_index,
         help="Source Elasticsearch index name",
     )
     parser.add_argument(
         "--es-user",
-        default=os.getenv("ELASTICSEARCH_USERNAME"),
+        default=_defaults.es_user,
         help="Elasticsearch username",
     )
     parser.add_argument(
         "--es-password",
-        default=os.getenv("ELASTICSEARCH_PASSWORD"),
+        default=_defaults.es_password,
         help="Elasticsearch password",
     )
 
@@ -779,13 +782,13 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=DATA_DIR / "faiss_migrated",
+        default=_defaults.output_dir,
         help="Output directory for FAISS index",
     )
     parser.add_argument(
         "--strategy",
         choices=["vector", "hnsw", "ivfpq", "opq_ivfpq", "ivfpq_disk"],
-        default="ivfpq",
+        default=_defaults.strategy,
         help="FAISS index strategy",
     )
 
@@ -810,52 +813,52 @@ def main():
     parser.add_argument(
         "--max-ram-mb",
         type=int,
-        default=4096,
+        default=_defaults.max_ram_mb,
         help="Maximum RAM to use in MB",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1000,
+        default=_defaults.batch_size,
         help="Batch size for processing",
     )
 
     # Embedding options
     parser.add_argument(
         "--embedding-provider",
-        default="modal",
+        default=_defaults.embedding_provider,
         choices=["modal", "openai", "huggingface"],
         help="Embedding provider",
     )
     parser.add_argument(
         "--embedding-model",
-        default="intfloat/multilingual-e5-large",
+        default=_defaults.embedding_model,
         help="Embedding model name",
     )
     parser.add_argument(
         "--gpu-batch-size",
         type=int,
-        default=64,
+        default=_defaults.gpu_batch_size,
         help="Forward-pass batch size on GPU (modal provider only). Default: 64",
     )
     parser.add_argument(
         "--request-batch-size",
         type=int,
-        default=100,
+        default=_defaults.request_batch_size,
         help="Number of texts per Modal request batch. Default: 100",
     )
     parser.add_argument(
         "--normalise-embeddings",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_defaults.normalise_embeddings,
         help="Normalise embedding vectors. Default: on",
     )
 
     # IVF_PQ options
-    parser.add_argument("--ivfpq-nlist", type=int, default=4096)
-    parser.add_argument("--ivfpq-m", type=int, default=32)
-    parser.add_argument("--ivfpq-nbits", type=int, default=8)
-    parser.add_argument("--ivfpq-nprobe", type=int, default=64)
+    parser.add_argument("--ivfpq-nlist", type=int, default=_defaults.ivfpq_nlist)
+    parser.add_argument("--ivfpq-m", type=int, default=_defaults.ivfpq_m)
+    parser.add_argument("--ivfpq-nbits", type=int, default=_defaults.ivfpq_nbits)
+    parser.add_argument("--ivfpq-nprobe", type=int, default=_defaults.ivfpq_nprobe)
 
     # Limit options
     parser.add_argument(
@@ -916,13 +919,13 @@ def main():
 
     # Show memory estimates
     service = create_faiss_service(config)
-    estimates = service.estimate_index_memory(total_docs, dim=1024)
+    estimates = service.estimate_index_memory(total_docs, dim=384)
     logger.info("Estimated RAM usage by strategy:")
     for strategy, mb in estimates.items():
         logger.info(f"  {strategy}: {mb:,.0f} MB")
 
     recommended = service.recommend_strategy(
-        total_docs, config.max_ram_mb, dim=1024
+        total_docs, config.max_ram_mb, dim=384
     )
     if recommended != config.strategy:
         logger.warning(
