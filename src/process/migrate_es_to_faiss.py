@@ -13,7 +13,7 @@ memory-efficient FAISS index. It supports:
 Usage:
     # Basic migration (re-embed documents)
     python scripts/migrate_es_to_faiss.py \
-        --es-index wiki_full_l \
+        --es-index wiki_full_bil \
         --output-dir data/faiss_wiki \
         --strategy ivfpq
 
@@ -85,7 +85,7 @@ class MigrationConfig:
     es_url: str = os.getenv("ELASTICSEARCH_ENDPOINT", "http://localhost:9200")
     es_user: str | None = os.getenv("ELASTICSEARCH_USERNAME")
     es_password: str | None = os.getenv("ELASTICSEARCH_PASSWORD")
-    es_index: str = "wiki_full_l"
+    es_index: str = "wiki_full_bil"
 
     # FAISS destination
     output_dir: Path = DATA_DIR / "faiss_migrated"
@@ -110,16 +110,16 @@ class MigrationConfig:
 
     # Migration control
     resume: bool = False
-    checkpoint_every: int = 10_000
+    checkpoint_every: int = 50_000
     deduplicate: bool = True
     skip_docs: int = 0
     max_docs: int | None = None
 
     # IVF_PQ settings (tuned for ~4M docs with 1024-dim vectors)
     ivfpq_nlist: int = 4096
-    ivfpq_m: int = 32  # Must divide embedding dim
+    ivfpq_m: int = 64  # Must divide embedding dim
     ivfpq_nbits: int = 8
-    ivfpq_nprobe: int = 64
+    ivfpq_nprobe: int = 256
 
 
 # === Elasticsearch Export ====================================================

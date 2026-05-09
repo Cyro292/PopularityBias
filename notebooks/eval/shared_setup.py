@@ -75,21 +75,25 @@ BACKENDS: dict[str, list[str]] = {
     "faiss":         ["ivfpq"],
 }
 
-OUTPUT_NAME   = "test_1"
+OUTPUT_NAME   = "all_qa_8k"        # Folder name for results (must match indexing output folder)
 COLLECTION_NAME = "wiki_full_bil"
 COLLECTION_ROOT = Path(DATA_DIR) / COLLECTION_NAME
 QUESTIONS_PATH  = COLLECTION_ROOT / "all_qa_8k.parquet"
 CORPUS_PATH     = COLLECTION_ROOT / "wiki_corpus.parquet"
 
-TOP_K              = 100
+TOP_K              = 1
 K_VALUES_DETAILED  = [1, 3, 5, 10]
 DECILE_MODE        = "chunk_weighted"   # "chunk_weighted" or "unweighted"
-OUTPUT_FOLDER      = "test_1"            # Folder name for storing all results (must match indexing output folder)
+OUTPUT_FOLDER      = "all_qa_8k"            # Folder name for storing all results (must match indexing output folder)
 RESULTS_DIR        = COLLECTION_ROOT / OUTPUT_FOLDER
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Flat list of all active strategies (order: backend order, then strategy order)
 ALL_STRATEGIES: list[str] = [s for strats in BACKENDS.values() for s in strats]
+
+# Datasets to exclude from all analyses. Set to [] to include everything.
+# Example: ["hotpot_qa", "trex"]
+EXCLUDED_DATASETS: list[str] = ["hotpot_qa", "trex"]
 
 # Set to True to ignore any cached files and recompute everything from scratch.
 FORCE_RECOMPUTE = False
@@ -214,7 +218,16 @@ for strategy in ALL_STRATEGIES:
 
     if not FORCE_RECOMPUTE and _cache_is_valid(strategy):
         print(f"  ✓ {strategy_label(strategy)}: loading from cache")
-        results_by_strategy[strategy] = pd.read_parquet(cache_path)
+        _df_cache = pd.read_parquet(cache_path)
+        if EXCLUDED_DATASETS:
+            _gc = pick_group_col(_df_cache)
+            if _gc:
+                _before = len(_df_cache)
+                _df_cache = _df_cache[~_df_cache[_gc].isin(EXCLUDED_DATASETS)].copy()
+                _dropped = _before - len(_df_cache)
+                if _dropped:
+                    print(f"    excluded {_dropped:,} rows matching EXCLUDED_DATASETS ({EXCLUDED_DATASETS})")
+        results_by_strategy[strategy] = _df_cache
         continue
 
     print(f"  computing {strategy_label(strategy)}…")
@@ -276,6 +289,14 @@ for strategy in ALL_STRATEGIES:
 
     df.to_parquet(cache_path, index=False)
     print(f"    cached → {cache_path.name}")
+    if EXCLUDED_DATASETS:
+        _gc = pick_group_col(df)
+        if _gc:
+            before = len(df)
+            df = df[~df[_gc].isin(EXCLUDED_DATASETS)].copy()
+            dropped = before - len(df)
+            if dropped:
+                print(f"    excluded {dropped:,} rows matching EXCLUDED_DATASETS ({EXCLUDED_DATASETS})")
     results_by_strategy[strategy] = df
 
 # Restrict ALL_STRATEGIES to only those that actually loaded

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 ROOT              = Path(__file__).parent.parent
 PAIRS_JSON        = ROOT / "data" / "similarity_pairs.json"
-CORPUS_2026       = ROOT / "data" / "wiki_2026" / "wiki_2026_corpus.parquet"
+CORPUS_2026       = ROOT / "data" / "wiki_2026" / "wiki_2026_corpus_clean.parquet"
 CORPUS_BIL        = ROOT / "data" / "wiki_full_bil" / "wiki_corpus.parquet"
 OUTPUT_PATH       = ROOT / "data" / "similarity_scores.parquet"
 

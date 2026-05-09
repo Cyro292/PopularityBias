@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -204,7 +205,7 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
             return []
 
         ckpt_path = Path(checkpoint_path) if checkpoint_path else None
-        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
+        completed = self._load_structured_checkpoint(ckpt_path, schema) if ckpt_path else []
         pending = prompts[len(completed):]
         results: list[T] = list(completed)  # type: ignore[assignment]
 
@@ -218,6 +219,8 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
                 batch: list[LanguageModelInput] = pending[i : i + batch_size]
                 batch_results = structured_llm.batch(batch)
                 results.extend(batch_results)  # type: ignore[arg-type]
+                if ckpt_path:
+                    self._save_structured_checkpoint(ckpt_path, results)
         except Exception as e:
             from openai import BadRequestError
             if isinstance(e, BadRequestError):
@@ -233,8 +236,42 @@ class OpenAIService(LLMBase):  # type: ignore[misc]  # LLMBase is not generic
                         )
             logger.error("OpenAI batch_generate_structured failed: %s", e)
             if ckpt_path:
-                self._save_checkpoint(ckpt_path, results)  # type: ignore[arg-type]
+                self._save_structured_checkpoint(ckpt_path, results)
                 logger.error("Checkpoint saved with %d completed results", len(results))
             raise
 
         return results  # type: ignore[return-value]
+
+    def _load_structured_checkpoint(self, ckpt_path: Path, schema: Type[T]) -> list[T]:
+        """Load structured results from a JSONL checkpoint, reconstructing Pydantic models."""
+        results: list[T] = []
+        if not ckpt_path or not ckpt_path.exists():
+            return results
+        try:
+            with ckpt_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    data.pop("question_idx", None)
+                    results.append(schema(**data))
+            logger.info("✓ Checkpoint: loaded %d structured results from %s", len(results), ckpt_path.name)
+        except Exception as e:
+            logger.error("Failed to load structured checkpoint %s: %s", ckpt_path, e)
+            return []
+        return results
+
+    def _save_structured_checkpoint(self, ckpt_path: Path, results: list) -> None:
+        """Write structured results to a JSONL checkpoint, serializing Pydantic models."""
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        with ckpt_path.open("w", encoding="utf-8") as fh:
+            for idx, r in enumerate(results):
+                if hasattr(r, "model_dump"):
+                    entry = r.model_dump()
+                elif hasattr(r, "dict"):
+                    entry = r.dict()
+                else:
+                    entry = {"answer": str(r)}
+                entry["question_idx"] = idx
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")

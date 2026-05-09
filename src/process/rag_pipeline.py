@@ -27,6 +27,7 @@ from src.llm.openAi_service import OpenAIService
 from src.llm.modalLLMService import ModalLLMService
 from src.llm.mistralLLMService import MistralLLMService
 from src.llm.qwenLLMService import QwenLLMService
+from src.llm.gptNeo27bLLMService import GPTNeo27bLLMService
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
 from src.rag.faiss_rag_service import FaissRagService
 from src.evaluator.binary_evaluator import BinaryEvaluator
@@ -70,7 +71,9 @@ def save_retrieved_docs_csv(docs: list[list], question_ids: list[str], path: pat
                     row[f"metadata_{key}"] = value
             rows.append(row)
     
-    df = pd.DataFrame(rows)
+    # Always write at least the header so the file is parseable on reload,
+    # even when all doc lists are empty (e.g. zero_shot strategy).
+    df = pd.DataFrame(rows, columns=["question_id", "doc_rank", "page_content"]) if not rows else pd.DataFrame(rows)
     df.to_csv(path, index=False)
     logger.info("Saved %d document rows across %d questions to %s", len(rows), len(docs), path)
 
@@ -93,7 +96,11 @@ def load_retrieved_docs_csv(path: pathlib.Path, question_ids: list[str]):
     
     try:
         df = pd.read_csv(path)
-        
+
+        # Empty checkpoint (e.g. zero_shot with no retrieved docs) — return empty lists
+        if df.empty or "question_id" not in df.columns:
+            return [[] for _ in question_ids]
+
         # Build mapping from question_id to documents
         question_id_to_docs = {}
         for question_id in df["question_id"].unique():
@@ -205,7 +212,7 @@ def should_skip_stage(
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    output_dir: str = "evaluation_results_text-davinci-003_200_exact_match"  # Directory to save evaluation results
+    output_dir: str = "evaluation_results_text_2B_200"  # Directory to save evaluation results
     dataset_names: list[str] = field(default_factory=lambda: ["natural_questions", "trivia_qa", "pop_qa", "fever"])  # List of HuggingFace dataset names to load questions from
     questions_per_decile: int = 200  # Number of questions to sample from each decile (set to -1 for all)
     model_name: str | None = None 
@@ -228,7 +235,7 @@ class PipelineConfig:
     # Restart from a specific stage; all downstream stages are also rerun (cascading).
     # Values: "none" (use all checkpoints), "retrieval", "answers", "evaluation", "all" (full rerun).
     # Any unrecognised value is treated as "none".
-    restart_from: str = "evaluation"  # Stage from which to restart the pipeline (default: "evaluation")
+    restart_from: str = "evaluation"  # Stage from which to restart the pipeline ("none" reuses all checkpoints)
     faiss_index_path: str = "faiss_migrated"  # Subdirectory under DATA_DIR containing the FAISS index
 
 
@@ -287,13 +294,13 @@ def main():
         strategy="ivfpq",
         distance_strategy="cosine",
     )
-    llm_service_2 = QwenLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
-    llm_service = OpenAIService(model_name="text-davinci-003", requests_per_second=10)
+    llm_service = GPTNeo27bLLMService(temperature=0.0, request_batch_size=config.model_request_batch_size)
+    # llm_service = OpenAIService(model_name="text-davinci-003", requests_per_second=10)
 
     llm_evaluation_service = OpenAIService(model_name="gpt-5-nano-2025-08-07", requests_per_second=10)
-    evaluator_2 = BinaryEvaluator(evaluation_service=llm_evaluation_service)
+    evaluator = BinaryEvaluator(evaluation_service=llm_evaluation_service)
 
-    evaluator = SubstringEvaluator()
+    evaluator_2 = SubstringEvaluator()
 
     question_input.load()
     question_data = question_input.get_items()
@@ -301,7 +308,7 @@ def main():
     logger.info("Loaded %d questions", len(question_data))
 
     rag_service.load_index(config.collection_name)
-    rag_service_2.load_index(DATA_DIR / config.faiss_index_path)
+    # rag_service_2.load_index(DATA_DIR / config.faiss_index_path)
 
     for strategy in ["zero_shot", "approximation", "bm25"]:
 

@@ -673,6 +673,7 @@ class FaissRagService(RagService):
         store_lock = threading.Lock()
         training_done = threading.Event()
         pending_index: list[faiss.Index] = []   # holds index before training finishes
+        pending_batches: list[tuple] = []        # batches buffered while IVF trains
 
         def _safe_put(q: queue.Queue, item: Any) -> bool:
             while not cancel.is_set():
@@ -749,6 +750,9 @@ class FaissRagService(RagService):
                                         raw_index = self._setup_ondisk_ivf(raw_index, save_path)
                                 else:
                                     pending_index.append(raw_index)
+                                    pending_batches.append(
+                                        (texts, embeddings, metadatas, batch_rows)
+                                    )
                                     logger.info(
                                         f"[Insert] Accumulating training vectors… "
                                         f"({self._training_vectors_count:,} so far)"
@@ -771,6 +775,9 @@ class FaissRagService(RagService):
                         elif pending_index and not training_done.is_set():
                             has_enough = self._accumulate_training_vectors(embeddings)
                             if not has_enough:
+                                pending_batches.append(
+                                    (texts, embeddings, metadatas, batch_rows)
+                                )
                                 continue  # still collecting
                             self._finalize_training(pending_index[0])
                             training_done.set()
@@ -787,6 +794,16 @@ class FaissRagService(RagService):
                                 index_to_docstore_id={},
                                 normalize_L2=self._normalize_l2,
                             )
+                            # Flush batches that were buffered during training
+                            for p_texts, p_embs, p_metas, p_rows in pending_batches:
+                                self._faiss_store.add_embeddings(
+                                    text_embeddings=list(zip(p_texts, p_embs)),
+                                    metadatas=p_metas,
+                                )
+                                total_chunks += len(p_texts)
+                                rows_processed += p_rows
+                                pbar.update(p_rows)
+                            pending_batches.clear()
 
                         self._faiss_store.add_embeddings(
                             text_embeddings=list(zip(texts, embeddings)),

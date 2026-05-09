@@ -499,7 +499,7 @@ def main() -> None:
         memory_config=MemoryConfig(use_mmap=args.use_mmap),
     )
 
-    store = service.load_faiss_store(index_dir, use_mmap=args.use_mmap)
+    store = service.load_index(index_dir, use_mmap=args.use_mmap)
     if store is None:
         logger.error("Failed to load FAISS index from %s", index_dir)
         sys.exit(1)

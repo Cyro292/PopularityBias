@@ -31,16 +31,18 @@ class BinaryJudgement(BaseModel):
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 _PROMPT_TEMPLATE = """\
-You are a strict relevance judge. Your task is to decide whether a proposed answer \
-adequately addresses the given question.
+You are a strict factual judge. Your task is to decide whether a proposed answer \
+correctly answers the given question, using the gold standard document as the source of truth.
 
 Rules:
-- Answer TRUE if the proposed answer is relevant and directly responsive to the question, \
-even if it is incomplete or partially correct.
-- Answer FALSE if the proposed answer is off-topic, nonsensical, or fails to address \
-the question at all.
-- Do NOT require the proposed answer to be factually correct against the reference answer; \
-judge relevance only.
+- Answer TRUE if the proposed answer is factually correct and directly responsive to the \
+question according to the gold standard document, even if it is incomplete or phrased differently.
+- Answer FALSE if the proposed answer is factually wrong, off-topic, nonsensical, or \
+contradicts the gold standard document.
+- Base your judgement solely on the gold standard document — do not rely on outside knowledge.
+
+Gold standard document:
+{page_content}
 
 Question: {question}
 Proposed answer: {proposed_answer}
@@ -54,19 +56,25 @@ Respond with a JSON object containing:
 # ── Evaluator ─────────────────────────────────────────────────────────────────
 
 class BinaryEvaluator(EvaluatorBase):
-    """LLM-based binary relevance evaluator.
+    """LLM-based binary factual evaluator.
 
     For each :class:`~src.evaluator.base.EvaluationObjects` item, asks an LLM
-    judge whether the *proposed_answer* is relevant to the *question*.  The
-    result is a :class:`~src.evaluator.base.EvaluationResult` whose
-    ``evaluation_score`` is a :class:`bool` (``True`` = relevant,
-    ``False`` = not relevant).
+    judge whether the *proposed_answer* is factually correct given the gold
+    standard document (``page_content``).  The result is a
+    :class:`~src.evaluator.base.EvaluationResult` whose ``evaluation_score``
+    is a :class:`bool` (``True`` = correct, ``False`` = incorrect).
+
+    ``page_content`` on each :class:`~src.evaluator.base.EvaluationObjects`
+    must be non-empty; it is provided automatically by the pipeline when a
+    :class:`~src.corpus_handler.base.CorpusHandler` is supplied to the
+    question handler.
 
     Args:
         evaluation_service: Any :class:`~src.llm.base.LLMBase` implementation
             used to call the LLM judge.
         prompt_template: Optional custom prompt template.  Must contain
-            ``{question}`` and ``{proposed_answer}`` placeholders.
+            ``{page_content}``, ``{question}``, and ``{proposed_answer}``
+            placeholders.
 
     Example::
 
@@ -104,6 +112,7 @@ class BinaryEvaluator(EvaluatorBase):
     def _build_prompt(self, obj: EvaluationObjects) -> str:
         """Render the prompt template for a single evaluation object."""
         return self.prompt_template.format(
+            page_content=obj.page_content,
             question=obj.question,
             proposed_answer=obj.proposed_answer,
         )
@@ -134,6 +143,14 @@ class BinaryEvaluator(EvaluatorBase):
         """
         if not evaluation_objects:
             return []
+
+        missing = sum(1 for obj in evaluation_objects if not obj.page_content)
+        if missing:
+            logger.warning(
+                "%d / %d evaluation objects have empty page_content — "
+                "ensure a CorpusHandler was provided to the question handler.",
+                missing, len(evaluation_objects),
+            )
 
         prompts = [self._build_prompt(obj) for obj in evaluation_objects]
 
