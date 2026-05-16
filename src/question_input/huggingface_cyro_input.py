@@ -144,67 +144,52 @@ class HuggingFaceCyroInput(QuestionInput):
         Returns:
             The path to the written parquet file.
         """
-        # ── Pass 1: stream HF → raw parquet (skipped on cache hit) ───────
+        # ── Pass 1: stream HF → raw parquet ──────────────────────────────
+        # Full re-fetch when force=True.
+        # Incremental fetch when cache exists: only download datasets that are
+        # not already represented in the cached parquet, then append those rows.
+        # Skipped entirely when the cache already contains all requested datasets.
         if not force and self.parquet_path.exists():
-            raw_rows = pq.read_metadata(self.parquet_path).num_rows
-            logger.info(
-                "Pass 1 — cache hit, skipping HuggingFace fetch (%s, %d rows)",
-                self.parquet_path,
-                raw_rows,
-            )
-        else:
-            from datasets import load_dataset, Dataset
+            cached_datasets: set[str] = set()
+            try:
+                cached_datasets = set(
+                    pq.read_table(self.parquet_path, columns=["dataset"])
+                    .column("dataset")
+                    .to_pylist()
+                )
+            except Exception:
+                pass  # schema missing dataset col → treat as empty
 
+            names_to_fetch = (
+                [n for n in self.dataset_names if n not in cached_datasets]
+                if self.datasets_filter is None
+                else [n for n in self.dataset_names if n not in cached_datasets and n in self.datasets_filter]
+            )
+
+            if not names_to_fetch:
+                raw_rows = pq.read_metadata(self.parquet_path).num_rows
+                logger.info(
+                    "Pass 1 — all datasets present in cache, skipping fetch (%s, %d rows)",
+                    self.parquet_path,
+                    raw_rows,
+                )
+            else:
+                logger.info(
+                    "Pass 1 — incremental fetch: cache has %s, fetching missing %s",
+                    sorted(cached_datasets),
+                    names_to_fetch,
+                )
+                self._fetch_datasets(names_to_fetch, append=True)
+        else:
             names_to_fetch = (
                 [n for n in self.dataset_names if n in self.datasets_filter]
                 if self.datasets_filter is not None
                 else self.dataset_names
             )
-
             self.parquet_path.parent.mkdir(parents=True, exist_ok=True)
-            writer: pq.ParquetWriter | None = None
-            total_written = 0
+            self._fetch_datasets(names_to_fetch, append=False)
 
-            try:
-                for name in names_to_fetch:
-                    logger.info("Pass 1 — fetching %s / %s (split=%s)", HF_REPO, name, self.split)
-
-                    ds = load_dataset(
-                        HF_REPO,
-                        name,
-                        split=self.split,
-                        cache_dir=self.cache_dir,
-                        token=self.hf_token,
-                    )
-
-                    if not isinstance(ds, Dataset):
-                        raise ValueError(f"Expected a Dataset for {name!r}, got {type(ds)}")
-                    assert isinstance(ds, Dataset)
-
-                    for batch in ds.data.to_batches(max_chunksize=_BATCH_SIZE):
-                        batch = batch.append_column(
-                            pa.field("dataset", pa.string()),
-                            pa.array([name] * len(batch), type=pa.string()),
-                        )
-
-                        if len(batch) == 0:
-                            continue
-
-                        if writer is None:
-                            writer = pq.ParquetWriter(self.parquet_path, batch.schema)
-                        writer.write_batch(batch)
-                        total_written += len(batch)
-
-                    del ds
-                    gc.collect()
-
-            finally:
-                if writer is not None:
-                    writer.close()
-
-            logger.info("Pass 1 complete — %d raw rows written to %s", total_written, self.parquet_path)
-
-            if total_written == 0:
+            if not self.parquet_path.exists():
                 return self.parquet_path
 
         # ── Pass 2: assign deciles + filter + balance (always runs) ───────
@@ -403,6 +388,75 @@ class HuggingFaceCyroInput(QuestionInput):
         """Return only the question text strings."""
         return [item.question_text for item in self.get_items()]
 
+    def _fetch_datasets(self, names: list[str], *, append: bool) -> None:
+        """Stream *names* from HuggingFace and write (or append) to :attr:`parquet_path`.
+
+        Args:
+            names: Dataset sub-names to fetch.
+            append: When ``True``, new rows are appended to the existing parquet
+                by reading it back and rewriting.  When ``False``, the file is
+                created from scratch (any existing file is overwritten).
+        """
+        from datasets import load_dataset, Dataset
+
+        self.parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        new_batches: list[pa.RecordBatch] = []
+        total_new = 0
+
+        for name in names:
+            logger.info("Pass 1 — fetching %s / %s (split=%s)", HF_REPO, name, self.split)
+            ds = load_dataset(
+                HF_REPO,
+                name,
+                split=self.split,
+                cache_dir=self.cache_dir,
+                token=self.hf_token,
+            )
+            if not isinstance(ds, Dataset):
+                raise ValueError(f"Expected a Dataset for {name!r}, got {type(ds)}")
+
+            for batch in ds.data.to_batches(max_chunksize=_BATCH_SIZE):
+                if len(batch) == 0:
+                    continue
+                batch = batch.append_column(
+                    pa.field("dataset", pa.string()),
+                    pa.array([name] * len(batch), type=pa.string()),
+                )
+                new_batches.append(batch)
+                total_new += len(batch)
+
+            del ds
+            gc.collect()
+
+        if not new_batches:
+            logger.info("Pass 1 — no rows fetched for %s", names)
+            return
+
+        if append and self.parquet_path.exists():
+            existing = pq.read_table(self.parquet_path)
+            schema = existing.schema
+            aligned: list[pa.Table] = [existing]
+            for batch in new_batches:
+                tbl = pa.Table.from_batches([batch])
+                for col in schema.names:
+                    if col not in tbl.schema.names:
+                        tbl = tbl.append_column(col, pa.array([None] * len(tbl), schema.field(col).type))
+                tbl = tbl.select(schema.names)
+                aligned.append(tbl)
+            combined = pa.concat_tables(aligned, promote_options="default")
+        else:
+            schema = new_batches[0].schema
+            combined = pa.Table.from_batches(new_batches, schema=schema)
+
+        tmp = self.parquet_path.with_suffix(".tmp.parquet")
+        pq.write_table(combined, tmp)
+        tmp.replace(self.parquet_path)
+        logger.info(
+            "Pass 1 complete — %d new rows, %d total → %s",
+            total_new, len(combined), self.parquet_path,
+        )
+
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -455,20 +509,24 @@ def _batch_to_items(
         ))
     return items
 
-
 def _balance_by_decile(
     df: "pd.DataFrame",
     target: int | None,
     random_state: int,
 ) -> "pd.DataFrame":
-    """Downsample each decile to *target* (or the smallest decile count)."""
+    """Downsample each decile to *target* (or the smallest decile count).
+
+    Assumes the DataFrame has already been shuffled with the desired seed.
+    Uses :meth:`~pandas.DataFrame.head` rather than
+    :meth:`~pandas.DataFrame.sample` so that increasing *target* simply
+    extends the existing selection instead of producing an entirely different
+    set of rows.
+    """
     import pandas as pd
     n = target or int(df["decile"].value_counts().min())
     parts = []
     for _, group in df.groupby("decile"):
-        if len(group) > n:
-            group = group.sample(n=n, random_state=random_state)
-        parts.append(group)
+        parts.append(group.head(n))
     result = pd.concat(parts, ignore_index=True)
     logger.info("After decile balance (target=%d): %d rows", n, len(result))
     return result
@@ -486,6 +544,12 @@ def _balance_per_dataset(
     source can crowd out the others.  Surplus rows from smaller datasets are
     *not* redistributed — use ``_balance_by_decile`` afterwards to enforce the
     overall per-decile total.
+
+    Assumes the DataFrame has already been shuffled with the desired seed.
+    Uses :meth:`~pandas.DataFrame.head` rather than
+    :meth:`~pandas.DataFrame.sample` so that increasing *target_per_decile*
+    simply extends the existing selection instead of producing entirely
+    different rows.
     """
     import pandas as pd
     dataset_names = df["dataset"].unique().tolist()
@@ -498,7 +562,7 @@ def _balance_per_dataset(
             if target_per_decile is not None:
                 cap = target_per_decile // n_datasets
                 if len(group) > cap:
-                    group = group.sample(n=cap, random_state=random_state)
+                    group = group.head(cap)
             parts.append(group)
 
     result = pd.concat(parts, ignore_index=True)

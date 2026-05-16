@@ -31,57 +31,63 @@ image = (
     .run_function(download_model)
 )
 
-@app.function(gpu="A10G", image=image, timeout=600, max_containers=2)
-def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256) -> list[str]:
+@app.function(gpu="H100", image=image, timeout=600, max_containers=4)
+def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256, gpu_batch_size: int = 32) -> list[str]:
+    import logging
+    import warnings
     from transformers import AutoTokenizer, pipeline
-    from tqdm import tqdm
+
+    # Suppress noisy HuggingFace warnings that clutter Modal logs
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message=".*max_length.*")
+    warnings.filterwarnings("ignore", message=".*generation_config.*")
+    warnings.filterwarnings("ignore", message=".*generation flags.*")
 
     max_input_tokens = 2048 - max_new_tokens  # GPT-Neo max_position_embeddings=2048
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    generator = pipeline("text-generation", model=model_name, tokenizer=tokenizer, device_map="cuda")
-    results = []
-    for prompt in tqdm(prompts, desc="Generating text"):
-        # Truncate by token count — character limits are unreliable
-        token_ids = tokenizer.encode(prompt, truncation=True, max_length=max_input_tokens)
-        truncated = tokenizer.decode(token_ids, skip_special_tokens=True)
-        result = generator(
-            truncated,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-        generated: str = result[0]["generated_text"]  # type: ignore[index]
-        results.append(generated[len(truncated):].strip())
-    return results
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-@app.function(gpu="A10G", image=image, timeout=600, max_containers=2)
-def generate_structured(
-    prompts: list[str],
-    schema_class: type[BaseModel],
-    *,
-    model_name: str = MODEL_NAME,
-    max_new_tokens: int = 256,
-) -> list:
-    import outlines
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from tqdm import tqdm
-
-    model = outlines.from_transformers(
-        AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda"),
-        AutoTokenizer.from_pretrained(model_name),
+    generator = pipeline(
+        "text-generation",
+        model=model_name,
+        tokenizer=tokenizer,
+        device_map="cuda",
+        max_length=max_input_tokens + max_new_tokens,
     )
-    results = []
-    for prompt in tqdm(prompts, desc="Generating structured responses"):
-        results.append(model(prompt, schema_class, max_new_tokens=max_new_tokens))
-    return results
+
+    # Batch-truncate all prompts upfront
+    truncated = [
+        tokenizer.decode(
+            tokenizer.encode(p, truncation=True, max_length=max_input_tokens),
+            skip_special_tokens=True,
+        )
+        for p in prompts
+    ]
+
+    print(f"[neo] generating {len(truncated)} prompts | gpu_batch_size={gpu_batch_size}")
+
+    # Single batched call — H100 processes gpu_batch_size prompts per forward pass
+    results_raw = generator(
+        truncated,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        batch_size=gpu_batch_size,
+        truncation=True,
+    )
+    return [r[0]["generated_text"][len(p):].strip() for r, p in zip(results_raw, truncated)]
 
 
 class GPTNeo27bLLMService(LLMBase):  # type: ignore[misc]
-    def __init__(self, temperature: float = 0.0, request_batch_size: int = 64) -> None:
+    def __init__(self, temperature: float = 0.0, request_batch_size: int = 128, gpu_batch_size: int = 32) -> None:
         super().__init__(model_name=MODEL_NAME, temperature=temperature)
         self._request_batch_size = request_batch_size
+        self._gpu_batch_size = gpu_batch_size
         self.generate_fn = modal.Function.from_name(APP_NAME, "generate")
-        self.generate_structured_fn = modal.Function.from_name(APP_NAME, "generate_structured")
 
     def generate(self, prompt: str) -> str:
         return self.generate_fn.remote([prompt], model_name=self.model_name, max_new_tokens=256)[0]
@@ -104,7 +110,7 @@ class GPTNeo27bLLMService(LLMBase):  # type: ignore[misc]
         if not pending:
             logger.info("✓ All %d prompts already completed (checkpoint fully reused)", len(results))
             return results
-        
+
         if len(completed) != len(prompts):
             logger.warning(
                 "⚠ Checkpoint length mismatch (checkpoint=%d, prompts=%d), generating %d new responses",
@@ -112,15 +118,23 @@ class GPTNeo27bLLMService(LLMBase):  # type: ignore[misc]
             )
 
         batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
+        n_batches = len(batched)
+        logger.info(
+            "→ [neo] dispatching %d prompts across %d Modal batches (request_batch=%d, gpu_batch=%d)",
+            len(pending), n_batches, self._request_batch_size, self._gpu_batch_size,
+        )
 
         try:
-            for batch_result in tqdm(
-                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True, wrap_returned_exceptions=False),
-                total=len(batched), desc="Generating text (parallel)", unit="batch",
-            ):
+            for i, batch_result in enumerate(tqdm(
+                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256, "gpu_batch_size": self._gpu_batch_size}, return_exceptions=True, wrap_returned_exceptions=False),
+                total=n_batches,
+                desc="[neo] Modal batches",
+                unit="batch",
+            )):
                 if isinstance(batch_result, Exception):
                     raise batch_result
                 results.extend(batch_result)
+                logger.info("[neo] batch %d/%d done — %d/%d prompts complete", i + 1, n_batches, len(results), len(prompts))
         except Exception as e:
             logger.error("GPTNeo batch_generate failed: %s", e)
             if ckpt_path:
@@ -136,7 +150,8 @@ class GPTNeo27bLLMService(LLMBase):  # type: ignore[misc]
         return results
 
     def generate_structured(self, prompt: str, schema: T) -> Any:
-        return self.generate_structured_fn.remote([prompt], schema_class=schema, model_name=self.model_name, max_new_tokens=256)[0]
+        raw = self.batch_generate([prompt])[0]
+        return self._parse_structured(raw, schema)
 
     def batch_generate_structured(
         self,
@@ -148,29 +163,14 @@ class GPTNeo27bLLMService(LLMBase):  # type: ignore[misc]
         if not prompts:
             return []
 
-        ckpt_path = Path(checkpoint_path) if checkpoint_path else None
-        completed = self._load_checkpoint(ckpt_path) if ckpt_path else []
-        pending = prompts[len(completed):]
-        results: list[Any] = list(completed)
+        wrapped = [self._structured_prompt(p, schema) for p in prompts]
+        raw_results = self.batch_generate(wrapped, checkpoint_path=checkpoint_path)
 
-        if not pending:
-            return results
-
-        batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
-
-        try:
-            for batch_result in tqdm(
-                self.generate_structured_fn.map(batched, kwargs={"schema_class": schema, "model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True),
-                total=len(batched), desc="Generating structured (parallel)", unit="batch",
-            ):
-                if isinstance(batch_result, Exception):
-                    raise batch_result
-                results.extend(batch_result)
-        except Exception as e:
-            logger.error("GPTNeo batch_generate_structured failed: %s", e)
-            if ckpt_path:
-                self._save_checkpoint(ckpt_path, results)
-                logger.error("Checkpoint saved with %d completed results", len(results))
-            raise
-
+        results: list[Any] = []
+        for raw in raw_results:
+            try:
+                results.append(self._parse_structured(raw, schema))
+            except Exception as e:
+                logger.warning("[neo] structured parse failed, substituting None: %s", e)
+                results.append(None)
         return results

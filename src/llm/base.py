@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Type, TypeVar
 
@@ -34,32 +35,29 @@ class LLMBase:
     def _load_checkpoint(self, ckpt_path: Path, question_ids: list[str] | None = None) -> list[str]:
         """Load completed prompt results from a checkpoint file (.csv or .jsonl).
 
-        Returns a list of result strings in the order they were saved.
-        
+        Returns answers ordered to match *question_ids*.  Any ID not present
+        in the checkpoint gets an empty string placeholder so that the caller
+        can detect gaps via :meth:`_load_checkpoint_map` instead.
+
         Args:
             ckpt_path: Path to checkpoint file.
-            question_ids: Optional list of question IDs to filter and order results.
+            question_ids: Ordered list of all question IDs for this run.
         """
         import pandas as pd
-        
+
         results: list[str] = []
         if not ckpt_path.exists():
             logger.debug("Checkpoint: no checkpoint file at %s", ckpt_path)
             return results
-        
-        # Support both CSV and JSONL formats
+
         if ckpt_path.suffix == ".csv":
             try:
                 df = pd.read_csv(ckpt_path)
                 if "answer" in df.columns and "question_id" in df.columns:
-                    # If question_ids provided, filter and order by them
                     if question_ids is not None:
-                        # Build mapping from question_id to answer
-                        id_to_answer = dict(zip(df["question_id"], df["answer"].fillna("")))
-                        # Return answers in the order of question_ids
-                        results = [id_to_answer.get(qid, "") for qid in question_ids]
+                        id_to_answer = dict(zip(df["question_id"].astype(str), df["answer"].fillna("")))
+                        results = [id_to_answer.get(str(qid), "") for qid in question_ids]
                     else:
-                        # Legacy: sort by question_idx if it exists, otherwise maintain CSV order
                         if "question_idx" in df.columns:
                             df = df.sort_values("question_idx")
                         results = df["answer"].fillna("").tolist()
@@ -71,24 +69,48 @@ class LLMBase:
             except Exception as e:
                 logger.error("Failed to load CSV checkpoint %s: %s", ckpt_path, e)
                 return []
-        
+
         # JSONL format (legacy support)
         with ckpt_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 try:
                     data = json.loads(line.strip())
-                    # Handle both old format (plain string) and new format (dict with 'answer' key)
                     if isinstance(data, dict) and "answer" in data:
                         results.append(data["answer"])
                     elif isinstance(data, str):
                         results.append(data)
                     else:
-                        # Fallback: convert to string
                         results.append(str(data))
                 except Exception:
                     pass
         logger.info("✓ Checkpoint: loaded %d completed results from %s", len(results), ckpt_path.name)
         return results
+
+    def _load_checkpoint_map(self, ckpt_path: Path) -> dict[str, str]:
+        """Load a checkpoint as a ``{question_id: answer}`` mapping.
+
+        Only works for CSV checkpoints that have a ``question_id`` column.
+        Returns an empty dict for JSONL checkpoints or missing files.
+
+        Args:
+            ckpt_path: Path to the checkpoint file.
+
+        Returns:
+            Mapping of question_id (str) → answer (str) for every row that
+            has a non-empty ``question_id``.
+        """
+        import pandas as pd
+
+        if not ckpt_path.exists() or ckpt_path.suffix != ".csv":
+            return {}
+        try:
+            df = pd.read_csv(ckpt_path)
+            if "answer" not in df.columns or "question_id" not in df.columns:
+                return {}
+            return dict(zip(df["question_id"].astype(str), df["answer"].fillna("")))
+        except Exception as e:
+            logger.error("Failed to load checkpoint map from %s: %s", ckpt_path, e)
+            return {}
 
     def _save_checkpoint(self, ckpt_path: Path, results: list[str], question_ids: list[str] | None = None) -> None:
         """Write all completed results to a checkpoint file (.csv or .jsonl).
@@ -148,3 +170,70 @@ class LLMBase:
         checkpoint_path: str | Path | None = None,
     ) -> list[T]:
         raise NotImplementedError("batch_generate_structured is not implemented")
+
+    # ── Shared structured-output helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _structured_prompt(prompt: str, schema: Type[T]) -> str:
+        """Append a JSON-format instruction to *prompt* so plain-text models
+        can produce structured output without constrained decoding.
+
+        Args:
+            prompt: The base prompt text.
+            schema: Pydantic model whose JSON schema describes the expected output.
+
+        Returns:
+            The prompt with a JSON instruction appended.
+        """
+        schema_str = json.dumps(schema.model_json_schema(), indent=2)
+        return (
+            f"{prompt}\n\n"
+            f"Respond with a JSON object matching this schema:\n{schema_str}\n"
+            f"Output only valid JSON, no extra text."
+        )
+
+    @staticmethod
+    def _parse_structured(raw: str, schema: Type[T]) -> T:
+        """Parse *raw* LLM output into a *schema* instance.
+
+        Tries strict JSON parsing first, then falls back to extracting the
+        first JSON object found in the text, then to field-level regex for
+        boolean ``verdict`` fields.
+
+        Args:
+            raw: Raw string returned by the LLM.
+            schema: Pydantic model to validate against.
+
+        Returns:
+            A validated *schema* instance.
+
+        Raises:
+            ValueError: If all parsing strategies fail.
+        """
+        # 1. Strict parse
+        try:
+            return schema.model_validate_json(raw)
+        except Exception:
+            pass
+
+        # 2. Extract first {...} block
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                return schema.model_validate_json(match.group(0))
+            except Exception:
+                pass
+
+        # 3. Regex fallback for verdict/reasoning fields (binary evaluator)
+        verdict_match = re.search(r'"verdict"\s*:\s*(true|false)', raw, re.IGNORECASE)
+        if verdict_match:
+            verdict = verdict_match.group(1).lower() == "true"
+            reasoning_match = re.search(r'"reasoning"\s*:\s*"([^"]*)"', raw)
+            reasoning = reasoning_match.group(1) if reasoning_match else raw[:200]
+            logger.warning("JSON parse fell back to regex (verdict=%s): %.80s…", verdict, raw)
+            try:
+                return schema.model_validate({"verdict": verdict, "reasoning": reasoning})
+            except Exception:
+                pass
+
+        raise ValueError(f"Could not parse structured output: {raw[:300]}")

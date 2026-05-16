@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, TypeVar, Type
 
@@ -29,64 +28,46 @@ def download_model() -> None:
 app = modal.App(APP_NAME)
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("transformers[torch]", "accelerate", "huggingface_hub", "pydantic", "tqdm", "outlines")
+    .pip_install("transformers[torch]", "accelerate", "huggingface_hub", "pydantic", "tqdm")
     .run_function(download_model)
 )
 
-@app.function(gpu="A10G", image=image, timeout=600, max_containers=2)
-def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256) -> list[str]:
-    from transformers import pipeline
-    from tqdm import tqdm
+@app.function(gpu="H100", image=image, timeout=600, max_containers=4)
+def generate(prompts: list[str], model_name: str = MODEL_NAME, max_new_tokens: int = 256, gpu_batch_size: int = 4) -> list[str]:
+    import warnings
+    from transformers import AutoTokenizer, pipeline
 
-    chatbot = pipeline("text-generation", model=model_name, device_map="cuda", max_new_tokens=max_new_tokens)
-    results = []
-    for prompt in tqdm(prompts, desc="Generating text"):
-        result = chatbot([{"role": "user", "content": prompt}])
-        results.append(result[0]["generated_text"][-1]["content"])  # type: ignore[index]
-    return results
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message=".*max_length.*")
+    warnings.filterwarnings("ignore", message=".*generation_config.*")
+    warnings.filterwarnings("ignore", message=".*generation flags.*")
 
-@app.function(gpu="A10G", image=image, timeout=600, max_containers=2)
-def generate_structured(
-    prompts: list[str],
-    schema_json: str,
-    *,
-    model_name: str = MODEL_NAME,
-    max_new_tokens: int = 256,
-) -> list[dict]:
-    """Generate structured responses constrained to the given JSON schema.
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    Args:
-        prompts: List of prompt strings.
-        schema_json: JSON Schema string (produced via ``Model.model_json_schema()``).
-            Passed as a plain string to avoid deserialisation issues with remote workers
-            that do not have the local ``src`` package available.
-        model_name: HuggingFace model identifier.
-        max_new_tokens: Maximum tokens to generate per prompt.
-
-    Returns:
-        List of dicts matching the supplied JSON schema, one per prompt.
-    """
-    import outlines
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from tqdm import tqdm
-
-    llm = outlines.from_transformers(
-        AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda"),
-        AutoTokenizer.from_pretrained(model_name),
+    chatbot = pipeline(
+        "text-generation",
+        model=model_name,
+        tokenizer=tokenizer,
+        device_map="cuda",
+        max_new_tokens=max_new_tokens,
     )
-    generator = outlines.Generator(llm, outlines.json_schema(schema_json))
-    results = []
-    for prompt in tqdm(prompts, desc="Generating structured responses"):
-        results.append(generator(prompt, max_new_tokens=max_new_tokens))
-    return results
+
+    messages = [[{"role": "user", "content": p}] for p in prompts]
+    print(f"[mistral] generating {len(messages)} prompts | gpu_batch_size={gpu_batch_size}")
+
+    results_raw = chatbot(messages, batch_size=gpu_batch_size)
+    return [r[0]["generated_text"][-1]["content"] for r in results_raw]
 
 
 class MistralLLMService(LLMBase):  # type: ignore[misc]
-    def __init__(self, temperature: float = 0.0, request_batch_size: int = 64) -> None:
+    def __init__(self, temperature: float = 0.0, request_batch_size: int = 64, gpu_batch_size: int = 4) -> None:
         super().__init__(model_name=MODEL_NAME, temperature=temperature)
         self._request_batch_size = request_batch_size
+        self._gpu_batch_size = gpu_batch_size
         self.generate_fn = modal.Function.from_name(APP_NAME, "generate")
-        self.generate_structured_fn = modal.Function.from_name(APP_NAME, "generate_structured")
 
     def generate(self, prompt: str) -> str:
         return self.generate_fn.remote([prompt], model_name=self.model_name, max_new_tokens=256)[0]
@@ -109,7 +90,7 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
         if not pending:
             logger.info("✓ All %d prompts already completed (checkpoint fully reused)", len(results))
             return results
-        
+
         if len(completed) != len(prompts):
             logger.warning(
                 "⚠ Checkpoint length mismatch (checkpoint=%d, prompts=%d), generating %d new responses",
@@ -117,15 +98,23 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
             )
 
         batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
+        n_batches = len(batched)
+        logger.info(
+            "→ [mistral] dispatching %d prompts across %d Modal batches (request_batch=%d, gpu_batch=%d)",
+            len(pending), n_batches, self._request_batch_size, self._gpu_batch_size,
+        )
 
         try:
-            for batch_result in tqdm(
-                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256}, return_exceptions=True, wrap_returned_exceptions=False),
-                total=len(batched), desc="Generating text (parallel)", unit="batch",
-            ):
+            for i, batch_result in enumerate(tqdm(
+                self.generate_fn.map(batched, kwargs={"model_name": self.model_name, "max_new_tokens": 256, "gpu_batch_size": self._gpu_batch_size}, return_exceptions=True, wrap_returned_exceptions=False),
+                total=n_batches,
+                desc="[mistral] Modal batches",
+                unit="batch",
+            )):
                 if isinstance(batch_result, Exception):
                     raise batch_result
                 results.extend(batch_result)
+                logger.info("[mistral] batch %d/%d done — %d/%d prompts complete", i + 1, n_batches, len(results), len(prompts))
         except Exception as e:
             logger.error("Mistral batch_generate failed: %s", e)
             if ckpt_path:
@@ -135,13 +124,14 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
 
         if ckpt_path:
             self._save_checkpoint(ckpt_path, results, question_ids)
+            logger.info("✓ Checkpoint saved with %d completed results", len(results))
 
         return results
 
     def generate_structured(self, prompt: str, schema: Type[T]) -> T:
-        schema_json = json.dumps(schema.model_json_schema())
-        raw = self.generate_structured_fn.remote([prompt], schema_json=schema_json, model_name=self.model_name, max_new_tokens=256)[0]
-        return schema.model_validate(raw) if isinstance(raw, dict) else schema.model_validate_json(raw)
+        wrapped = self._structured_prompt(prompt, schema)
+        raw = self.generate_fn.remote([wrapped], model_name=self.model_name, max_new_tokens=512)[0]
+        return self._parse_structured(raw, schema)
 
     def batch_generate_structured(
         self,
@@ -153,72 +143,16 @@ class MistralLLMService(LLMBase):  # type: ignore[misc]
         if not prompts:
             return []
 
-        ckpt_path = Path(checkpoint_path) if checkpoint_path else None
+        wrapped = [self._structured_prompt(p, schema) for p in prompts]
+        raw_results = self.batch_generate(wrapped, checkpoint_path=checkpoint_path)
 
-        # Checkpoint stores raw JSON strings; convert back to model instances on load.
-        raw_completed: list[str] = self._load_checkpoint(ckpt_path) if ckpt_path else []
         results: list[T] = []
-        for raw in raw_completed:
+        for raw in raw_results:
             try:
-                results.append(schema.model_validate_json(raw) if isinstance(raw, str) else schema.model_validate(raw))
-            except Exception:
-                break  # Truncated / corrupt entry — regenerate from here
-
-        pending = prompts[len(results):]
-        if not pending:
-            return results
-
-        batched = [pending[i:i + self._request_batch_size] for i in range(0, len(pending), self._request_batch_size)]
-        schema_json = json.dumps(schema.model_json_schema())
-
-        try:
-            for batch_result in tqdm(
-                self.generate_structured_fn.map(
-                    batched,
-                    kwargs={"schema_json": schema_json, "model_name": self.model_name, "max_new_tokens": 512},
-                    return_exceptions=True,
-                    wrap_returned_exceptions=False,
-                ),
-                total=len(batched), desc="Generating structured (parallel)", unit="batch",
-            ):
-                if isinstance(batch_result, Exception):
-                    raise batch_result
-                for item in batch_result:
-                    results.append(self._parse_structured_item(item, schema))
-        except Exception as e:
-            logger.error("Mistral batch_generate_structured failed: %s", e)
-            if ckpt_path:
-                # Save as raw JSON strings so _save_checkpoint (string-only) works.
-                raw_results = [
-                    r.model_dump_json() if isinstance(r, BaseModel) else str(r)
-                    for r in results
-                ]
-                self._save_checkpoint(ckpt_path, raw_results)
-                logger.error("Checkpoint saved with %d completed results", len(results))
-            raise
-
-        if ckpt_path:
-            raw_results = [
-                r.model_dump_json() if isinstance(r, BaseModel) else str(r)
-                for r in results
-            ]
-            self._save_checkpoint(ckpt_path, raw_results)
-
+                results.append(self._parse_structured(raw, schema))
+            except Exception as e:
+                logger.warning("[mistral] structured parse failed, substituting None: %s", e)
+                results.append(None)
         return results
 
-    @staticmethod
-    def _parse_structured_item(item: Any, schema: Type[T]) -> T:
-        """Parse a single structured output item, recovering from truncated JSON."""
-        if isinstance(item, dict):
-            return schema.model_validate(item)
-        raw: str = item
-        try:
-            return schema.model_validate_json(raw)
-        except Exception:
-            # Attempt to recover verdict from truncated JSON via regex
-            match = re.search(r'"verdict"\s*:\s*(true|false)', raw, re.IGNORECASE)
-            if match:
-                verdict = match.group(1).lower() == "true"
-                logger.warning("Truncated JSON recovered (verdict=%s): %.80s…", verdict, raw)
-                return schema.model_validate({"verdict": verdict, "reasoning": raw[:200]})
-            raise
+

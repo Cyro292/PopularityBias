@@ -155,12 +155,20 @@ class BinaryEvaluator(EvaluatorBase):
         prompts = [self._build_prompt(obj) for obj in evaluation_objects]
 
         try:
-            judgements = self.evaluation_service.batch_generate_structured(
-                prompts, BinaryJudgement, checkpoint_path=checkpoint_path
+            raw_texts = self.evaluation_service.batch_generate(
+                prompts, checkpoint_path=checkpoint_path
             )
         except Exception as e:
-            logger.error("batch_generate_structured failed: %s", e)
+            logger.error("batch_generate failed: %s", e)
             raise
+
+        judgements: list[BinaryJudgement] = []
+        for raw in raw_texts:
+            try:
+                judgements.append(self.evaluation_service._parse_structured(raw, BinaryJudgement))
+            except Exception as e:
+                logger.warning("Failed to parse judgement, defaulting to False: %s", e)
+                judgements.append(BinaryJudgement(verdict=False, reasoning="parse error"))
 
         results: list[EvaluationResult] = []
         for obj, judgement in zip(evaluation_objects, judgements):
