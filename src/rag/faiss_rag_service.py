@@ -896,13 +896,13 @@ class FaissRagService(RagService):
     def load_index(
         self,
         path_or_name: str | Path,
-        *,
         use_mmap: bool | None = None,
+        docstore_path: str | Path | None = None,
         **kwargs: Any,
     ) -> FAISS:
-        """Load a FAISS index from *path_or_name*.
+        """Load a saved FAISS index from disk.
 
-        Expects a directory with the layout::
+         Expects a directory with the layout::
 
             <path>/faiss/index.faiss
             <path>/faiss/docstore.sqlite
@@ -911,6 +911,11 @@ class FaissRagService(RagService):
             path_or_name: Root directory of the saved index.
             use_mmap: If ``True``, memory-map the index file.  Defaults to
                 ``self.memory_config.use_mmap``.
+            docstore_path: Optional override for the SQLite docstore file.
+                Useful when the docstore lives in a different directory (e.g.
+                ``ivfpq_low`` sharing ``faiss_high``'s docstore after the
+                low-index copy was deleted).  When ``None``, defaults to
+                ``<path>/faiss/docstore.sqlite``.
             **kwargs: Ignored.
 
         Returns:
@@ -923,7 +928,7 @@ class FaissRagService(RagService):
         path = Path(path_or_name)
         faiss_dir = path / "faiss"
         faiss_file = faiss_dir / "index.faiss"
-        db_file    = faiss_dir / "docstore.sqlite"
+        db_file    = Path(docstore_path) if docstore_path is not None else faiss_dir / "docstore.sqlite"
 
         if not faiss_dir.exists():
             raise FileNotFoundError(f"FAISS index directory not found: {faiss_dir}")

@@ -217,30 +217,25 @@ CFG = EvalConfig(
             results_path = _OUT / "retrieved_docs_es_approx.csv",
         ),
         BackendEntry(
-            label        = "Sparse Retrieval (BM25 elasticsearch)",
-            results_path = _OUT / "retrieved_docs_bm25.csv",
-        ),
-        BackendEntry(
-            label        = "Sparse Retrieval (BM25 lucerne)",
-            results_path = _OUT / "retrieved_docs_bm25_naive.csv",
+            label        = "Hybrid Retrieval (ES dense + BM25)",
+            results_path = _OUT / "retrieved_docs_es_hybrid.csv",
         ),
         BackendEntry(
             label        = "Sparse Retrieval (BM25 plus)",
             results_path = _OUT / "retrieved_docs_bm25_plus.csv",
         ),
         BackendEntry(
-            label        = "Sparse Retrieval (BM25 plus no length norm)",
-            results_path = _OUT / "retrieved_docs_bm25_plus_nolen.csv",
-        ),
-        BackendEntry(
-            label        = "Dense Retrieval (FAISS low ivfpq)",
-            results_path = _OUT / "retrieved_docs_ivfpq_low.csv",
-            index_path   = _ROOT / "faiss_low",
-        ),
-        BackendEntry(
             label        = "Dense Retrieval (FAISS high ivfpq)",
             results_path = _OUT / "retrieved_docs_ivfpq_high.csv",
             index_path   = _ROOT / "faiss_high",
+        ),
+        BackendEntry(
+            label        = "Router (popularity-aware)",
+            results_path = _OUT / "retrieved_docs_router.csv",
+        ),
+        BackendEntry(
+            label        = "Router ES (popularity-aware)",
+            results_path = _OUT / "retrieved_docs_router_es.csv",
         ),
     ],
     top_k             = 10,
@@ -298,6 +293,8 @@ _STRATEGY_COLOR_MAP: dict[str, str] = {
     "approximation":    "#2563EB",  # strong blue
     "vector":           "#2563EB",
     "es_approx":        "#2563EB",
+    # ── Hybrid ES ─────────────────────────────────────────────────────────────
+    "es_hybrid":        "#059669",  # emerald green
     # ── Sparse ES ─────────────────────────────────────────────────────────────
     "bm25":             "#DC2626",  # strong red
     # ── Sparse native (bm25s) ─────────────────────────────────────────────────
@@ -314,6 +311,9 @@ _STRATEGY_COLOR_MAP: dict[str, str] = {
     "hybrid":           "#16A34A",  # green
     # ── Zero-shot ─────────────────────────────────────────────────────────────
     "zero_shot":        "#6B7280",  # neutral grey
+    # ── Router ────────────────────────────────────────────────────────────────
+    "router":           "#EC4899",  # pink — distinct from all backend families
+    "router_es":        "#BE185D",  # dark pink — ES variant of router
 }
 
 _FALLBACK_COLORS = [

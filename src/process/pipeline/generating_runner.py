@@ -1,10 +1,10 @@
 """Generating runner — Stage 2 of the RAG evaluation pipeline.
 
 Picks up ``retrieved_docs_<key>.csv`` checkpoints written by
-:mod:`src.process.retrieval.retrieval_runner`, generates an answer for each
+:mod:`src.process.pipeline.retrieval_runner`, generates an answer for each
 question using the configured LLM, and saves ``answer_checkpoint_<key>.csv``.
 
-The next stage (:mod:`src.process.retrieval.llm_eval_runner`) picks those up.
+The next stage (:mod:`src.process.pipeline.llm_eval_runner`) picks those up.
 
 Checkpoint behaviour
 --------------------
@@ -17,9 +17,9 @@ Usage
 -----
 ::
 
-    python -m src.process.retrieval.generating_runner
-    python -m src.process.retrieval.generating_runner --restart
-    python -m src.process.retrieval.generating_runner --help
+    python -m src.process.pipeline.generating_runner
+    python -m src.process.pipeline.generating_runner --restart
+    python -m src.process.pipeline.generating_runner --help
 """
 
 from __future__ import annotations
@@ -52,13 +52,13 @@ from config import DATA_DIR
 from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
 from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.llm.base import LLMBase
-from src.process.retrieval.retrieval_runner import (
+from src.process.pipeline.retrieval_runner import (
     RetrievalConfig,
     RetrievalRunner,
     load_retrieved_docs_csv,
     save_retrieved_docs_csv,
 )
-from src.process.retrieval.latency_utils import time_batch, save_latency
+from src.process.pipeline.latency_utils import time_batch, save_latency
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,11 +136,15 @@ class GeneratingConfig:
     ])
     backends:           list[GenerationBackend] = field(default_factory=lambda: [
         GenerationBackend(key="zero_shot"),
+        GenerationBackend(key="es_approx"),
+        GenerationBackend(key="es_hybrid"),
         GenerationBackend(key="bm25_plus"),
-        GenerationBackend(key="ivfpq_low"),
         GenerationBackend(key="ivfpq_high"),
+        GenerationBackend(key="router"),
+        GenerationBackend(key="router_es"),
+        GenerationBackend(key="faiss_hybrid"),
     ])
-    context_sizes:      list[int]               = field(default_factory=lambda: [1, 3])
+    context_sizes:      list[int]               = field(default_factory=lambda: [3])
     prompt_template:    str                     = (
         "Documents: {documents}\n \n \n Question: {question}"
     )

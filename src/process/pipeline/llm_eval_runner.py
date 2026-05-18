@@ -1,7 +1,7 @@
 """LLM eval runner — Stage 3 (final) of the RAG evaluation pipeline.
 
 Picks up ``answer_checkpoint_{llm_key}_{retrieval_key}_top{n}.csv`` files
-written by :mod:`src.process.retrieval.generating_runner`, evaluates each
+written by :mod:`src.process.pipeline.generating_runner`, evaluates each
 proposed answer with a judge LLM, and writes
 ``results_{llm_key}_{retrieval_key}_top{n}.parquet`` files consumed by the
 eval notebooks.
@@ -17,9 +17,9 @@ Usage
 -----
 ::
 
-    python -m src.process.retrieval.llm_eval_runner
-    python -m src.process.retrieval.llm_eval_runner --restart
-    python -m src.process.retrieval.llm_eval_runner --help
+    python -m src.process.pipeline.llm_eval_runner
+    python -m src.process.pipeline.llm_eval_runner --restart
+    python -m src.process.pipeline.llm_eval_runner --help
 """
 
 from __future__ import annotations
@@ -55,13 +55,13 @@ from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.evaluator.binary_evaluator import BinaryEvaluator
 from src.evaluator.substring_evaluator import SubstringEvaluator
 from src.evaluator.base import EvaluationObjects, EvaluationResult, EvaluatorBase
-from src.process.retrieval.retrieval_runner import (
+from src.process.pipeline.retrieval_runner import (
     RetrievalConfig,
     RetrievalRunner,
     load_retrieved_docs_csv,
     save_retrieved_docs_csv,
 )
-from src.process.retrieval.generating_runner import (
+from src.process.pipeline.generating_runner import (
     GeneratingConfig,
     GenerationBackend,
     LLMBackend,
@@ -104,7 +104,7 @@ class EvalBackend:
 class EvalConfig:
     """Configuration for the evaluation stage (Stage 3).
 
-    Mirrors :class:`~src.process.retrieval.generating_runner.GeneratingConfig`
+    Mirrors :class:`~src.process.pipeline.generating_runner.GeneratingConfig`
     so you select the exact same (model, backend, context_size) combinations
     that were generated.
 
@@ -123,11 +123,10 @@ class EvalConfig:
 
     generating:    GeneratingConfig        = None   # type: ignore[assignment]
     models:        list[str]               = field(default_factory=lambda: ["neo", "qwen"])
-    backends:      list[str]               = field(default_factory=lambda: ["zero_shot", "bm25_plus", "ivfpq_low", "ivfpq_high"])
-    context_sizes: list[int]               = field(default_factory=lambda: [1, 3])
+    backends:      list[str]               = field(default_factory=lambda: ["zero_shot", "bm25_plus", "ivfpq_high", "es_approx", "es_hybrid", "router", "router_es", "faiss_hybrid"])
+    context_sizes: list[int]               = field(default_factory=lambda: [3])
     evaluators:    list[EvalBackend]       = field(default_factory=lambda: [
-        # EvalBackend(key="substring", type="substring"),
-        EvalBackend(key="binary_mistral", type="binary", llm_type="mistral"),
+        EvalBackend(key="substring", type="substring"),
     ])
     restart:       bool                    = False
 

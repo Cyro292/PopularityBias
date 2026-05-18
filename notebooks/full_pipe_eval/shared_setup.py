@@ -61,9 +61,9 @@ FORCE_RECOMPUTE: bool = False
 # LLM models, retrieval backends, context labels, and evaluator keys that were
 # produced by llm_eval_runner.  Adjust to match what you actually ran.
 LLM_KEYS:       list[str] = ["neo", "qwen"]
-BACKEND_KEYS:   list[str] = ["zero_shot", "bm25_plus", "ivfpq_low", "ivfpq_high"]
+BACKEND_KEYS:   list[str] = ["zero_shot", "bm25_plus", "ivfpq_high", "router"]
 CTX_LABELS:     list[str] = ["zero", "top1", "top3"]   # "zero" for zero_shot
-EVALUATOR_KEYS: list[str] = ["substring", "binary_mistral"]
+EVALUATOR_KEYS: list[str] = ["substring"]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Derived paths ─────────────────────────────────────────────────────────────
@@ -145,9 +145,12 @@ ALL_ENTRIES: list[RunEntry] = [
 
 _BACKEND_COLORS: dict[str, str] = {
     "zero_shot":  "#6B7280",
-    "bm25_plus":  "#3B82F6",
-    "ivfpq_low":  "#10B981",
-    "ivfpq_high": "#F59E0B",
+    "es_approx":  "#2563EB",
+    "es_hybrid":  "#059669",
+    "bm25_plus":  "#D97706",
+    "ivfpq_high": "#0D9488",
+    "router":     "#EC4899",
+    "router_es":  "#BE185D",
 }
 _LLM_COLORS: dict[str, str] = {
     "neo":  "#8B5CF6",

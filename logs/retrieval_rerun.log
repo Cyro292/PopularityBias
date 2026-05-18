@@ -1,0 +1,55 @@
+03:20:17 INFO     datasets — PyTorch version 2.8.0 available.
+03:20:18 INFO     faiss.loader — Loading faiss.
+03:20:18 INFO     faiss.loader — Successfully loaded faiss.
+/Users/cyro/Documents/VSC/PopularityBias/src/storage/sqlite_docstore.py:11: LangChainDeprecationWarning: Importing AddableMixin from langchain.docstore is deprecated. Please replace deprecated imports:
+
+>> from langchain.docstore import AddableMixin
+
+with new imports of:
+
+>> from langchain_community.docstore.base import AddableMixin
+You can use the langchain cli to **automatically** upgrade many imports. Please see documentation here <https://python.langchain.com/docs/versions/v0_2/>
+  from langchain.docstore.base import AddableMixin
+03:20:18 INFO     src.question_input.huggingface_cyro_input — Pass 1 — all datasets present in cache, skipping fetch (/Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/all_qa_8k/cyro_qa_cache.parquet, 7383 rows)
+03:20:18 INFO     src.question_input.huggingface_cyro_input — Pass 2 — starting (decile_mode=chunk_weighted, balance_deciles=True, target_per_decile=800, balance_datasets=True)
+03:20:18 INFO     src.question_input.huggingface_cyro_input — Pass 2 — loaded 7383 rows from parquet
+03:20:18 INFO     src.corpus_handler.parquet_corpus_handler — Loading decile boundaries from /Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/metadata.json
+03:20:18 INFO     src.question_input.huggingface_cyro_input — Pass 2 — building popularity lookup from corpus…
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — popularity lookup: 6810 / 6810 QA ids matched
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — balancing column: pop_decile_chunk_weighted
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — pre-balance decile distribution (unweighted):     {0: 117, 1: 152, 2: 238, 3: 330, 4: 521, 5: 576, 6: 749, 7: 908, 8: 1217, 9: 2575}
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — pre-balance decile distribution (chunk_weighted): {0: 490, 1: 635, 2: 750, 3: 779, 4: 781, 5: 777, 6: 788, 7: 793, 8: 795, 9: 795}
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — 7383 rows total before balancing
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — shuffled 7383 rows (random_state=42)
+03:20:21 INFO     src.question_input.huggingface_cyro_input — After dataset balance (cap=800//6 per dataset per decile): 7383 rows
+03:20:21 INFO     src.question_input.huggingface_cyro_input — After decile balance (target=800): 7383 rows
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 — final decile distribution (pop_decile_chunk_weighted): {0: 490, 1: 635, 2: 750, 3: 779, 4: 781, 5: 777, 6: 788, 7: 793, 8: 795, 9: 795}
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Pass 2 complete — 7383 rows total
+03:20:21 INFO     src.question_input.huggingface_cyro_input — Saved to /Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/all_qa_8k/cyro_qa_cache.parquet
+03:20:42 INFO     __main__ — Loaded 7383 questions
+03:20:42 INFO     __main__ — ⚙ [bm25_plus] Pre-loading sub-backend for router…
+03:20:43 INFO     src.rag.bm25_rag_service — Loading BM25 index from /Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/bm25_bm25plus …
+03:20:50 INFO     root — Closed file and mmap objects
+03:20:51 INFO     root — Opened file and mmap objects
+03:20:51 INFO     src.rag.bm25_rag_service — BM25 index loaded
+03:20:51 INFO     __main__ — ⚙ [ivfpq_high] Pre-loading sub-backend for router…
+03:20:52 INFO     sentence_transformers.SentenceTransformer — Use pytorch device_name: mps
+03:20:52 INFO     sentence_transformers.SentenceTransformer — Load pretrained SentenceTransformer: Lajavaness/bilingual-embedding-small
+03:20:57 INFO     src.rag.faiss_rag_service — FAISS ivfpq strategy ready (mmap=True, max_ram=4096 MB)
+03:20:57 INFO     src.rag.faiss_rag_service — Loading FAISS index with memory-mapping…
+03:20:57 INFO     src.rag.faiss_rag_service — ✓ 24,806,534 vectors (mmap)
+03:21:13 INFO     __main__ — ♻ [zero_shot] Zero-shot (no retrieval) — overwriting checkpoint
+03:21:13 INFO     __main__ — ▶ [zero_shot] Zero-shot (no retrieval) — retrieving…
+03:21:14 INFO     __main__ — Saved 0 document rows across 7383 questions to /Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/all_qa_8k/retrieved_docs_zero_shot.csv
+03:21:14 INFO     __main__ — ✓ [zero_shot] Saved 7383 results → /Users/cyro/Documents/VSC/PopularityBias/data/wiki_full_bil/all_qa_8k/retrieved_docs_zero_shot.csv
+03:21:15 INFO     src.process.retrieval.latency_utils — [zero_shot] Latency (retrieval): avg=0.0 ms  p95=0.0 ms  total=0.0 s → latency_retrieval_zero_shot.json
+03:21:15 INFO     __main__ — ♻ [es_approx] Dense Retrieval (ES hnsw bbq) — overwriting checkpoint
+03:21:15 INFO     __main__ — ▶ [es_approx] Dense Retrieval (ES hnsw bbq) — retrieving…
+03:21:15 INFO     sentence_transformers.SentenceTransformer — Use pytorch device_name: mps
+03:21:15 INFO     sentence_transformers.SentenceTransformer — Load pretrained SentenceTransformer: Lajavaness/bilingual-embedding-small
+03:21:19 INFO     src.rag.elasticsearch_rag_service — Elasticsearch vector strategy ready
+03:21:48 INFO     src.rag.elasticsearch_rag_service — [Embed] Embedding 7,383 queries (batch_size=512)...
+Embedding queries:   0%|          | 0/7383 [00:00<?, ?q/s]Embedding queries:   7%|▋         | 512/7383 [00:04<00:57, 119.38q/s]Embedding queries:  14%|█▍        | 1024/7383 [00:05<00:30, 210.90q/s]Embedding queries:  21%|██        | 1536/7383 [00:06<00:18, 316.02q/s]Embedding queries:  28%|██▊       | 2048/7383 [00:06<00:12, 414.34q/s]Embedding queries:  35%|███▍      | 2560/7383 [00:07<00:10, 479.24q/s]Embedding queries:  35%|███▍      | 2560/7383 [00:18<00:10, 479.24q/s]Embedding queries:  42%|████▏     | 3072/7383 [00:18<00:38, 113.10q/s]Embedding queries:  49%|████▊     | 3584/7383 [00:19<00:25, 149.53q/s]Embedding queries:  55%|█████▌    | 4096/7383 [00:20<00:16, 195.28q/s]Embedding queries:  62%|██████▏   | 4608/7383 [00:21<00:10, 258.86q/s]Embedding queries:  69%|██████▉   | 5120/7383 [00:22<00:06, 325.24q/s]Embedding queries:  76%|███████▋  | 5632/7383 [00:22<00:04, 394.06q/s]Embedding queries:  83%|████████▎ | 6144/7383 [00:23<00:02, 472.47q/s]Embedding queries:  90%|█████████ | 6656/7383 [00:24<00:01, 515.99q/s]Embedding queries:  97%|█████████▋| 7168/7383 [00:24<00:00, 593.77q/s]Embedding queries: 100%|██████████| 7383/7383 [00:24<00:00, 611.23q/s]Embedding queries: 100%|██████████| 7383/7383 [00:24<00:00, 296.18q/s]
+03:22:14 INFO     src.rag.elasticsearch_rag_service — [Embed] ✓ 7,383 vectors ready
+Retrieving (approximation):   0%|          | 0/7383 [00:00<?, ?q/s]Retrieving (approximation):   0%|          | 5/7383 [00:26<11:03:05,  5.39s/q]Retrieving (approximation):   0%|          | 25/7383 [01:00<4:30:54,  2.21s/q]Retrieving (approximation):   1%|          | 40/7383 [01:24<3:57:07,  1.94s/q]Retrieving (approximation):   1%|          | 65/7383 [01:51<2:59:43,  1.47s/q]Retrieving (approximation):   1%|          | 90/7383 [01:51<1:42:00,  1.19q/s]Retrieving (approximation):   1%|          | 90/7383 [02:03<1:42:00,  1.19q/s]Retrieving (approximation):   1%|▏         | 95/7383 [02:17<2:41:07,  1.33s/q]Retrieving (approximation):   2%|▏         | 115/7383 [02:17<1:38:59,  1.22q/s]Retrieving (approximation):   2%|▏         | 115/7383 [02:33<1:38:59,  1.22q/s]/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/multiprocessing/resource_tracker.py:216: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

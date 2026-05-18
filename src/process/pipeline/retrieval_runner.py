@@ -3,7 +3,7 @@
 Backends are declared as :class:`RetrievalBackend` entries — one per index you
 want to evaluate.  The runner loads each backend, retrieves documents for every
 question, and writes ``retrieved_docs_<key>.csv`` checkpoints consumed by the
-next stage (:mod:`src.process.retrieval.generating_runner`).
+next stage (:mod:`src.process.pipeline.generating_runner`).
 
 Declaring backends
 ------------------
@@ -43,10 +43,10 @@ Usage
 -----
 ::
 
-    python -m src.process.retrieval.retrieval_runner
-    python -m src.process.retrieval.retrieval_runner --restart
-    python -m src.process.retrieval.retrieval_runner --restart-keys faiss_high faiss_low
-    python -m src.process.retrieval.retrieval_runner --help
+    python -m src.process.pipeline.retrieval_runner
+    python -m src.process.pipeline.retrieval_runner --restart
+    python -m src.process.pipeline.retrieval_runner --restart-keys faiss_high faiss_low
+    python -m src.process.pipeline.retrieval_runner --help
 """
 
 from __future__ import annotations
@@ -84,8 +84,10 @@ from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
 from src.rag.faiss_rag_service import FaissRagService
 from src.rag.bm25_rag_service import BM25RagService
+from src.rag.router_rag_service import RouterRagService
+from src.rag.hybrid_faiss_rag_service import HybridFaissRagService
 from src.rag.utils import IndexingConfig
-from src.process.retrieval.latency_utils import time_batch, save_latency
+from src.process.pipeline.latency_utils import time_batch, save_latency
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -127,13 +129,21 @@ class RetrievalBackend:
 
     key:            str
     label:          str
-    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot"]
+    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot", "router", "hybrid_faiss"]
     index_path:     Path | None = None
     es_index:       str | None  = None
     es_strategy:    str         = "approximation"
     faiss_strategy: str         = "ivfpq"
     faiss_distance: str         = "cosine"
     service_kwargs: dict        = field(default_factory=dict)
+    router_sub_keys: tuple[str, ...] = ()
+    """Keys of other backends (in the same config) to wrap.
+
+    Must be a tuple of 3–4 backend keys in order:
+    ``(bm25_plus_key, ivfpq_high_key, ivfpq_low_key[, zero_shot_key])``.
+    The referenced backends must appear earlier in ``RetrievalConfig.backends``
+    so their services are already loaded.
+    """
 
     def __post_init__(self) -> None:
         if self.index_path is not None:
@@ -184,6 +194,12 @@ class RetrievalConfig:
             es_strategy = "approximation",
         ),
         RetrievalBackend(
+            key         = "es_hybrid",
+            label       = "Hybrid Retrieval (ES dense + BM25)",
+            type        = "elasticsearch",
+            es_strategy = "hybrid",
+        ),
+        RetrievalBackend(
             key         = "bm25",
             label       = "Sparse Retrieval (BM25 Elasticsearch)",
             type        = "elasticsearch",
@@ -212,7 +228,10 @@ class RetrievalConfig:
             label          = "Dense Retrieval (FAISS low-pop ivfpq)",
             type           = "faiss",
             index_path     = DATA_DIR / "wiki_full_bil" / "faiss_low",
-            service_kwargs = {"ivfpq_nprobe": 64},
+            service_kwargs = {
+                "ivfpq_nprobe": 64,
+                "docstore_path": DATA_DIR / "wiki_full_bil" / "faiss_high" / "faiss" / "docstore.sqlite",
+            },
         ),
         RetrievalBackend(
             key            = "ivfpq_high",
@@ -226,7 +245,25 @@ class RetrievalConfig:
             label          = "Dense Retrieval (FAISS extremely high-pop ivfpq)",
             type           = "faiss",
             index_path     = DATA_DIR / "wiki_full_bil" / "faiss_high",
-            service_kwargs = {"ivfpq_nprobe": 1.024},
+            service_kwargs = {"ivfpq_nprobe": 1024},
+        ),
+        RetrievalBackend(
+            key             = "router",
+            label           = "Popularity-aware Router FAISS (BM25+ / IVFPQ-high)",
+            type            = "router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+        ),
+        RetrievalBackend(
+            key             = "router_es",
+            label           = "Popularity-aware Router ES (BM25+ / ES approx)",
+            type            = "router",
+            router_sub_keys = ("bm25_plus", "es_approx"),
+        ),
+        RetrievalBackend(
+            key             = "faiss_hybrid",
+            label           = "Hybrid Retrieval (FAISS dense + BM25 RRF)",
+            type            = "hybrid_faiss",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
         ),
     ])
     dataset_names:                 tuple[str, ...] = (
@@ -409,11 +446,14 @@ class RetrievalRunner:
             trust_remote_code=True,
         )
 
-    def _load_service(self, backend: RetrievalBackend) -> object:
+    def _load_service(self, backend: RetrievalBackend, loaded_services: dict[str, object] | None = None) -> object:
         """Instantiate and load the RAG service for *backend*.
 
         Args:
             backend: Backend declaration to load.
+            loaded_services: Dict of already-loaded services keyed by backend
+                key.  Required when ``backend.type == "router"`` so the router
+                can wrap already-loaded sub-backends.
 
         Returns:
             A loaded RAG service instance, or ``None`` for ``zero_shot``.
@@ -424,6 +464,10 @@ class RetrievalRunner:
         """
         if backend.type == "zero_shot":
             return None
+
+        # Return cached instance if available (avoids double-loading for router)
+        if loaded_services is not None and backend.key in loaded_services:
+            return loaded_services[backend.key]
 
         if backend.type == "elasticsearch":
             es_index = backend.es_index or self.cfg.collection_name
@@ -442,13 +486,15 @@ class RetrievalRunner:
                 raise ValueError(
                     f"[{backend.key}] RetrievalBackend.index_path is required for type='faiss'"
                 )
+            faiss_kwargs = dict(backend.service_kwargs)
+            docstore_path = faiss_kwargs.pop("docstore_path", None)
             service = FaissRagService(
                 config=self._indexing_config(),
                 strategy=backend.faiss_strategy,
                 distance_strategy=backend.faiss_distance,
-                **backend.service_kwargs,
+                **faiss_kwargs,
             )
-            service.load_index(backend.index_path)
+            service.load_index(backend.index_path, docstore_path=docstore_path)
             return service
 
         if backend.type == "bm25":
@@ -464,6 +510,60 @@ class RetrievalRunner:
             service.load_index(backend.index_path)
             return service
 
+        if backend.type == "router":
+            if not backend.router_sub_keys or len(backend.router_sub_keys) < 2:
+                raise ValueError(
+                    f"[{backend.key}] router_sub_keys must have exactly 2 entries: "
+                    "(sparse_key, dense_key)"
+                )
+            if loaded_services is None:
+                raise ValueError(
+                    f"[{backend.key}] loaded_services dict is required for type='router'"
+                )
+            sparse_key, dense_key = backend.router_sub_keys[:2]
+
+            def _get(key: str) -> object:
+                svc = loaded_services.get(key)
+                if svc is None:
+                    raise ValueError(
+                        f"[{backend.key}] router sub-backend '{key}' not found in loaded services. "
+                        "Make sure it appears before the router backend in RetrievalConfig.backends."
+                    )
+                return svc
+
+            return RouterRagService(
+                sparse_service=_get(sparse_key),
+                dense_service=_get(dense_key),
+                **backend.service_kwargs,
+            )
+
+        if backend.type == "hybrid_faiss":
+            if not backend.router_sub_keys or len(backend.router_sub_keys) < 2:
+                raise ValueError(
+                    f"[{backend.key}] router_sub_keys must have exactly 2 entries: "
+                    "(sparse_key, dense_key)"
+                )
+            if loaded_services is None:
+                raise ValueError(
+                    f"[{backend.key}] loaded_services dict is required for type='hybrid_faiss'"
+                )
+            sparse_key, dense_key = backend.router_sub_keys[:2]
+
+            def _get_hybrid(key: str) -> object:
+                svc = loaded_services.get(key)
+                if svc is None:
+                    raise ValueError(
+                        f"[{backend.key}] hybrid sub-backend '{key}' not found in loaded_services. "
+                        "Make sure it appears before the hybrid_faiss backend in RetrievalConfig.backends."
+                    )
+                return svc
+
+            return HybridFaissRagService(
+                sparse_service=_get_hybrid(sparse_key),
+                dense_service=_get_hybrid(dense_key),
+                **backend.service_kwargs,
+            )
+
         raise ValueError(f"Unknown backend type: {backend.type!r}")
 
     # ── Per-backend retrieval ─────────────────────────────────────────────────
@@ -473,6 +573,8 @@ class RetrievalRunner:
         backend: RetrievalBackend,
         questions: list[str],
         question_ids: list[str] | None = None,
+        popularities: list[float] | None = None,
+        loaded_services: dict[str, object] | None = None,
     ) -> tuple[list[list[Document]], list[float]]:
         """Run retrieval for one backend.
 
@@ -481,6 +583,11 @@ class RetrievalRunner:
             questions: Question strings in evaluation order.
             question_ids: Optional question IDs used for latency records.
                 Defaults to positional string indices when not provided.
+            popularities: Per-question popularity scores.  Required when
+                ``backend.type == "router"``; ignored otherwise.
+            loaded_services: Already-loaded service instances keyed by backend
+                key.  Required when ``backend.type == "router"`` so the router
+                can be constructed from pre-loaded sub-backends.
 
         Returns:
             Tuple of (list of document lists — one per question,
@@ -491,7 +598,11 @@ class RetrievalRunner:
         if backend.type == "zero_shot":
             return [[] for _ in questions], [0.0] * len(questions)
 
-        service = self._load_service(backend)
+        service = self._load_service(backend, loaded_services=loaded_services)
+
+        # Cache so later router backends can reuse without re-loading
+        if loaded_services is not None and backend.key not in loaded_services and backend.type != "router":
+            loaded_services[backend.key] = service
 
         if service.get_doc_count() == 0:
             logger.error(
@@ -499,7 +610,21 @@ class RetrievalRunner:
             )
             return [[] for _ in questions], [0.0] * len(questions)
 
-        if backend.type == "elasticsearch":
+        if backend.type == "router":
+            if not popularities or len(popularities) != len(questions):
+                raise ValueError(
+                    f"[{backend.key}] popularities must be provided for the router backend "
+                    f"and must match the number of questions ({len(questions)})"
+                )
+            scored, latencies_ms = time_batch(
+                lambda: service.batch_retrieve_with_scores(
+                    questions,
+                    top_k=self.cfg.top_k,
+                    popularities=popularities,
+                ),
+                _ids,
+            )
+        elif backend.type == "elasticsearch":
             scored, latencies_ms = time_batch(
                 lambda: service.batch_retrieve_with_scores(
                     questions,
@@ -549,6 +674,36 @@ class RetrievalRunner:
 
         questions    = [item.question_text for item in question_data]
         question_ids = [item.question_id   for item in question_data]
+        popularities = [item.popularity_avg if item.popularity_avg is not None else 0.0
+                        for item in question_data]
+
+        # Cache of already-loaded services so router can reuse sub-backends
+        # without loading them a second time.
+        loaded_services: dict[str, object] = {}
+
+        # Pre-load any sub-backends required by a router or hybrid_faiss backend that is being
+        # run, even if those sub-backends are not in --only-keys themselves.
+        router_backends_to_run = [
+            b for b in self.cfg.backends
+            if b.type in ("router", "hybrid_faiss")
+            and (not self.cfg.only_keys or b.key in self.cfg.only_keys)
+        ]
+        required_sub_keys: set[str] = set()
+        for rb in router_backends_to_run:
+            required_sub_keys.update(rb.router_sub_keys)
+
+        backend_by_key = {b.key: b for b in self.cfg.backends}
+        for sub_key in required_sub_keys:
+            if sub_key in loaded_services:
+                continue
+            sub_backend = backend_by_key.get(sub_key)
+            if sub_backend is None or sub_backend.type in ("zero_shot", "router", "hybrid_faiss"):
+                continue
+            logger.info("⚙ [%s] Pre-loading sub-backend for router…", sub_key)
+            try:
+                loaded_services[sub_key] = self._load_service(sub_backend, loaded_services)
+            except Exception as e:
+                logger.error("[%s] Failed to pre-load router sub-backend: %s", sub_key, e, exc_info=True)
 
         for backend in self.cfg.backends:
             if self.cfg.only_keys and backend.key not in self.cfg.only_keys:
@@ -566,12 +721,19 @@ class RetrievalRunner:
             if checkpoint.exists():
                 existing_docs = load_retrieved_docs_csv(checkpoint, question_ids)
                 # load_retrieved_docs_csv returns [] for any ID not in the CSV
-                missing_mask = [len(docs) == 0 for docs in existing_docs]
-                missing_ids  = [qid for qid, m in zip(question_ids, missing_mask) if m]
-                missing_qs   = [q   for q,   m in zip(questions,    missing_mask) if m]
+                missing_mask  = [len(docs) == 0 for docs in existing_docs]
+                missing_ids   = [qid  for qid,  m in zip(question_ids, missing_mask) if m]
+                missing_qs    = [q    for q,     m in zip(questions,    missing_mask) if m]
+                missing_pops  = [pop  for pop,   m in zip(popularities, missing_mask) if m]
 
                 if not missing_ids:
                     logger.info("✓ [%s] %s — all %d questions done, skipping", backend.key, backend.label, len(question_ids))
+                    # Ensure service is cached so a later router backend can reference it
+                    if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
+                        try:
+                            loaded_services[backend.key] = self._load_service(backend, loaded_services)
+                        except Exception as e:
+                            logger.warning("[%s] Could not cache service for router: %s", backend.key, e)
                     continue
 
                 logger.info(
@@ -579,7 +741,11 @@ class RetrievalRunner:
                     backend.key, backend.label, len(missing_ids), len(question_ids),
                 )
                 try:
-                    new_docs, latencies_ms = self.retrieve_for_backend(backend, missing_qs, missing_ids)
+                    new_docs, latencies_ms = self.retrieve_for_backend(
+                        backend, missing_qs, missing_ids,
+                        popularities=missing_pops,
+                        loaded_services=loaded_services,
+                    )
                 except Exception as e:
                     logger.error("[%s] Retrieval failed: %s", backend.key, e, exc_info=True)
                     continue
@@ -590,13 +756,31 @@ class RetrievalRunner:
             else:
                 logger.info("▶ [%s] %s — retrieving…", backend.key, backend.label)
                 try:
-                    retrieved, latencies_ms = self.retrieve_for_backend(backend, questions, question_ids)
+                    retrieved, latencies_ms = self.retrieve_for_backend(
+                        backend, questions, question_ids,
+                        popularities=popularities,
+                        loaded_services=loaded_services,
+                    )
                 except Exception as e:
                     logger.error("[%s] Retrieval failed: %s", backend.key, e, exc_info=True)
                     continue
 
                 save_retrieved_docs_csv(retrieved, question_ids, checkpoint)
                 logger.info("✓ [%s] Saved %d results → %s", backend.key, len(retrieved), checkpoint)
+
+            # Cache non-router services for potential later router use
+            if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
+                try:
+                    loaded_services[backend.key] = self._load_service(backend, loaded_services)
+                except Exception as e:
+                    logger.warning("[%s] Could not cache service for router: %s", backend.key, e)
+
+            # Cache non-router services for potential later router use
+            if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
+                try:
+                    loaded_services[backend.key] = self._load_service(backend, loaded_services)
+                except Exception as e:
+                    logger.warning("[%s] Could not cache service for router: %s", backend.key, e)
 
             latency_path = self._output_folder / f"latency_retrieval_{backend.key}.json"
             save_latency(
