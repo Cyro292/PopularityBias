@@ -123,7 +123,7 @@ class EvalConfig:
 
     generating:    GeneratingConfig        = None   # type: ignore[assignment]
     models:        list[str]               = field(default_factory=lambda: ["neo", "qwen"])
-    backends:      list[str]               = field(default_factory=lambda: ["zero_shot", "bm25_plus", "ivfpq_high", "es_approx", "es_hybrid", "router", "router_es", "faiss_hybrid"])
+    backends:      list[str]               = field(default_factory=lambda: ["zero_shot", "bm25_plus", "ivfpq_high", "ivfpq_extremely_high"])
     context_sizes: list[int]               = field(default_factory=lambda: [3])
     evaluators:    list[EvalBackend]       = field(default_factory=lambda: [
         EvalBackend(key="substring", type="substring"),
@@ -336,7 +336,7 @@ class LLMEvalRunner:
                                 "dataset":                  q.dataset,
                                 "strategy":                 backend.key,
                                 "context_size":             0 if backend.key == "zero_shot" else ctx_n,
-                                "retrieved_doc_popularity": [doc.metadata.get("popularity", 0) for doc in docs],
+                                "retrieved_doc_popularity": [doc.metadata.get("popularity_avg", 0) for doc in docs],
                                 "retrieved_doc_ids":        [doc.metadata.get("wikipedia_id", "") for doc in docs],
                             },
                         )

@@ -192,7 +192,8 @@ class HuggingFaceCyroInput(QuestionInput):
             if not self.parquet_path.exists():
                 return self.parquet_path
 
-        # ── Pass 2: assign deciles + filter + balance (always runs) ───────
+        # ── Pass 2: assign deciles + filter + balance ───────────────────
+        # Skip if cache already has deciles and hasn't been freshly written
         if self.corpus_handler is not None:
             import pandas as pd
             from src.metrics.decile_utils import (
@@ -202,6 +203,20 @@ class HuggingFaceCyroInput(QuestionInput):
                 COL_DECILE_CHUNK_WEIGHTED,
             )
 
+            # Check if cache already has decile columns
+            try:
+                existing_schema = pq.read_schema(self.parquet_path)
+                has_deciles = (
+                    COL_DECILE_UNWEIGHTED in existing_schema.names
+                    and COL_DECILE_CHUNK_WEIGHTED in existing_schema.names
+                )
+                
+                if has_deciles and not force and not names_to_fetch:
+                    logger.info("Pass 2 — skipping (cache already has decile columns and is up-to-date)")
+                    return self.parquet_path
+            except Exception:
+                pass  # proceed with Pass 2 if we can't check schema
+            
             logger.info("Pass 2 — starting (decile_mode=%s, balance_deciles=%s, target_per_decile=%s, balance_datasets=%s)",
                         self.balance_decile_mode, self.balance_deciles, self.target_per_decile, self.balance_datasets)
 

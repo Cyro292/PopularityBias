@@ -17,6 +17,7 @@ proposed_answer : str   — LLM answer (may be raw generation pre-parse)
 performance     : bool  — evaluation_score (True = correct)
 popularity      : float — popularity_avg from metadata
 decile          : int   — canonical decile (0–9) from metadata
+split           : str   — "train" or "test" (90/10 split, seed=42, per dataset)
 llm             : str   — e.g. "neo", "qwen"
 backend         : str   — e.g. "bm25_plus", "ivfpq_low", "ivfpq_high", "zero_shot"
 ctx_size        : int   — context_size from metadata (0 for zero_shot)
@@ -92,19 +93,78 @@ class BuildConfig:
             ``"substring"``, ``"binary_mistral"``.
         results_dir: Directory that contains ``results_*.parquet`` files.
         output_path: Destination parquet file.
+        qa_parquet_path: Path to the question dataset parquet used to reconstruct
+            train/test splits. If None, attempts to auto-detect from results_dir parent.
     """
 
     llms:        list[Literal["neo", "qwen"]]                         = field(default_factory=lambda: ["neo", "qwen"])
-    backends:    list[str]                                             = field(default_factory=lambda: ["bm25_plus", "ivfpq_low", "ivfpq_high", "zero_shot"])
+    backends:    list[str]                                             = field(default_factory=lambda: ["bm25_plus", "ivfpq_low", "ivfpq_high", "zero_shot", "faiss_hybrid"])
     ctx_labels:  list[Literal["top1", "top3", "zero"]]                = field(default_factory=lambda: ["top1", "top3", "zero"])
     eval_types:  list[Literal["substring", "binary_mistral"]]         = field(default_factory=lambda: ["substring", "binary_mistral"])
     results_dir: Path                                                  = field(default_factory=lambda: _DEFAULT_RESULTS_DIR)
     output_path: Path                                                  = field(default_factory=lambda: _DEFAULT_OUTPUT_PATH)
+    qa_parquet_path: Path | None                                       = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Internals
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_split_map(qa_parquet: Path) -> dict[str, str]:
+    """Reconstruct train/test split labels from the question dataset.
+    
+    The HuggingFace upload used a 90/10 train/test split with seed=42, applied
+    per sub-dataset. This function replicates that logic to assign split labels
+    to each question_id.
+    
+    Args:
+        qa_parquet: Path to the question dataset parquet file.
+        
+    Returns:
+        Dict mapping question_id → "train" | "test".
+        
+    Raises:
+        FileNotFoundError: If qa_parquet does not exist.
+        KeyError: If required columns (question_id, dataset) are missing.
+    """
+    if not qa_parquet.exists():
+        raise FileNotFoundError(f"QA parquet not found: {qa_parquet}")
+    
+    logger.info("Loading QA dataset from %s to reconstruct splits …", qa_parquet)
+    qa_df = pd.read_parquet(qa_parquet, columns=["question_id", "dataset"])
+    
+    # Vectorized approach: create split column directly
+    qa_df["split"] = "unknown"
+    
+    for dataset_name in qa_df["dataset"].unique():
+        mask = qa_df["dataset"] == dataset_name
+        dataset_indices = qa_df[mask].index.tolist()
+        
+        # Shuffle indices with seed=42
+        import random
+        rng = random.Random(42)
+        rng.shuffle(dataset_indices)
+        
+        # 90/10 split
+        split_idx = int(len(dataset_indices) * 0.9)
+        train_indices = dataset_indices[:split_idx]
+        test_indices = dataset_indices[split_idx:]
+        
+        qa_df.loc[train_indices, "split"] = "train"
+        qa_df.loc[test_indices, "split"] = "test"
+        
+        logger.info(
+            "  %s: %d train, %d test (%.1f%% train)",
+            dataset_name, len(train_indices), len(test_indices),
+            100 * len(train_indices) / len(dataset_indices) if len(dataset_indices) > 0 else 0,
+        )
+    
+    # Convert to dict (much faster than building dict in loop)
+    split_map = dict(zip(qa_df["question_id"], qa_df["split"]))
+    
+    logger.info("Split map built: %d question IDs total", len(split_map))
+    return split_map
+
 
 def _parse_filename(name: str) -> dict[str, str] | None:
     """Return parsed fields from a results parquet filename, or None if unrecognised."""
@@ -135,27 +195,54 @@ def _matches_config(parsed: dict[str, str], cfg: BuildConfig) -> bool:
     )
 
 
-def _extract_metadata_fields(meta: dict) -> dict:
-    """Pull scalar fields out of the per-row metadata dict."""
-    doc_ids = meta.get("retrieved_doc_ids")
-    doc_pop = meta.get("retrieved_doc_popularity")
+def _extract_metadata_fields_vectorized(metadata_series: pd.Series) -> pd.DataFrame:
+    """Extract metadata fields from a Series of dicts in a vectorized manner.
+    
+    Args:
+        metadata_series: Pandas Series where each element is a metadata dict.
+        
+    Returns:
+        DataFrame with extracted metadata columns.
+    """
+    # Convert Series of dicts to DataFrame directly (much faster than apply)
+    meta_df = pd.json_normalize(metadata_series)
+    
+    # Rename columns to match expected output
+    result = pd.DataFrame()
+    result["wikipedia_id"] = meta_df.get("wikipedia_id", pd.Series([""] * len(meta_df))).astype(str)
+    result["popularity"] = pd.to_numeric(meta_df.get("popularity_avg", float("nan")), errors="coerce")
+    
+    # Try both decile column names
+    if "decile" in meta_df.columns:
+        result["decile"] = meta_df["decile"].fillna(-1).astype(int)
+    elif "decile_chunk_weighted" in meta_df.columns:
+        result["decile"] = meta_df["decile_chunk_weighted"].fillna(-1).astype(int)
+    else:
+        result["decile"] = -1
+    
+    result["ctx_size"] = meta_df.get("context_size", 0).fillna(0).astype(int)
+    result["dataset"] = meta_df.get("dataset", "").astype(str)
+    result["retrieved_doc_ids"] = meta_df.get("retrieved_doc_ids", None)
+    result["retrieved_doc_popularity"] = meta_df.get("retrieved_doc_popularity", None)
+    
+    return result
 
-    return {
-        "wikipedia_id": str(meta.get("wikipedia_id", "")),
-        "popularity":   float(meta.get("popularity_avg", float("nan"))),
-        "decile":       int(meta.get("decile", meta.get("decile_chunk_weighted", -1))),
-        "ctx_size":     int(meta.get("context_size", 0)),
-        "dataset":      str(meta.get("dataset", "")),
-        "retrieved_doc_ids":       list(doc_ids) if doc_ids is not None else None,
-        "retrieved_doc_popularity": list(doc_pop) if doc_pop is not None else None,
-    }
 
-
-def _process_file(path: Path, parsed: dict[str, str]) -> pd.DataFrame:
-    """Load one results parquet and return a normalised DataFrame."""
+def _process_file(path: Path, parsed: dict[str, str], split_map: dict[str, str]) -> pd.DataFrame:
+    """Load one results parquet and return a normalised DataFrame.
+    
+    Args:
+        path: Path to results parquet file.
+        parsed: Parsed metadata from filename.
+        split_map: Dict mapping question_id → "train" | "test".
+        
+    Returns:
+        DataFrame with one row per question, including split column.
+    """
     df = pd.read_parquet(path)
 
-    meta_df = pd.DataFrame(list(df["metadata"].apply(_extract_metadata_fields)))
+    # Vectorized metadata extraction (much faster than row-by-row apply)
+    meta_df = _extract_metadata_fields_vectorized(df["metadata"])
 
     out = pd.DataFrame()
     out["question_id"]             = df["id"].astype(str)
@@ -166,6 +253,7 @@ def _process_file(path: Path, parsed: dict[str, str]) -> pd.DataFrame:
     out["performance"]             = df["evaluation_score"].astype(bool)
     out["popularity"]              = meta_df["popularity"]
     out["decile"]                  = meta_df["decile"]
+    out["split"]                   = out["question_id"].map(split_map).fillna("unknown")
     out["llm"]                     = parsed["llm"]
     out["backend"]                 = parsed["backend"]
     out["ctx_label"]               = parsed["ctx_label"]
@@ -193,9 +281,26 @@ def build(cfg: BuildConfig | None = None) -> pd.DataFrame:
 
     Returns:
         The combined DataFrame that was written to ``cfg.output_path``.
+        
+    Raises:
+        FileNotFoundError: If qa_parquet_path does not exist.
+        RuntimeError: If no matching result parquets found.
     """
     if cfg is None:
         cfg = BuildConfig()
+
+    # ── Auto-detect QA parquet path if not provided ──
+    qa_parquet = cfg.qa_parquet_path
+    if qa_parquet is None:
+        # Default: results_dir contains cyro_qa_cache.parquet
+        qa_parquet = cfg.results_dir / "cyro_qa_cache.parquet"
+        if not qa_parquet.exists():
+            # Fallback: results_dir parent contains all_qa_8k.parquet
+            qa_parquet = cfg.results_dir.parent / "all_qa_8k.parquet"
+        logger.info("QA parquet path not provided, using: %s", qa_parquet)
+    
+    # ── Build split map ──
+    split_map = _build_split_map(qa_parquet)
 
     all_files = sorted(cfg.results_dir.glob("results_*.parquet"))
     matched:  list[tuple[Path, dict]] = []
@@ -232,7 +337,7 @@ def build(cfg: BuildConfig | None = None) -> pd.DataFrame:
             i, len(matched), path.name,
             parsed["llm"], parsed["backend"], parsed["ctx_label"], parsed["eval_type"],
         )
-        frames.append(_process_file(path, parsed))
+        frames.append(_process_file(path, parsed, split_map))
 
     combined = pd.concat(frames, ignore_index=True)
 
@@ -241,6 +346,16 @@ def build(cfg: BuildConfig | None = None) -> pd.DataFrame:
         len(combined), len(combined.columns), combined["run_type"].nunique(),
     )
     logger.info("Run types: %s", sorted(combined["run_type"].unique()))
+    
+    # ── Report split distribution ──
+    split_counts = combined["split"].value_counts().to_dict()
+    logger.info("Split distribution: %s", split_counts)
+    unknown_count = split_counts.get("unknown", 0)
+    if unknown_count > 0:
+        logger.warning(
+            "%d rows (%.1f%%) have unknown split (question_id not found in QA parquet)",
+            unknown_count, 100 * unknown_count / len(combined),
+        )
 
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(cfg.output_path, index=False)
@@ -255,8 +370,8 @@ def build(cfg: BuildConfig | None = None) -> pd.DataFrame:
 
 ACTIVE_CONFIG = BuildConfig(
     llms        = ["neo", "qwen"],
-    backends    = ["bm25_plus", "ivfpq_low", "ivfpq_high", "zero_shot"],
-    ctx_labels  = ["top1", "top3", "zero"],
+    backends    = ["bm25_plus", "ivfpq_low", "ivfpq_high", "zero_shot", "faiss_hybrid"],
+    ctx_labels  = ["top3", "zero"],
     eval_types  = ["substring", "binary_mistral"],
     # results_dir = DATA_DIR / "wiki_full_bil" / "all_qa_8k",   # override if needed
     # output_path = DATA_DIR / "wiki_full_bil" / "analysis_dataset.parquet",
@@ -278,6 +393,9 @@ if __name__ == "__main__":
                         help="Override results directory from ACTIVE_CONFIG")
     parser.add_argument("--output", type=Path, default=None,
                         help="Override output parquet path from ACTIVE_CONFIG")
+    parser.add_argument("--qa-parquet", type=Path, default=None,
+                        help="Path to question dataset parquet for split reconstruction "
+                             "(default: auto-detect from results_dir parent)")
     parser.add_argument("--llms", nargs="+", default=None,
                         metavar="LLM", help="Override llms filter (e.g. --llms neo)")
     parser.add_argument("--backends", nargs="+", default=None,
@@ -296,6 +414,7 @@ if __name__ == "__main__":
         eval_types  = args.eval_types  or ACTIVE_CONFIG.eval_types,
         results_dir = args.results_dir or ACTIVE_CONFIG.results_dir,
         output_path = args.output      or ACTIVE_CONFIG.output_path,
+        qa_parquet_path = args.qa_parquet or ACTIVE_CONFIG.qa_parquet_path,
     )
 
     build(cfg)

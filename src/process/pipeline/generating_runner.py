@@ -136,13 +136,14 @@ class GeneratingConfig:
     ])
     backends:           list[GenerationBackend] = field(default_factory=lambda: [
         GenerationBackend(key="zero_shot"),
-        GenerationBackend(key="es_approx"),
-        GenerationBackend(key="es_hybrid"),
         GenerationBackend(key="bm25_plus"),
         GenerationBackend(key="ivfpq_high"),
-        GenerationBackend(key="router"),
-        GenerationBackend(key="router_es"),
-        GenerationBackend(key="faiss_hybrid"),
+        GenerationBackend(key="ivfpq_extremely_high"),
+        # GenerationBackend(key="es_approx"),
+        # GenerationBackend(key="es_hybrid"),
+        # GenerationBackend(key="router"),
+        # GenerationBackend(key="router_es"),
+        # GenerationBackend(key="faiss_hybrid"),
     ])
     context_sizes:      list[int]               = field(default_factory=lambda: [3])
     prompt_template:    str                     = (
@@ -252,13 +253,15 @@ class GeneratingRunner:
             corpus_path=self._collection_folder / "wiki_corpus.parquet",
             metadata_path=self._collection_folder / "metadata.json",
         )
+        # Disable balancing when questions_per_decile is -1 (use all questions as-is)
+        use_all_questions = self._rcfg.questions_per_decile == -1
         question_input = HuggingFaceCyroInput(
             dataset_names=list(self._rcfg.dataset_names),
             corpus_handler=corpus_handler,
             parquet_path=self._output_folder / "cyro_qa_cache.parquet",
-            balance_deciles=True,
-            balance_datasets=True,
-            target_per_decile=self._rcfg.questions_per_decile,
+            balance_deciles=not use_all_questions,
+            balance_datasets=not use_all_questions,
+            target_per_decile=None if use_all_questions else self._rcfg.questions_per_decile,
             shuffle=True,
             balance_decile_mode=self._rcfg.balance_decile_mode,
         )

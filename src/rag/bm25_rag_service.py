@@ -738,7 +738,7 @@ class BM25RagService(RagService):
         *,
         top_k: int = 5,
         progress_bar: bool = True,
-        batch_size: int = 64,
+        batch_size: int = 124,
         **kwargs: Any,
     ) -> list[list[Document]]:
         return [
@@ -754,7 +754,7 @@ class BM25RagService(RagService):
         *,
         top_k: int = 5,
         progress_bar: bool = True,
-        batch_size: int = 64,
+        batch_size: int = 124,
         **kwargs: Any,
     ) -> list[list[tuple[Document, float]]]:
         import bm25s

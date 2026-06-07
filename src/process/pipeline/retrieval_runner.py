@@ -32,6 +32,30 @@ Edit the ``backends`` list in :class:`RetrievalConfig`::
         label = "Zero-shot (no retrieval)",
         type  = "zero_shot",
     ),
+    RetrievalBackend(
+        key             = "neural_router_strict",
+        label           = "Neural Router (Strict - Argmax)",
+        type            = "neural_router",
+        router_sub_keys = ("bm25", "faiss_high"),
+        service_kwargs  = {
+            "model_path": "models/router_mrr20.pt",
+            "backend_order": ["bm25", "faiss_high"],
+            "strict": True,
+        },
+    ),
+    RetrievalBackend(
+        key             = "neural_router_hybrid",
+        label           = "Neural Router (Hybrid - Probability Weighted RRF)",
+        type            = "neural_router",
+        router_sub_keys = ("bm25", "faiss_high"),
+        service_kwargs  = {
+            "model_path": "models/router_mrr20.pt",
+            "backend_order": ["bm25", "faiss_high"],
+            "strict": False,
+            "rrf_k": 60,
+            "rrf_depth": 60,
+        },
+    ),
 
 Checkpoint behaviour
 --------------------
@@ -78,7 +102,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-from config import DATA_DIR
+from config import DATA_DIR, ROOT_DIR
 from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
 from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
 from src.rag.elasticsearch_rag_service import ElasticsearchRagService
@@ -129,7 +153,7 @@ class RetrievalBackend:
 
     key:            str
     label:          str
-    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot", "router", "hybrid_faiss"]
+    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot", "router", "hybrid_faiss", "neural_router"]
     index_path:     Path | None = None
     es_index:       str | None  = None
     es_strategy:    str         = "approximation"
@@ -139,8 +163,8 @@ class RetrievalBackend:
     router_sub_keys: tuple[str, ...] = ()
     """Keys of other backends (in the same config) to wrap.
 
-    Must be a tuple of 3–4 backend keys in order:
-    ``(bm25_plus_key, ivfpq_high_key, ivfpq_low_key[, zero_shot_key])``.
+    For router/hybrid_faiss: tuple of 2 backend keys (sparse_key, dense_key).
+    For neural_router: tuple of 2+ backend keys in the order model was trained.
     The referenced backends must appear earlier in ``RetrievalConfig.backends``
     so their services are already loaded.
     """
@@ -148,6 +172,83 @@ class RetrievalBackend:
     def __post_init__(self) -> None:
         if self.index_path is not None:
             self.index_path = Path(self.index_path)
+
+
+def router_backends_from_models_dir(
+    models_dir: Path | None = None,
+    sub_keys: tuple[str, str] = ("bm25_plus", "ivfpq_high"),
+) -> list[RetrievalBackend]:
+    """Build RetrievalBackend entries for every router_*.pt in a directory.
+
+    Each ``router_<name>.pt`` file yields two backends so both routing
+    strategies can be compared:
+
+      - ``neural_router_<name>``       — strict (argmax) routing
+      - ``neural_router_<name>_hybrid`` — probability-weighted RRF routing
+
+    The referenced *sub_keys* (default: ``bm25_plus`` and ``ivfpq_high``)
+    must be declared earlier in :class:`RetrievalConfig.backends` so their
+    services are loaded before the router is constructed.
+
+    Args:
+        models_dir: Directory containing the trained ``router_*.pt`` files.
+            Defaults to ``ROOT_DIR / "models"``.
+        sub_keys: Backend keys the router chooses between. Order matters —
+            it must match the ``backend_order`` the model was trained on.
+
+    Returns:
+        Ordered list of :class:`RetrievalBackend` entries (two per model).
+
+    Raises:
+        FileNotFoundError: If *models_dir* does not exist.
+    """
+    models_dir = Path(models_dir) if models_dir else ROOT_DIR / "models"
+    if not models_dir.exists():
+        raise FileNotFoundError(
+            f"router_backends_from_models_dir: '{models_dir}' does not exist"
+        )
+
+    pt_files = sorted(models_dir.glob("router_*.pt"))
+    if not pt_files:
+        logger.warning("No router_*.pt files found in %s", models_dir)
+        return []
+
+    backends: list[RetrievalBackend] = []
+    for pt in pt_files:
+        stem        = pt.stem                    # e.g. "router_pop_after_bert"
+        model_path  = str(pt.resolve())          # absolute — survives CWD changes
+        backend_ord = list(sub_keys)
+
+        backends.append(RetrievalBackend(
+            key             = f"neural_{stem}",
+            label           = f"Neural Router ({stem}) — strict",
+            type            = "neural_router",
+            router_sub_keys = sub_keys,
+            service_kwargs  = {
+                "model_path":    model_path,
+                "backend_order": backend_ord,
+                "strict":        True,
+            },
+        ))
+        backends.append(RetrievalBackend(
+            key             = f"neural_{stem}_hybrid",
+            label           = f"Neural Router ({stem}) — hybrid RRF",
+            type            = "neural_router",
+            router_sub_keys = sub_keys,
+            service_kwargs  = {
+                "model_path":    model_path,
+                "backend_order": backend_ord,
+                "strict":        False,
+                "rrf_k":         60,
+                "rrf_depth":     60,
+            },
+        ))
+
+    logger.info(
+        "Discovered %d router models in %s → %d backends (strict + hybrid)",
+        len(pt_files), models_dir, len(backends),
+    )
+    return backends
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -265,10 +366,227 @@ class RetrievalConfig:
             type            = "hybrid_faiss",
             router_sub_keys = ("bm25_plus", "ivfpq_high"),
         ),
+        RetrievalBackend(
+            key             = "neural_router_strict",
+            label           = "Neural Router (Strict - Argmax)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": str(DATA_DIR / "wiki_full_bil" / "models" / "router_pop_after_bert.pt"),
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_hybrid",
+            label           = "Neural Router (Hybrid - Probability Weighted RRF)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": str(DATA_DIR / "wiki_full_bil" / "models" / "router_pop_after_bert.pt"),
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_plain_bert",
+            label           = "Neural Router (Plain BERT - mrr@60 with popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_plain_bert_hybrid",
+            label           = "Neural Router (Plain BERT Hybrid - mrr@60 with popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_no_pop_answer",
+            label           = "Neural Router (No Pop - answer mode, no popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert_no_pop_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_no_pop_answer_hybrid",
+            label           = "Neural Router (No Pop Hybrid - answer mode, no popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert_no_pop_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_pop_after_bert",
+            label           = "Neural Router (Pop After BERT - mrr@20 with popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_pop_after_bert.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_pop_after_bert_hybrid",
+            label           = "Neural Router (Pop After BERT Hybrid - mrr@20 with popularity)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_pop_after_bert.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_unfreeze1_answer",
+            label           = "Neural Router (Unfreeze1 - answer mode, 1 BERT layer)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_unfreeze1_bert_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_unfreeze1_answer_hybrid",
+            label           = "Neural Router (Unfreeze1 Hybrid - answer mode, 1 BERT layer)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_unfreeze1_bert_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_bert_answer",
+            label           = "Neural Router (BERT answer)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_bert_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_bert_answer_hybrid",
+            label           = "Neural Router (BERT answer hybrid)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_bert_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_mrr_no_pop",
+            label           = "Neural Router (MRR no-pop)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_mrr_no_pop.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_mrr_no_pop_hybrid",
+            label           = "Neural Router (MRR no-pop hybrid)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_mrr_no_pop.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_plain_bert_mrr_filter",
+            label           = "Neural Router (Plain BERT MRR filter)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert_mrr_filter.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_plain_bert_mrr_filter_hybrid",
+            label           = "Neural Router (Plain BERT MRR filter hybrid)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_plain_bert_mrr_filter.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_unfreeze1_no_pop_answer",
+            label           = "Neural Router (Unfreeze1 no-pop answer)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_unfreeze1_no_pop_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": True,
+            },
+        ),
+        RetrievalBackend(
+            key             = "neural_router_unfreeze1_no_pop_answer_hybrid",
+            label           = "Neural Router (Unfreeze1 no-pop answer hybrid)",
+            type            = "neural_router",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/router_unfreeze1_no_pop_answer.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "strict": False,
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
     ])
     dataset_names:                 tuple[str, ...] = (
         "natural_questions", "trivia_qa", "pop_qa", "fever", "hotpot_qa", "trex"
     )
+    qa_file:                       Path | None = None  # If set, load from local parquet instead of HF
     questions_per_decile:          int  = 800
     top_k:                         int  = 10
     num_candidates:                int  = 1000
@@ -382,22 +700,28 @@ def load_retrieved_docs_csv(
     if not path.exists():
         return None
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, dtype={"question_id": str})
         if df.empty or "question_id" not in df.columns:
             return [[] for _ in question_ids]
 
         id_to_docs: dict[str, list[Document]] = {}
-        for qid in df["question_id"].unique():
-            q_rows = df[df["question_id"] == qid].sort_values("doc_rank")
+        
+        # Sort entire dataframe by question_id and doc_rank at once
+        df = df.sort_values(["question_id", "doc_rank"])
+        
+        metadata_cols = [col for col in df.columns if col.startswith("metadata_")]
+        
+        for qid, group in df.groupby("question_id"):
             doc_list: list[Document] = []
-            for _, row in q_rows.iterrows():
-                content = row["page_content"]
+            for row in group.itertuples(index=False):
+                row_dict = row._asdict()
+                content = row_dict["page_content"]
                 if pd.isna(content):
                     content = ""
                 metadata = {
-                    col[len("metadata_"):]: row[col]
-                    for col in row.index
-                    if col.startswith("metadata_") and pd.notna(row[col])
+                    col[len("metadata_"):]: row_dict[col]
+                    for col in metadata_cols
+                    if pd.notna(row_dict[col])
                 }
                 doc_list.append(Document(page_content=content, metadata=metadata))
             id_to_docs[qid] = doc_list
@@ -430,6 +754,50 @@ class RetrievalRunner:
         self.cfg = cfg
         self._collection_folder = DATA_DIR / cfg.collection_name
         self._output_folder     = self._collection_folder / cfg.output_dir
+
+    # ── Question loading helper ───────────────────────────────────────────────
+
+    def _load_from_local_parquet(self, qa_file: Path) -> list:
+        """Load questions from a local parquet file (e.g., from prepare_qa.py).
+
+        Args:
+            qa_file: Path to the parquet file containing questions.
+
+        Returns:
+            List of QuestionItem instances.
+        """
+        import pandas as pd
+        from src.question_input.base import QuestionItem
+        from src.metrics.decile_utils import COL_DECILE_UNWEIGHTED, COL_DECILE_CHUNK_WEIGHTED, COL_POPULARITY
+
+        if not qa_file.exists():
+            raise FileNotFoundError(f"QA file not found: {qa_file}")
+
+        df = pd.read_parquet(qa_file)
+        logger.info("Loaded %d rows from %s", len(df), qa_file)
+
+        # Build QuestionItem list
+        items = []
+        for _, row in df.iterrows():
+            # Handle both old and new column names
+            decile_uw = row.get(COL_DECILE_UNWEIGHTED, row.get("decile", -1))
+            decile_cw = row.get(COL_DECILE_CHUNK_WEIGHTED, row.get("decile", -1))
+            legacy_decile = row.get("decile", decile_uw if decile_uw != -1 else -1)
+            
+            items.append(QuestionItem(
+                question_id=str(row.get("question_id", "")),
+                question_text=str(row.get("question_text", "")),
+                answer_texts=row.get("answer_texts", []) if isinstance(row.get("answer_texts"), list) else [],
+                wikipedia_id=str(row.get("wikipedia_id", "")),
+                wikipedia_title=str(row.get("wikipedia_title", "")),
+                decile=int(legacy_decile) if pd.notna(legacy_decile) else -1,
+                decile_unweighted=int(decile_uw) if pd.notna(decile_uw) else -1,
+                decile_chunk_weighted=int(decile_cw) if pd.notna(decile_cw) else -1,
+                dataset=str(row.get("dataset", "")),
+                popularity_avg=float(row.get(COL_POPULARITY, 0.0)) if pd.notna(row.get(COL_POPULARITY)) else None,
+            ))
+
+        return items
 
     # ── Service factory ───────────────────────────────────────────────────────
 
@@ -563,6 +931,52 @@ class RetrievalRunner:
                 dense_service=_get_hybrid(dense_key),
                 **backend.service_kwargs,
             )
+        
+        if backend.type == "neural_router":
+            # Neural router requires: router_sub_keys (backend names in order),
+            # model_path, backend_order, strict, rrf_k, rrf_depth
+            if not backend.router_sub_keys or len(backend.router_sub_keys) < 2:
+                raise ValueError(
+                    f"[{backend.key}] router_sub_keys must have 2+ entries for neural_router"
+                )
+            if loaded_services is None:
+                raise ValueError(
+                    f"[{backend.key}] loaded_services dict is required for type='neural_router'"
+                )
+            
+            # Extract configuration from service_kwargs
+            kwargs = dict(backend.service_kwargs)
+            model_path = kwargs.pop("model_path", None)
+            backend_order = kwargs.pop("backend_order", None)
+            
+            if model_path is None:
+                raise ValueError(
+                    f"[{backend.key}] service_kwargs must include 'model_path' for neural_router"
+                )
+            if backend_order is None:
+                raise ValueError(
+                    f"[{backend.key}] service_kwargs must include 'backend_order' for neural_router"
+                )
+            
+            # Build backends dict from router_sub_keys
+            backends_dict = {}
+            for sub_key in backend.router_sub_keys:
+                svc = loaded_services.get(sub_key)
+                if svc is None:
+                    raise ValueError(
+                        f"[{backend.key}] neural_router sub-backend '{sub_key}' not found. "
+                        "Make sure it appears before neural_router in RetrievalConfig.backends."
+                    )
+                backends_dict[sub_key] = svc
+            
+            from src.rag.neural_router_rag_service import NeuralRouterRagService
+            
+            return NeuralRouterRagService(
+                backends=backends_dict,
+                backend_order=backend_order,
+                model_path=model_path,
+                **kwargs,  # Remaining: strict, rrf_k, rrf_depth, predict_batch_size, device
+            )
 
         raise ValueError(f"Unknown backend type: {backend.type!r}")
 
@@ -601,7 +1015,7 @@ class RetrievalRunner:
         service = self._load_service(backend, loaded_services=loaded_services)
 
         # Cache so later router backends can reuse without re-loading
-        if loaded_services is not None and backend.key not in loaded_services and backend.type != "router":
+        if loaded_services is not None and backend.key not in loaded_services and backend.type not in ("router", "neural_router"):
             loaded_services[backend.key] = service
 
         if service.get_doc_count() == 0:
@@ -610,10 +1024,10 @@ class RetrievalRunner:
             )
             return [[] for _ in questions], [0.0] * len(questions)
 
-        if backend.type == "router":
+        if backend.type in ("router", "neural_router"):
             if not popularities or len(popularities) != len(questions):
                 raise ValueError(
-                    f"[{backend.key}] popularities must be provided for the router backend "
+                    f"[{backend.key}] popularities must be provided for router backends "
                     f"and must match the number of questions ({len(questions)})"
                 )
             scored, latencies_ms = time_batch(
@@ -658,19 +1072,28 @@ class RetrievalRunner:
             corpus_path=self._collection_folder / "wiki_corpus.parquet",
             metadata_path=self._collection_folder / "metadata.json",
         )
-        question_input = HuggingFaceCyroInput(
-            dataset_names=list(self.cfg.dataset_names),
-            corpus_handler=corpus_handler,
-            parquet_path=self._output_folder / "cyro_qa_cache.parquet",
-            balance_deciles=True,
-            balance_datasets=True,
-            target_per_decile=self.cfg.questions_per_decile,
-            shuffle=True,
-            balance_decile_mode=self.cfg.balance_decile_mode,
-        )
-        question_input.load(force=self.cfg.restart)
-        question_data = question_input.get_items()
-        logger.info("Loaded %d questions", len(question_data))
+        
+        # ── Load questions: either from local file or HuggingFace ─────────
+        if self.cfg.qa_file is not None:
+            # Load from local parquet file
+            logger.info("Loading questions from local file: %s", self.cfg.qa_file)
+            question_data = self._load_from_local_parquet(self.cfg.qa_file)
+            logger.info("Loaded %d questions from local file", len(question_data))
+        else:
+            # Original HuggingFace loading path
+            question_input = HuggingFaceCyroInput(
+                dataset_names=list(self.cfg.dataset_names),
+                corpus_handler=corpus_handler,
+                parquet_path=self._output_folder / "cyro_qa_cache.parquet",
+                balance_deciles=True,
+                balance_datasets=True,
+                target_per_decile=self.cfg.questions_per_decile,
+                shuffle=True,
+                balance_decile_mode=self.cfg.balance_decile_mode,
+            )
+            question_input.load(force=self.cfg.restart)
+            question_data = question_input.get_items()
+            logger.info("Loaded %d questions", len(question_data))
 
         questions    = [item.question_text for item in question_data]
         question_ids = [item.question_id   for item in question_data]
@@ -681,11 +1104,11 @@ class RetrievalRunner:
         # without loading them a second time.
         loaded_services: dict[str, object] = {}
 
-        # Pre-load any sub-backends required by a router or hybrid_faiss backend that is being
-        # run, even if those sub-backends are not in --only-keys themselves.
+        # Pre-load any sub-backends required by a router or hybrid_faiss or neural_router backend
+        # that is being run, even if those sub-backends are not in --only-keys themselves.
         router_backends_to_run = [
             b for b in self.cfg.backends
-            if b.type in ("router", "hybrid_faiss")
+            if b.type in ("router", "hybrid_faiss", "neural_router")
             and (not self.cfg.only_keys or b.key in self.cfg.only_keys)
         ]
         required_sub_keys: set[str] = set()
@@ -697,7 +1120,7 @@ class RetrievalRunner:
             if sub_key in loaded_services:
                 continue
             sub_backend = backend_by_key.get(sub_key)
-            if sub_backend is None or sub_backend.type in ("zero_shot", "router", "hybrid_faiss"):
+            if sub_backend is None or sub_backend.type in ("zero_shot", "router", "hybrid_faiss", "neural_router"):
                 continue
             logger.info("⚙ [%s] Pre-loading sub-backend for router…", sub_key)
             try:
@@ -729,7 +1152,7 @@ class RetrievalRunner:
                 if not missing_ids:
                     logger.info("✓ [%s] %s — all %d questions done, skipping", backend.key, backend.label, len(question_ids))
                     # Ensure service is cached so a later router backend can reference it
-                    if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
+                    if backend.type not in ("zero_shot", "router", "hybrid_faiss", "neural_router") and backend.key not in loaded_services:
                         try:
                             loaded_services[backend.key] = self._load_service(backend, loaded_services)
                         except Exception as e:
@@ -811,6 +1234,10 @@ class RetrievalRunner:
                        help="Overwrite checkpoints only for these backend keys.")
         p.add_argument("--only-keys", nargs="+", default=[],
                        help="Run only these backend keys; skip all others.")
+        p.add_argument("--datasets", nargs="+", default=None,
+                       help="QA dataset names to load from HuggingFace (default: all 6 datasets).")
+        p.add_argument("--qa-file", type=Path, default=None,
+                       help="Path to local QA parquet file (skips HuggingFace download).")
         args = p.parse_args(argv)
 
         cfg = RetrievalConfig(
@@ -821,6 +1248,8 @@ class RetrievalRunner:
             restart=args.restart,
             restart_keys=tuple(args.restart_keys),
             only_keys=tuple(args.only_keys),
+            dataset_names=tuple(args.datasets) if args.datasets else _d.dataset_names,
+            qa_file=args.qa_file,
         )
         cls(cfg).run()
 

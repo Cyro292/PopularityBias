@@ -61,8 +61,33 @@ FORCE_RECOMPUTE: bool = False
 # LLM models, retrieval backends, context labels, and evaluator keys that were
 # produced by llm_eval_runner.  Adjust to match what you actually ran.
 LLM_KEYS:       list[str] = ["neo", "qwen"]
-BACKEND_KEYS:   list[str] = ["zero_shot", "bm25_plus", "ivfpq_high", "router"]
-CTX_LABELS:     list[str] = ["zero", "top1", "top3"]   # "zero" for zero_shot
+
+# Baselines are intentionally excluded for the vanilla-router experiment view.
+_BASE_BACKENDS: list[str] = []
+
+# Vanilla router experiment backends (strict + hybrid). Each router_*.pt model
+# is exposed by the pipeline as two backends: strict argmax and weighted hybrid.
+_NEURAL_ROUTER_BACKENDS: list[str] = [
+    "neural_router_mrr_filter_e20_vanilla",
+    "neural_router_mrr_filter_e20_vanilla_hybrid",
+    "neural_router_mrr_filter_e50_vanilla",
+    "neural_router_mrr_filter_e50_vanilla_hybrid",
+    "neural_router_mrr_filter_e120_vanilla",
+    "neural_router_mrr_filter_e120_vanilla_hybrid",
+    "neural_router_mrr_filter_e250_vanilla",
+    "neural_router_mrr_filter_e250_vanilla_hybrid",
+    "neural_router_mrr_no_pop_e20_vanilla",
+    "neural_router_mrr_no_pop_e20_vanilla_hybrid",
+    "neural_router_mrr_no_pop_e50_vanilla",
+    "neural_router_mrr_no_pop_e50_vanilla_hybrid",
+    "neural_router_mrr_no_pop_e120_vanilla",
+    "neural_router_mrr_no_pop_e120_vanilla_hybrid",
+    "neural_router_mrr_no_pop_e250_vanilla",
+    "neural_router_mrr_no_pop_e250_vanilla_hybrid",
+]
+
+BACKEND_KEYS:   list[str] = _BASE_BACKENDS + _NEURAL_ROUTER_BACKENDS
+CTX_LABELS:     list[str] = ["top3"]   # "zero" for zero_shot
 EVALUATOR_KEYS: list[str] = ["substring"]
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -144,13 +169,22 @@ ALL_ENTRIES: list[RunEntry] = [
 # ═════════════════════════════════════════════════════════════════════════════
 
 _BACKEND_COLORS: dict[str, str] = {
-    "zero_shot":  "#6B7280",
-    "es_approx":  "#2563EB",
-    "es_hybrid":  "#059669",
-    "bm25_plus":  "#D97706",
-    "ivfpq_high": "#0D9488",
-    "router":     "#EC4899",
-    "router_es":  "#BE185D",
+    "neural_router_mrr_filter_e20_vanilla":              "#14532D",
+    "neural_router_mrr_filter_e20_vanilla_hybrid":       "#86EFAC",
+    "neural_router_mrr_filter_e50_vanilla":              "#166534",
+    "neural_router_mrr_filter_e50_vanilla_hybrid":       "#BBF7D0",
+    "neural_router_mrr_filter_e120_vanilla":             "#0F766E",
+    "neural_router_mrr_filter_e120_vanilla_hybrid":      "#99F6E4",
+    "neural_router_mrr_filter_e250_vanilla":             "#0369A1",
+    "neural_router_mrr_filter_e250_vanilla_hybrid":      "#7DD3FC",
+    "neural_router_mrr_no_pop_e20_vanilla":              "#7E22CE",
+    "neural_router_mrr_no_pop_e20_vanilla_hybrid":       "#D8B4FE",
+    "neural_router_mrr_no_pop_e50_vanilla":              "#B45309",
+    "neural_router_mrr_no_pop_e50_vanilla_hybrid":       "#FDE68A",
+    "neural_router_mrr_no_pop_e120_vanilla":             "#9A3412",
+    "neural_router_mrr_no_pop_e120_vanilla_hybrid":      "#FDBA74",
+    "neural_router_mrr_no_pop_e250_vanilla":             "#831843",
+    "neural_router_mrr_no_pop_e250_vanilla_hybrid":      "#F9A8D4",
 }
 _LLM_COLORS: dict[str, str] = {
     "neo":  "#8B5CF6",
