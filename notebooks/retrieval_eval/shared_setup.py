@@ -212,71 +212,41 @@ CFG = EvalConfig(
     results_dir = _OUT,
     corpus_root = _ROOT,
     backends    = [
-        # ── Vanilla router experiment (strict + hybrid RRF) ───────────────────
+        # ── Baselines ─────────────────────────────────────────────────────────
         BackendEntry(
-            label        = "Vanilla Router pop e20",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e20_vanilla.csv",
+            label        = "BM25+",
+            results_path = _OUT / "retrieved_docs_bm25_plus.csv",
         ),
         BackendEntry(
-            label        = "Vanilla Router pop e20 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e20_vanilla_hybrid.csv",
+            label        = "FAISS high",
+            results_path = _OUT / "retrieved_docs_ivfpq_high.csv",
         ),
         BackendEntry(
-            label        = "Vanilla Router pop e50",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e50_vanilla.csv",
+            label        = "FAISS hybrid",
+            results_path = _OUT / "retrieved_docs_faiss_hybrid.csv",
+        ),
+        # ── Anti-overfitting router (frozen BERT, wd=5e-3, drop=0.6, mrr20, s42) ─
+        BackendEntry(
+            label        = "Router frozen wd5e-3 drop60 s42",
+            results_path = _OUT / "retrieved_docs_router60k_frozen_wd5e-3_drop60_mrr20_s42.csv",
+            key          = "router60k_frozen_wd5e-3_drop60_mrr20_s42",
         ),
         BackendEntry(
-            label        = "Vanilla Router pop e50 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e50_vanilla_hybrid.csv",
+            label        = "Router frozen wd5e-3 drop60 s42 hybrid",
+            results_path = _OUT / "retrieved_docs_router60k_frozen_wd5e-3_drop60_mrr20_s42_hybrid.csv",
+            key          = "router60k_frozen_wd5e-3_drop60_mrr20_s42_hybrid",
         ),
         BackendEntry(
-            label        = "Vanilla Router pop e120",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e120_vanilla.csv",
+            label        = "Router no-pop wd5e-3 drop60 s42",
+            results_path = _OUT / "retrieved_docs_router60k_nopop_wd5e-3_drop60_mrr20_s42.csv",
+            key          = "router60k_nopop_wd5e-3_drop60_mrr20_s42",
         ),
         BackendEntry(
-            label        = "Vanilla Router pop e120 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e120_vanilla_hybrid.csv",
+            label        = "Router no-pop wd5e-3 drop60 s42 hybrid",
+            results_path = _OUT / "retrieved_docs_router60k_nopop_wd5e-3_drop60_mrr20_s42_hybrid.csv",
+            key          = "router60k_nopop_wd5e-3_drop60_mrr20_s42_hybrid",
         ),
-        BackendEntry(
-            label        = "Vanilla Router pop e250",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e250_vanilla.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router pop e250 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_filter_e250_vanilla_hybrid.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e20",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e20_vanilla.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e20 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e20_vanilla_hybrid.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e50",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e50_vanilla.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e50 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e50_vanilla_hybrid.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e120",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e120_vanilla.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e120 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e120_vanilla_hybrid.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e250",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e250_vanilla.csv",
-        ),
-        BackendEntry(
-            label        = "Vanilla Router no-pop e250 hybrid",
-            results_path = _OUT / "retrieved_docs_neural_router_mrr_no_pop_e250_vanilla_hybrid.csv",
-        ),
+        
     ],
     top_k             = 10,
     k_values_detailed = [1, 3, 5, 10],
@@ -321,24 +291,18 @@ def strategy_label(strategy: str) -> str:
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Exact-key colour assignments for the vanilla router experiment.
+# Exact-key colour assignments.
 _STRATEGY_COLOR_MAP: dict[str, str] = {
-    "neural_router_mrr_filter_e20_vanilla":              "#14532D",
-    "neural_router_mrr_filter_e20_vanilla_hybrid":       "#86EFAC",
-    "neural_router_mrr_filter_e50_vanilla":              "#166534",
-    "neural_router_mrr_filter_e50_vanilla_hybrid":       "#BBF7D0",
-    "neural_router_mrr_filter_e120_vanilla":             "#0F766E",
-    "neural_router_mrr_filter_e120_vanilla_hybrid":      "#99F6E4",
-    "neural_router_mrr_filter_e250_vanilla":             "#0369A1",
-    "neural_router_mrr_filter_e250_vanilla_hybrid":      "#7DD3FC",
-    "neural_router_mrr_no_pop_e20_vanilla":              "#7E22CE",
-    "neural_router_mrr_no_pop_e20_vanilla_hybrid":       "#D8B4FE",
-    "neural_router_mrr_no_pop_e50_vanilla":              "#B45309",
-    "neural_router_mrr_no_pop_e50_vanilla_hybrid":       "#FDE68A",
-    "neural_router_mrr_no_pop_e120_vanilla":             "#9A3412",
-    "neural_router_mrr_no_pop_e120_vanilla_hybrid":      "#FDBA74",
-    "neural_router_mrr_no_pop_e250_vanilla":             "#831843",
-    "neural_router_mrr_no_pop_e250_vanilla_hybrid":      "#F9A8D4",
+    # Baselines
+    "retrieved_docs_bm25_plus":                         "#F59E0B",
+    "retrieved_docs_ivfpq_high":                        "#3B82F6",
+    "retrieved_docs_faiss_hybrid":                      "#06B6D4",
+    # Anti-overfitting router — frozen BERT (with popularity)
+    "router60k_frozen_wd5e-3_drop60_mrr20_s42":         "#166534",
+    "router60k_frozen_wd5e-3_drop60_mrr20_s42_hybrid":  "#86EFAC",
+    # Anti-overfitting router — no popularity
+    "router60k_nopop_wd5e-3_drop60_mrr20_s42":          "#831843",
+    "router60k_nopop_wd5e-3_drop60_mrr20_s42_hybrid":   "#F9A8D4",
 }
 
 _FALLBACK_COLORS = [

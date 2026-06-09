@@ -317,6 +317,12 @@ def _training_dict_from_cfg(cfg: Any) -> dict[str, Any]:
         "dropout",
         "use_scheduler",
         "seed",
+        "weight_decay",
+        "bert_weight_decay",
+        "wandb_project",
+        "wandb_run_name",
+        "warmup_epochs",
+        "min_lr_ratio",
     )
     out: dict[str, Any] = {}
     for k in keys:

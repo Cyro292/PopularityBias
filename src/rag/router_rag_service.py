@@ -77,30 +77,54 @@ class RouterRagService(RagService):
     Args:
         dense_service:  Dense retrieval backend — e.g. ``FaissRagService``
                         (``ivfpq_high``) or ``ElasticsearchRagService``
-                        (``approximation``).  Required.
+                        (``approximation``).  May be ``None`` when
+                        ``set_precomputed_results()`` will be called.
         sparse_service: Sparse retrieval backend — e.g. ``BM25RagService``
-                        (``bm25_plus``).  Required.
+                        (``bm25_plus``).  May be ``None`` when
+                        ``set_precomputed_results()`` will be called.
         device:         Torch device for the classifier (default ``"cpu"``).
     """
 
     def __init__(
         self,
         *,
-        dense_service:  RagService,
-        sparse_service: RagService,
+        dense_service:  RagService | None = None,
+        sparse_service: RagService | None = None,
         device: str = "cpu",
     ) -> None:
-        self._backends: dict[str, RagService] = {
+        self._backends: dict[str, RagService | None] = {
             "dense":  dense_service,
             "sparse": sparse_service,
         }
         self._device = device
+        self.precomputed_results: dict[str, list[list[Document]]] | None = None
 
         logger.info("RouterRagService — loading classifier from HuggingFace Hub…")
         self._model    = self._load_model()
         self._embedder = SentenceTransformer(_EMBEDDER, device=device)
-        logger.info("RouterRagService — ready (dense=%s, sparse=%s)",
-                    type(dense_service).__name__, type(sparse_service).__name__)
+        if dense_service is not None and sparse_service is not None:
+            logger.info("RouterRagService — ready (dense=%s, sparse=%s)",
+                        type(dense_service).__name__, type(sparse_service).__name__)
+        else:
+            logger.info("RouterRagService — ready (no live backends, "
+                        "call set_precomputed_results() before retrieval)")
+
+    # ── Pre-computed results ───────────────────────────────────────────────────
+
+    def set_precomputed_results(
+        self, results: dict[str, list[list[Document]]]
+    ) -> None:
+        """Supply cached sub-backend results so live retrieval is skipped.
+
+        Args:
+            results: Dict with ``"dense"`` and ``"sparse"`` keys, each mapping
+                to ``list[list[Document]]`` (one list per query).
+        """
+        self.precomputed_results = results
+        logger.info(
+            "RouterRagService — pre-computed results set — "
+            "live retrieval will be skipped"
+        )
 
     # ── Router internals ──────────────────────────────────────────────────────
 
@@ -169,6 +193,18 @@ class RouterRagService(RagService):
             logits   = self._model(features)                       # (N, num_classes)
             labels   = torch.argmax(logits, dim=1).tolist()
         return [self._label_to_backend(lbl) for lbl in labels]
+
+    def predict_backend(self, query: str, popularity: float) -> str:
+        """Return the predicted routing label without retrieving documents."""
+        return self._predict_backend(query, popularity)
+
+    def predict_backends_batch(
+        self,
+        queries: list[str],
+        popularities: list[float],
+    ) -> list[str]:
+        """Return predicted routing labels for a batch without retrieval."""
+        return self._predict_backends_batch(queries, popularities)
 
     def _label_to_backend(self, label: int) -> str:
         """Map a classifier label index to ``"dense"``, ``"sparse"``, or ``"zero_shot"``.
@@ -362,6 +398,15 @@ class RouterRagService(RagService):
         dist = Counter(backend_keys)
         logger.info("Router — routing distribution: %s", dict(dist))
 
+        # ── Pre-computed path: slice from cached sub-backend results ──────────
+        if self.precomputed_results is not None:
+            results: list[list[tuple[Document, float]]] = [[] for _ in range(n)]
+            for i, backend_key in enumerate(backend_keys):
+                cached = self.precomputed_results.get(backend_key, [])
+                if i < len(cached):
+                    results[i] = [(doc, 0.0) for doc in cached[i][:top_k]]
+            return results
+
         # ── Step 2: group original indices by backend ─────────────────────────
         groups: dict[str, list[int]] = defaultdict(list)
         for i, key in enumerate(backend_keys):
@@ -423,7 +468,12 @@ class RouterRagService(RagService):
         Returns:
             Document count from the dense backend.
         """
-        return self._backends["dense"].get_doc_count()
+        if self.precomputed_results is not None:
+            return 1  # non-zero so runner's empty-index check passes
+        svc = self._backends.get("dense")
+        if svc is None:
+            return 1
+        return svc.get_doc_count()
 
     def get_index_stats(self) -> dict[str, Any]:
         """Return stats from all backends.

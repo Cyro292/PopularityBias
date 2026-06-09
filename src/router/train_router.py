@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -107,6 +108,12 @@ class RouterTrainingConfig:
     use_scheduler: bool = True
     seed: int = 42
     save_history: str | None = None
+    weight_decay: float = 1e-3
+    bert_weight_decay: float = 1e-2
+    wandb_project: str = "popularity-bias-router"
+    wandb_run_name: str | None = None
+    warmup_epochs: int = 0
+    min_lr_ratio: float = 0.1
     
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -433,6 +440,13 @@ def train_router(cfg: RouterTrainingConfig) -> dict:
         dropout=cfg.dropout,
         use_scheduler=cfg.use_scheduler,
         seed=cfg.seed,
+        weight_decay=cfg.weight_decay,
+        bert_weight_decay=cfg.bert_weight_decay,
+        wandb_key=os.getenv("WEIGHTS_AND_BIASES_API_KEY"),
+        wandb_project=cfg.wandb_project,
+        wandb_run_name=cfg.wandb_run_name or cfg.model_name,
+        warmup_epochs=cfg.warmup_epochs,
+        min_lr_ratio=cfg.min_lr_ratio,
     )
     
     # Save model
@@ -517,6 +531,10 @@ def _write_history(
             "dropout": cfg.dropout,
             "use_scheduler": cfg.use_scheduler,
             "seed": cfg.seed,
+            "weight_decay": cfg.weight_decay,
+            "bert_weight_decay": cfg.bert_weight_decay,
+            "wandb_project": cfg.wandb_project,
+            "wandb_run_name": cfg.wandb_run_name or cfg.model_name,
         },
         "epoch": list(range(epochs_completed)),
         "train_loss": history.get("train_loss", []),
@@ -595,8 +613,21 @@ def main():
                         help="Random seed for reproducible training")
     parser.add_argument("--no-scheduler", action="store_true",
                         help="Disable cosine LR scheduler and use constant learning rate")
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Linear warmup epochs before cosine decay (0=disabled)")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1,
+                        help="Minimum LR as fraction of initial LR (default 0.1 = 10%%). "
+                             "Prevents cosine annealing from collapsing LR to ~0")
     parser.add_argument("--no-early-stop", action="store_true",
                         help="Disable early stopping and run all epochs")
+    parser.add_argument("--weight-decay", type=float, default=1e-3,
+                        help="L2 weight decay for classifier head (default 1e-3)")
+    parser.add_argument("--bert-weight-decay", type=float, default=1e-2,
+                        help="L2 weight decay for unfrozen BERT params (default 1e-2)")
+    parser.add_argument("--wandb-project", default="popularity-bias-router",
+                        help="W&B project name for experiment tracking")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="W&B run name (defaults to --model-name)")
     parser.add_argument("--save-history", default=None,
                         help="Path to write per-epoch train/test metrics JSON")
     
@@ -624,8 +655,14 @@ def main():
         patience=0 if args.no_early_stop else args.patience,
         dropout=args.dropout,
         use_scheduler=not args.no_scheduler,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_ratio=args.min_lr_ratio,
         seed=args.seed,
         save_history=args.save_history,
+        weight_decay=args.weight_decay,
+        bert_weight_decay=args.bert_weight_decay,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
     
     # Train

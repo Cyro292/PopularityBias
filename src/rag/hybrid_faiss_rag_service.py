@@ -46,8 +46,10 @@ class HybridFaissRagService(RagService):
     replicating the behaviour of Elasticsearch's built-in hybrid strategy.
 
     Args:
-        dense_service: A loaded ``FaissRagService`` instance.
-        sparse_service: A loaded ``BM25RagService`` instance.
+        dense_service: A loaded ``FaissRagService`` instance. May be ``None``
+            when ``set_precomputed_results()`` will be called.
+        sparse_service: A loaded ``BM25RagService`` instance. May be ``None``
+            when ``set_precomputed_results()`` will be called.
         rrf_k: RRF smoothing constant. Higher values reduce the impact of
             top-ranked documents. Defaults to 60 (ES default).
         rrf_depth: Number of candidates fetched from each backend before
@@ -56,8 +58,8 @@ class HybridFaissRagService(RagService):
 
     def __init__(
         self,
-        dense_service: RagService,
-        sparse_service: RagService,
+        dense_service: RagService | None = None,
+        sparse_service: RagService | None = None,
         *,
         rrf_k: int = 60,
         rrf_depth: int = 60,
@@ -66,10 +68,28 @@ class HybridFaissRagService(RagService):
         self.sparse_service = sparse_service
         self.rrf_k          = rrf_k
         self.rrf_depth      = rrf_depth
+        self.precomputed_results: dict[str, list[list[Document]]] | None = None
         logger.info(
             "HybridFaissRagService ready (rrf_k=%d, rrf_depth=%d)",
             rrf_k,
             rrf_depth,
+        )
+
+    # ── Pre-computed results ───────────────────────────────────────────────────
+
+    def set_precomputed_results(
+        self, results: dict[str, list[list[Document]]]
+    ) -> None:
+        """Supply cached sub-backend results so live retrieval is skipped.
+
+        Args:
+            results: Dict with ``"dense"`` and ``"sparse"`` keys, each mapping
+                to ``list[list[Document]]`` (one list per query).
+        """
+        self.precomputed_results = results
+        logger.info(
+            "HybridFaissRagService — pre-computed results set — "
+            "live retrieval will be skipped"
         )
 
     # ── RRF core ──────────────────────────────────────────────────────────────
@@ -204,6 +224,19 @@ class HybridFaissRagService(RagService):
         Returns:
             One list of ``(Document, rrf_score)`` tuples per query.
         """
+        # ── Pre-computed path: RRF fusion from cached sub-backend results ──────
+        if self.precomputed_results is not None:
+            dense_all  = self.precomputed_results["dense"]
+            sparse_all = self.precomputed_results["sparse"]
+            return [
+                self._fuse(
+                    [(doc, 0.0) for doc in dense_all[i]],
+                    [(doc, 0.0) for doc in sparse_all[i]],
+                    top_k,
+                )
+                for i in tqdm(range(len(queries)), desc="Fusing (hybrid_faiss, pre-computed)")
+            ]
+
         depth = max(self.rrf_depth, top_k)
 
         dense_all  = self.dense_service.batch_retrieve_with_scores(
@@ -241,10 +274,16 @@ class HybridFaissRagService(RagService):
         raise NotImplementedError("HybridFaissRagService has no index to delete.")
 
     def get_doc_count(self) -> int:
+        if self.precomputed_results is not None or self.dense_service is None:
+            return 1  # non-zero so runner's empty-index check passes
         return self.dense_service.get_doc_count()
 
     def embed_prompt(self, text: str) -> str:
+        if self.dense_service is None:
+            return text
         return self.dense_service.embed_prompt(text)
 
     def embed_passage(self, text: str) -> str:
+        if self.dense_service is None:
+            return text
         return self.dense_service.embed_passage(text)

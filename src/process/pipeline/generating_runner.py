@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 from typing import Any, Literal
 
+from tqdm import tqdm
+
 from config import DATA_DIR
 from src.corpus_handler.parquet_corpus_handler import ParquetCorpusHandler
 from src.question_input.huggingface_cyro_input import HuggingFaceCyroInput
@@ -285,6 +287,12 @@ class GeneratingRunner:
 
         retrieval_runner = RetrievalRunner(self._rcfg)
         run_idx = 0
+        progress = tqdm(
+            total=n_total,
+            desc="Stage 2 runs",
+            unit="run",
+            dynamic_ncols=True,
+        )
 
         for llm_model in self.cfg.models:
             logger.info("── Model: %s (%s) ──", llm_model.key, llm_model.type)
@@ -310,6 +318,7 @@ class GeneratingRunner:
                 for ctx_n in ([self.cfg.context_sizes[0]] if backend.key == "zero_shot" else self.cfg.context_sizes):
                     run_idx += 1
                     tag = f"{llm_model.key} | {backend.key} | top{ctx_n}"
+                    progress.set_postfix_str(tag)
                     answer_checkpoint = (
                         self._output_folder
                         / f"answer_checkpoint_{llm_model.key}_{backend.key}_top{ctx_n}.csv"
@@ -335,6 +344,7 @@ class GeneratingRunner:
 
                     if missing_count == 0:
                         logger.info("  [%d/%d] %s — all %d answers done, skipping", run_idx, n_total, tag, len(question_ids))
+                        progress.update(1)
                         continue
 
                     if done_map:
@@ -394,6 +404,9 @@ class GeneratingRunner:
                         question_ids=question_ids,
                         latencies_ms=gen_latencies_ms,
                     )
+                    progress.update(1)
+
+        progress.close()
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

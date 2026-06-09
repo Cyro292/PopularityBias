@@ -34,14 +34,35 @@ _NUM_DECILES = 10
 
 # Bump this whenever the stats computation changes so cached entries are
 # automatically invalidated on the next run.
-TFIDF_STATS_VERSION = 2
+TFIDF_STATS_VERSION = 3
 
 
-def _cache_key(chunk_size: int | None, chunk_overlap: int, sample_per_decile: int) -> str:
-    """Return the metadata.json key for the given chunking + sample settings."""
+def _cache_key(
+    chunk_size: int | None,
+    chunk_overlap: int,
+    sample_per_decile: int,
+    *,
+    max_features: int | None = None,
+) -> str:
+    """Return the metadata.json key for the given chunking + sample settings.
+
+    Args:
+        chunk_size: Chunk size in characters (``None`` = document-level).
+        chunk_overlap: Overlap between consecutive chunks.
+        sample_per_decile: Documents sampled per decile.
+        max_features: Vocabulary cap.  Included since v3 so that changing
+            ``max_features`` invalidates the cache.
+
+    Returns:
+        Cache key string embedded in ``metadata.json``.
+    """
+    parts = [_CACHE_KEY]
     if chunk_size:
-        return f"{_CACHE_KEY}_chunks_{chunk_size}_{chunk_overlap}_n{sample_per_decile}"
-    return f"{_CACHE_KEY}_n{sample_per_decile}"
+        parts.append(f"chunks_{chunk_size}_{chunk_overlap}")
+    parts.append(f"n{sample_per_decile}")
+    if max_features is not None:
+        parts.append(f"vocab{max_features}")
+    return "_".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +147,13 @@ def _reservoir_sample_corpus(
                     if j < sample_per_decile:
                         reservoirs[d][j] = text
 
-        # Early exit: all deciles full and we've seen a reasonable oversample
+        # Early exit: only when every decile's reservoir is full AND
+        # we've seen at least 100× the per-decile target.  This ensures
+        # we scan a substantial fraction of the corpus so that file-order
+        # bias is minimised.
         if all(len(reservoirs[d]) >= sample_per_decile for d in range(_NUM_DECILES)):
             sampled_so_far = sum(counts.values())
-            if sampled_so_far >= sample_per_decile * 50:
+            if sampled_so_far >= sample_per_decile * 100:
                 print(f"  Early exit after {sampled_so_far:,} docs seen")
                 break
 
@@ -333,7 +357,7 @@ def load_or_compute_corpus_vectorizer(
 
     metadata_path = Path(metadata_path)
     cache_dir = metadata_path.parent
-    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile)
+    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile, max_features=max_features)
     pkl_path = cache_dir / f"tfidf_vectorizer_{key}.pkl"
 
     if not force_recompute and pkl_path.exists():
@@ -672,7 +696,7 @@ def load_or_compute_tfidf_stats(
         mean_tfidf_score, mean_idf_of_used_terms, vocab_coverage
     """
     metadata_path = Path(metadata_path)
-    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile)
+    key = _cache_key(chunk_size, chunk_overlap, sample_per_decile, max_features=max_features)
 
     # ---- Try cache first ------------------------------------------------
     if not force_recompute and metadata_path.exists():
@@ -802,9 +826,12 @@ def plot_retrieval_difficulty(
 
     n_panels = 4 if avg_chunk_length is not None else 3
 
-    # Random baseline: P(random chunk = gold doc) = 1 / corpus_docs[d]
+    # Random baselines: P(random unit = gold doc)
+    #   doc-level:   1 / corpus_docs[d]
+    #   chunk-level: 1 / corpus_chunks[d]  (relevant for BM25 chunk retrieval)
     with np.errstate(divide="ignore", invalid="ignore"):
-        random_p_hit = np.where(corpus_docs > 0, 1.0 / corpus_docs, np.nan)
+        random_p_doc   = np.where(corpus_docs > 0,   1.0 / corpus_docs,   np.nan)
+        random_p_chunk = np.where(corpus_chunks > 0, 1.0 / corpus_chunks, np.nan)
 
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
 
@@ -836,23 +863,29 @@ def plot_retrieval_difficulty(
     ax.set_xticks(d_idx)
     ax.grid(axis="y", alpha=0.3)
 
-    # Panel C — Random-baseline hit probability
+    # Panel C — Random-baseline hit probability (both doc- and chunk-level)
     ax = axes[2]
-    pct = random_p_hit * 100
-    ax.bar(d_idx, pct, color="#e74c3c", alpha=0.85, edgecolor="white", linewidth=1)
-    valid_pct = pct[~np.isnan(pct)]
-    for xi, p in zip(d_idx, pct):
+    pct_doc   = random_p_doc   * 100
+    pct_chunk = random_p_chunk * 100
+    width = 0.35
+    ax.bar(d_idx - width / 2, pct_doc, width, color="#e74c3c", alpha=0.80,
+           edgecolor="white", linewidth=1, label="Doc-level (1/docs)")
+    ax.bar(d_idx + width / 2, pct_chunk, width, color="#c0392b", alpha=0.60,
+           edgecolor="white", linewidth=1, label="Chunk-level (1/chunks)")
+    valid_pct = pct_doc[~np.isnan(pct_doc)]
+    for xi, p in zip(d_idx, pct_doc):
         if not np.isnan(p):
-            ax.text(xi, p + (max(valid_pct) * 0.01 if len(valid_pct) else 0), f"{p:.3f}%",
-                    ha="center", va="bottom", fontsize=7.5, fontweight="bold")
+            ax.text(xi, p + (max(valid_pct) * 0.02 if len(valid_pct) else 0), f"{p:.3f}%",
+                    ha="center", va="bottom", fontsize=6.5, fontweight="bold")
     ax.set_xlabel("Popularity Decile (1=Rare → 10=Famous)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("P(random chunk = gold doc) %", fontsize=11, fontweight="bold")
+    ax.set_ylabel("P(random = gold) %", fontsize=11, fontweight="bold")
     ax.set_title(
         "C. Random-Baseline Hit Probability\n"
-        "(= 1 / corpus_docs[d] — higher = trivially easier)",
+        "(higher = trivially easier)",
         fontsize=12, fontweight="bold",
     )
     ax.set_xticks(d_idx)
+    ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
 
     # Panel D — Average chunk character length per decile (optional)

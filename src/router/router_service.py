@@ -49,7 +49,8 @@ image = (
         "pandas",
         "pyarrow",
         "scikit-learn",
-        "tqdm"
+        "tqdm",
+        "wandb",
     )
     .run_function(download_models)
 )
@@ -146,6 +147,13 @@ class RouterModel:
         dropout: float | None = None,
         use_scheduler: bool = True,
         seed: int = 42,
+        weight_decay: float = 1e-3,
+        bert_weight_decay: float = 1e-2,
+        wandb_key: str | None = None,
+        wandb_project: str = "popularity-bias-router",
+        wandb_run_name: str | None = None,
+        warmup_epochs: int = 0,
+        min_lr_ratio: float = 0.1,
     ) -> Dict:
         """Train router model on Modal GPU and return trained weights.
         
@@ -159,6 +167,18 @@ class RouterModel:
                 historical defaults (0.3 frozen BERT, 0.5 unfrozen BERT).
             use_scheduler: Whether to use cosine learning-rate scheduling.
             seed: Random seed for torch, numpy, and Python random.
+            weight_decay: L2 weight decay for the classifier head.
+            bert_weight_decay: L2 weight decay for unfrozen BERT params.
+            wandb_key: W&B API key. If provided, metrics are logged to W&B.
+            wandb_project: W&B project name.
+            wandb_run_name: W&B run name (defaults to model config auto-name).
+            warmup_epochs: Linear warmup epochs before cosine decay begins.
+                0 disables warmup.  During warmup, LR ramps linearly from
+                ``lr / warmup_epochs`` to ``lr``.
+            min_lr_ratio: Minimum LR as a fraction of the initial LR
+                (default 0.1 → LR never drops below 10% of initial).
+                Prevents the "dead zone" where cosine annealing pushes
+                LR to ~0 and the model stops learning in later epochs.
         """
         import random
 
@@ -252,7 +272,7 @@ class RouterModel:
         # pass one to AdamW. Higher wd on the unfrozen BERT params adds
         # extra regularization for the fine-tuning case.
         optimizer_params = [
-            {'params': classifier.parameters(), 'lr': lr, 'weight_decay': 1e-3}
+            {'params': classifier.parameters(), 'lr': lr, 'weight_decay': weight_decay}
         ]
         
         # Add BERT parameters if any layers are unfrozen
@@ -260,21 +280,51 @@ class RouterModel:
             bert_params = [p for p in self.bert.parameters() if p.requires_grad]
             if bert_params:
                 optimizer_params.insert(
-                    0, {'params': bert_params, 'lr': bert_lr, 'weight_decay': 1e-2}
+                    0, {'params': bert_params, 'lr': bert_lr, 'weight_decay': bert_weight_decay}
                 )
-                print(f"Using differential LR: BERT={bert_lr} (wd=1e-2), "
-                      f"Classifier={lr} (wd=1e-3), dropout={classifier_dropout}")
+                print(f"Using differential LR: BERT={bert_lr} (wd={bert_weight_decay}), "
+                      f"Classifier={lr} (wd={weight_decay}), dropout={classifier_dropout}")
         
         opt = torch.optim.AdamW(optimizer_params)
-        # T_max tracks the actual epoch count so the cosine schedule completes
-        # a full cycle by the end of training (was hardcoded to 40, which made
-        # LR climb back up for any --epochs > 40 run). Vanilla experiments can
-        # disable this to keep a constant LR throughout training.
-        scheduler = (
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-            if use_scheduler
-            else None
-        )
+        # ── Scheduler: cosine annealing with optional warmup and LR floor ──
+        # The previous CosineAnnealingLR used eta_min=0 (default), which
+        # pushed the LR to ~0 by the end of training — effectively a dead
+        # zone where the model could no longer learn.  We now:
+        #   1. Set eta_min = lr * min_lr_ratio (default 10%) so the LR
+        #      never collapses to zero.
+        #   2. Optionally prepend a linear warmup phase (warmup_epochs > 0)
+        #      to stabilize early training when BERT layers are unfrozen.
+        # Both phases are strictly monotonically non-increasing (the
+        # warmup is strictly increasing, then cosine is strictly
+        # decreasing), so there are no non-monotonic jumps.
+        if use_scheduler:
+            import math
+
+            eta_min = lr * min_lr_ratio
+
+            if warmup_epochs > 0:
+                cosine_epochs = max(1, epochs - warmup_epochs)
+                _eta_ratio = min_lr_ratio
+
+                def _warmup_cosine(epoch: int) -> float:
+                    if epoch < warmup_epochs:
+                        return (epoch + 1) / warmup_epochs
+                    progress = (epoch - warmup_epochs) / cosine_epochs
+                    return _eta_ratio + (1 - _eta_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+                scheduler: "torch.optim.lr_scheduler.LRScheduler | None" = (
+                    torch.optim.lr_scheduler.LambdaLR(opt, _warmup_cosine)
+                )
+                print(f"Scheduler: warmup {warmup_epochs} ep → cosine "
+                      f"(eta_min={eta_min:.2e}, ratio={min_lr_ratio:.0%})")
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=epochs, eta_min=eta_min,
+                )
+                print(f"Scheduler: cosine (eta_min={eta_min:.2e}, "
+                      f"ratio={min_lr_ratio:.0%}, T_max={epochs})")
+        else:
+            scheduler = None
         loss_fn = nn.CrossEntropyLoss()
         
         train_dataset = TensorDataset(
@@ -293,6 +343,39 @@ class RouterModel:
         )
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
         
+        # ── W&B init ─────────────────────────────────────────────────────
+        wandb_run = None
+        if wandb_key:
+            try:
+                import wandb
+                wandb.login(key=wandb_key)
+                wandb_run = wandb.init(
+                    project=wandb_project,
+                    name=wandb_run_name,
+                    config={
+                        "epochs": epochs,
+                        "batch_size": batch_size,
+                        "lr": lr,
+                        "unfreeze_layers": unfreeze_layers,
+                        "bert_lr": bert_lr,
+                        "include_popularity": include_popularity,
+                        "patience": patience,
+                        "dropout": classifier_dropout,
+                        "use_scheduler": use_scheduler,
+                        "seed": seed,
+                        "weight_decay": weight_decay,
+                        "bert_weight_decay": bert_weight_decay,
+                        "num_classes": num_classes,
+                        "num_train": len(train_questions),
+                        "num_test": len(test_questions),
+                        "input_dim": input_dim,
+                    },
+                )
+                print(f"W&B run initialized: {wandb_run.url}")
+            except Exception as e:
+                print(f"Warning: W&B init failed ({e}), continuing without logging.")
+                wandb_run = None
+
         # Training loop
         history = {'train_loss': [], 'train_acc': [], 'test_acc': [], 'test_loss': []}
         
@@ -403,6 +486,17 @@ class RouterModel:
                   f'Train Acc: {train_acc:.2%} | Test Loss: {avg_test_loss:.4f} | '
                   f'Test Acc: {test_acc:.2%}')
             
+            # ── W&B per-epoch logging ────────────────────────────────────
+            if wandb_run is not None:
+                wandb_run.log({
+                    "epoch": epoch + 1,
+                    "train_loss": avg_train_loss,
+                    "train_acc": train_acc,
+                    "test_loss": avg_test_loss,
+                    "test_acc": test_acc,
+                    "learning_rate": opt.param_groups[0]["lr"],
+                })
+            
             # ── Best-model snapshot + early stopping ───────────────────────
             if avg_test_loss < best_test_loss - min_delta:
                 best_test_loss = avg_test_loss
@@ -425,6 +519,16 @@ class RouterModel:
         # record best_epoch / best_test_loss for diagnostics, but the saved
         # checkpoint should reflect the actual end of the requested run.
         state_dict_cpu = {k: v.cpu() for k, v in classifier.state_dict().items()}
+
+        # ── W&B final summary ────────────────────────────────────────────
+        if wandb_run is not None:
+            wandb_run.log({
+                "stopped_early": int(stopped_early),
+                "best_epoch": best_epoch + 1 if best_classifier_state is not None else 0,
+                "best_test_loss": best_test_loss if best_classifier_state is not None else 0.0,
+                "epochs_completed": epoch + 1,
+            })
+            wandb_run.finish()
         
         return {
             'classifier_state': state_dict_cpu,
@@ -448,6 +552,8 @@ class RouterModel:
                 'unfreeze_layers': unfreeze_layers,
                 'include_popularity': include_popularity,
                 'use_scheduler': use_scheduler,
+                'warmup_epochs': warmup_epochs,
+                'min_lr_ratio': min_lr_ratio,
                 'seed': seed,
             }
         }
@@ -462,8 +568,12 @@ class RouterModel:
         scaler_scale: List[float],
         model_config: Dict,
         batch_size: int = 64
-    ) -> List[int]:
-        """Run inference on a batch of questions."""
+    ) -> List[List[float]]:
+        """Run inference on a batch of questions.
+
+        Returns:
+            Softmax probabilities per class for each question.
+        """
         import torch
         import torch.nn as nn
         from torch.utils.data import TensorDataset, DataLoader
@@ -508,7 +618,7 @@ class RouterModel:
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         
         # Inference
-        all_preds = []
+        all_probs: List[List[float]] = []
         
         with torch.no_grad():
             for batch in loader:
@@ -522,10 +632,10 @@ class RouterModel:
                     combined = cls_embedding
                 logits = classifier(combined)
                 
-                preds = logits.argmax(1).cpu().numpy()
-                all_preds.extend(preds.tolist())
+                probs = torch.softmax(logits, dim=1).cpu().tolist()
+                all_probs.extend(probs)
         
-        return all_preds
+        return all_probs
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -587,6 +697,13 @@ class RouterService:
         dropout: float | None = None,
         use_scheduler: bool = True,
         seed: int = 42,
+        weight_decay: float = 1e-3,
+        bert_weight_decay: float = 1e-2,
+        wandb_key: str | None = None,
+        wandb_project: str = "popularity-bias-router",
+        wandb_run_name: str | None = None,
+        warmup_epochs: int = 0,
+        min_lr_ratio: float = 0.1,
     ) -> Dict:
         """Train router on Modal GPU.
         
@@ -598,6 +715,13 @@ class RouterService:
             dropout: Optional classifier dropout override.
             use_scheduler: Whether to use cosine learning-rate scheduling.
             seed: Random seed for reproducible training.
+            weight_decay: L2 weight decay for the classifier head.
+            bert_weight_decay: L2 weight decay for unfrozen BERT params.
+            wandb_key: W&B API key. If provided, metrics are logged to W&B.
+            wandb_project: W&B project name.
+            wandb_run_name: W&B run name.
+            warmup_epochs: Linear warmup epochs before cosine decay begins.
+            min_lr_ratio: Minimum LR as a fraction of initial LR (default 0.1).
         """
         return self.service.train_router.remote(
             train_questions,
@@ -617,6 +741,13 @@ class RouterService:
             dropout,
             use_scheduler,
             seed,
+            weight_decay,
+            bert_weight_decay,
+            wandb_key,
+            wandb_project,
+            wandb_run_name,
+            warmup_epochs,
+            min_lr_ratio,
         )
     
     def predict(
@@ -628,8 +759,12 @@ class RouterService:
         scaler_scale: List[float],
         model_config: Dict,
         batch_size: int = 64
-    ) -> List[int]:
-        """Run inference on Modal GPU."""
+    ) -> List[List[float]]:
+        """Run inference on Modal GPU.
+
+        Returns:
+            Softmax probabilities per class for each question.
+        """
         return self.service.predict_batch.remote(
             questions,
             popularity,

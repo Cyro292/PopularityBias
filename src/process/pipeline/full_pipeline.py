@@ -204,10 +204,13 @@ def _retrieval_backends_for_keys(active_backends: list[str]) -> list[RetrievalBa
     """Build retrieval backends, adding dynamic router_*.pt backends as needed.
 
     The normal CLI path uses :class:`RetrievalConfig`, whose ``backends`` list
-    is mostly static. New router checkpoints under ``models/router_*.pt`` are
+    is mostly static. New router checkpoints under ``models/router*.pt`` are
     discovered dynamically here so commands like ``--only-keys
-    neural_router_mrr_filter_e80`` work without hand-editing
+    router_mrr_filter_e80`` work without hand-editing
     ``RetrievalConfig.backends`` for every new experiment.
+
+    For backward compatibility, the old ``neural_<stem>`` prefix (e.g.
+    ``neural_router_mrr_filter_e80``) is still accepted as an alias.
     """
     backends = list(RetrievalConfig().backends)
     dynamic_router_backends = router_backends_from_models_dir()
@@ -216,11 +219,19 @@ def _retrieval_backends_for_keys(active_backends: list[str]) -> list[RetrievalBa
         backends.extend(b for b in dynamic_router_backends if b.key not in existing)
 
     known_keys = {b.key for b in backends}
-    missing = sorted(k for k in active_backends if k not in known_keys)
+    # Backward compat: accept old "neural_<stem>" keys by stripping the
+    # "neural_" prefix.  New convention uses the bare stem as the key.
+    key_lookup: dict[str, str] = {}
+    for b in backends:
+        key_lookup[b.key] = b.key
+        if b.key.startswith("router"):
+            key_lookup[f"neural_{b.key}"] = b.key
+
+    missing = sorted(k for k in active_backends if k not in key_lookup)
     if missing:
         raise ValueError(
             "Requested backend keys are not declared and no matching "
-            f"models/router_*.pt files were found: {missing}"
+            f"models/router*.pt files were found: {missing}"
         )
     return backends
 
@@ -370,11 +381,11 @@ def run_router_evaluation(
 ) -> None:
     """Run retrieval → generation → eval for every router model in ``models/``.
 
-    Scans *models_dir* (default: ``ROOT_DIR / "models"``) for ``router_*.pt``
+    Scans *models_dir* (default: ``ROOT_DIR / "models"``) for ``router*.pt``
     files and builds two :class:`RetrievalBackend` entries per file:
 
-      * ``neural_router_<name>``       — strict argmax routing
-      * ``neural_router_<name>_hybrid`` — probability-weighted RRF
+      * ``<stem>``       — strict argmax routing
+      * ``<stem>_hybrid`` — probability-weighted RRF
 
     The required sub-backends (*bm25_plus* and *ivfpq_high* by default) are
     pulled from the default :class:`RetrievalConfig` and loaded once, then
@@ -390,7 +401,7 @@ def run_router_evaluation(
         models: LLM keys for Stage 2/3. Defaults to :data:`_DEFAULT_MODELS`.
         context_sizes: Number of docs fed to the LLM. Defaults to
             :data:`_DEFAULT_CONTEXT_SIZES`.
-        models_dir: Override the directory scanned for ``router_*.pt`` files.
+        models_dir: Override the directory scanned for ``router*.pt`` files.
         skip_retrieval: If True, reuse existing retrieval CSVs.
         skip_generation: If True, reuse existing answer checkpoints.
         skip_eval: If True, skip Stage 3.

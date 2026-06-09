@@ -76,6 +76,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -86,6 +87,7 @@ from typing import Literal
 
 import pandas as pd
 from langchain.schema import Document
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
@@ -178,20 +180,25 @@ def router_backends_from_models_dir(
     models_dir: Path | None = None,
     sub_keys: tuple[str, str] = ("bm25_plus", "ivfpq_high"),
 ) -> list[RetrievalBackend]:
-    """Build RetrievalBackend entries for every router_*.pt in a directory.
+    """Build RetrievalBackend entries for every router*.pt in a directory.
 
-    Each ``router_<name>.pt`` file yields two backends so both routing
+    Each ``router<name>.pt`` file yields two backends so both routing
     strategies can be compared:
 
-      - ``neural_router_<name>``       — strict (argmax) routing
-      - ``neural_router_<name>_hybrid`` — probability-weighted RRF routing
+      - ``<stem>``       — strict (argmax) routing
+      - ``<stem>_hybrid`` — probability-weighted RRF routing
+
+    The backend key equals the file stem (e.g. ``router_mrr_filter_e80``
+    or ``router60k_frozen_wd5e-3_drop60_mrr20_s42``).  For backward
+    compatibility, the old ``neural_<stem>`` prefix is resolved as an
+    alias in :func:`full_pipeline._retrieval_backends_for_keys`.
 
     The referenced *sub_keys* (default: ``bm25_plus`` and ``ivfpq_high``)
     must be declared earlier in :class:`RetrievalConfig.backends` so their
     services are loaded before the router is constructed.
 
     Args:
-        models_dir: Directory containing the trained ``router_*.pt`` files.
+        models_dir: Directory containing the trained ``router*.pt`` files.
             Defaults to ``ROOT_DIR / "models"``.
         sub_keys: Backend keys the router chooses between. Order matters —
             it must match the ``backend_order`` the model was trained on.
@@ -208,19 +215,19 @@ def router_backends_from_models_dir(
             f"router_backends_from_models_dir: '{models_dir}' does not exist"
         )
 
-    pt_files = sorted(models_dir.glob("router_*.pt"))
+    pt_files = sorted(models_dir.glob("router*.pt"))
     if not pt_files:
-        logger.warning("No router_*.pt files found in %s", models_dir)
+        logger.warning("No router*.pt files found in %s", models_dir)
         return []
 
     backends: list[RetrievalBackend] = []
     for pt in pt_files:
-        stem        = pt.stem                    # e.g. "router_pop_after_bert"
+        stem        = pt.stem                    # e.g. "router_mrr_filter_e80"
         model_path  = str(pt.resolve())          # absolute — survives CWD changes
         backend_ord = list(sub_keys)
 
         backends.append(RetrievalBackend(
-            key             = f"neural_{stem}",
+            key             = stem,
             label           = f"Neural Router ({stem}) — strict",
             type            = "neural_router",
             router_sub_keys = sub_keys,
@@ -231,7 +238,7 @@ def router_backends_from_models_dir(
             },
         ))
         backends.append(RetrievalBackend(
-            key             = f"neural_{stem}_hybrid",
+            key             = f"{stem}_hybrid",
             label           = f"Neural Router ({stem}) — hybrid RRF",
             type            = "neural_router",
             router_sub_keys = sub_keys,
@@ -754,6 +761,10 @@ class RetrievalRunner:
         self.cfg = cfg
         self._collection_folder = DATA_DIR / cfg.collection_name
         self._output_folder     = self._collection_folder / cfg.output_dir
+        self._precomputed_cache: dict[str, dict[str, list[list[Document]]]] = {}
+        self._shared_precomputed_docs: dict[str, list[list[Document]]] = {}
+        self._shared_precomputed_depths: dict[str, int] = {}
+        self._shared_precomputed_refcounts: dict[str, int] = {}
 
     # ── Question loading helper ───────────────────────────────────────────────
 
@@ -884,11 +895,24 @@ class RetrievalRunner:
                     f"[{backend.key}] router_sub_keys must have exactly 2 entries: "
                     "(sparse_key, dense_key)"
                 )
+            sparse_key, dense_key = backend.router_sub_keys[:2]
+
+            # ── Pre-computed path: skip live sub-backend loading ────────────
+            precomputed = self._precomputed_cache.get(backend.key)
+            if precomputed is not None:
+                logger.info("⚡ [%s] Using pre-computed sub-backend results", backend.key)
+                service = RouterRagService(**backend.service_kwargs)
+                service.set_precomputed_results({
+                    "dense":  precomputed.get(dense_key, []),
+                    "sparse": precomputed.get(sparse_key, []),
+                })
+                return service
+
+            # ── Live path: requires loaded sub-backend services ──────────────
             if loaded_services is None:
                 raise ValueError(
                     f"[{backend.key}] loaded_services dict is required for type='router'"
                 )
-            sparse_key, dense_key = backend.router_sub_keys[:2]
 
             def _get(key: str) -> object:
                 svc = loaded_services.get(key)
@@ -911,11 +935,24 @@ class RetrievalRunner:
                     f"[{backend.key}] router_sub_keys must have exactly 2 entries: "
                     "(sparse_key, dense_key)"
                 )
+            sparse_key, dense_key = backend.router_sub_keys[:2]
+
+            # ── Pre-computed path: skip live sub-backend loading ────────────
+            precomputed = self._precomputed_cache.get(backend.key)
+            if precomputed is not None:
+                logger.info("⚡ [%s] Using pre-computed sub-backend results", backend.key)
+                service = HybridFaissRagService(**backend.service_kwargs)
+                service.set_precomputed_results({
+                    "dense":  precomputed.get(dense_key, []),
+                    "sparse": precomputed.get(sparse_key, []),
+                })
+                return service
+
+            # ── Live path: requires loaded sub-backend services ──────────────
             if loaded_services is None:
                 raise ValueError(
                     f"[{backend.key}] loaded_services dict is required for type='hybrid_faiss'"
                 )
-            sparse_key, dense_key = backend.router_sub_keys[:2]
 
             def _get_hybrid(key: str) -> object:
                 svc = loaded_services.get(key)
@@ -939,16 +976,12 @@ class RetrievalRunner:
                 raise ValueError(
                     f"[{backend.key}] router_sub_keys must have 2+ entries for neural_router"
                 )
-            if loaded_services is None:
-                raise ValueError(
-                    f"[{backend.key}] loaded_services dict is required for type='neural_router'"
-                )
-            
+
             # Extract configuration from service_kwargs
             kwargs = dict(backend.service_kwargs)
             model_path = kwargs.pop("model_path", None)
             backend_order = kwargs.pop("backend_order", None)
-            
+
             if model_path is None:
                 raise ValueError(
                     f"[{backend.key}] service_kwargs must include 'model_path' for neural_router"
@@ -957,8 +990,27 @@ class RetrievalRunner:
                 raise ValueError(
                     f"[{backend.key}] service_kwargs must include 'backend_order' for neural_router"
                 )
-            
-            # Build backends dict from router_sub_keys
+
+            # ── Pre-computed path: skip live sub-backend loading ────────────
+            precomputed = self._precomputed_cache.get(backend.key)
+            if precomputed is not None:
+                logger.info("⚡ [%s] Using pre-computed sub-backend results", backend.key)
+                from src.rag.neural_router_rag_service import NeuralRouterRagService
+                service = NeuralRouterRagService(
+                    backends={},
+                    backend_order=backend_order,
+                    model_path=model_path,
+                    **kwargs,
+                )
+                service.set_precomputed_results(precomputed)
+                return service
+
+            # ── Live path: requires loaded sub-backend services ──────────────
+            if loaded_services is None:
+                raise ValueError(
+                    f"[{backend.key}] loaded_services dict is required for type='neural_router'"
+                )
+
             backends_dict = {}
             for sub_key in backend.router_sub_keys:
                 svc = loaded_services.get(sub_key)
@@ -989,6 +1041,8 @@ class RetrievalRunner:
         question_ids: list[str] | None = None,
         popularities: list[float] | None = None,
         loaded_services: dict[str, object] | None = None,
+        *,
+        override_top_k: int | None = None,
     ) -> tuple[list[list[Document]], list[float]]:
         """Run retrieval for one backend.
 
@@ -1002,12 +1056,16 @@ class RetrievalRunner:
             loaded_services: Already-loaded service instances keyed by backend
                 key.  Required when ``backend.type == "router"`` so the router
                 can be constructed from pre-loaded sub-backends.
+            override_top_k: When provided, use this instead of ``cfg.top_k``.
+                Used by the auto-upgrade path to retrieve sub-backends at a
+                deeper depth for RRF fusion.
 
         Returns:
             Tuple of (list of document lists — one per question,
             list of per-question latency in ms).
         """
         _ids = question_ids or [str(i) for i in range(len(questions))]
+        _top_k = override_top_k or self.cfg.top_k
 
         if backend.type == "zero_shot":
             return [[] for _ in questions], [0.0] * len(questions)
@@ -1033,7 +1091,7 @@ class RetrievalRunner:
             scored, latencies_ms = time_batch(
                 lambda: service.batch_retrieve_with_scores(
                     questions,
-                    top_k=self.cfg.top_k,
+                    top_k=_top_k,
                     popularities=popularities,
                 ),
                 _ids,
@@ -1042,7 +1100,7 @@ class RetrievalRunner:
             scored, latencies_ms = time_batch(
                 lambda: service.batch_retrieve_with_scores(
                     questions,
-                    top_k=self.cfg.top_k,
+                    top_k=_top_k,
                     strategy=backend.es_strategy,
                     search_workers=6,
                     msearch_batch_size=5,
@@ -1052,11 +1110,246 @@ class RetrievalRunner:
             )
         else:
             scored, latencies_ms = time_batch(
-                lambda: service.batch_retrieve_with_scores(questions, top_k=self.cfg.top_k),
+                lambda: service.batch_retrieve_with_scores(questions, top_k=_top_k),
                 _ids,
             )
 
         return [[doc for doc, _ in docs] for docs in scored], latencies_ms
+
+    # ── Pre-computed sub-backend reuse helpers ─────────────────────────────────
+
+    def _compute_required_depth(self, backend: RetrievalBackend) -> int:
+        """Determine the required retrieval depth for a backend's sub-backends.
+
+        Hybrid/RRF modes need ``max(rrf_depth, top_k)`` docs per sub-backend
+        for proper fusion. Strict modes only need ``top_k``.
+
+        Args:
+            backend: A composite backend declaration.
+
+        Returns:
+            Required number of docs per question per sub-backend.
+        """
+        top_k = self.cfg.top_k
+        if backend.type == "neural_router":
+            strict = backend.service_kwargs.get("strict", True)
+            if not strict:
+                rrf_depth = backend.service_kwargs.get("rrf_depth", 60)
+                return max(rrf_depth, top_k)
+        elif backend.type == "hybrid_faiss":
+            rrf_depth = backend.service_kwargs.get("rrf_depth", 60)
+            return max(rrf_depth, top_k)
+        # router (popularity) and strict neural_router only need top_k
+        return top_k
+
+    def _try_load_precomputed(
+        self,
+        sub_keys: tuple[str, ...],
+        question_ids: list[str],
+        required_depth: int,
+    ) -> tuple[dict[str, list[list[Document]]] | None, list[str]]:
+        """Try to load pre-computed sub-backend results from CSVs.
+
+        Args:
+            sub_keys: Sub-backend keys (e.g., ``("bm25_plus", "ivfpq_high")``).
+            question_ids: All question IDs in evaluation order.
+            required_depth: Minimum docs per question needed.
+
+        Returns:
+            Tuple of ``(precomputed_dict, insufficient_keys)``.
+            ``precomputed_dict`` is ``None`` if any CSV is missing entirely.
+            ``insufficient_keys`` lists sub-keys whose CSV exists but has
+            fewer docs than ``required_depth`` (candidates for auto-upgrade).
+        """
+        precomputed: dict[str, list[list[Document]]] = {}
+        insufficient: list[str] = []
+        for sub_key in sub_keys:
+            if sub_key in self._shared_precomputed_docs:
+                docs = self._shared_precomputed_docs[sub_key]
+                max_docs = self._shared_precomputed_depths.get(sub_key, 0)
+                if max_docs < required_depth:
+                    insufficient.append(sub_key)
+                precomputed[sub_key] = docs
+                continue
+
+            path = self._output_folder / f"retrieved_docs_{sub_key}.csv"
+            if not path.exists():
+                return None, list(sub_keys)
+
+            logger.info("📥 [%s] Loading pre-computed CSV into memory: %s", sub_key, path.name)
+            docs = load_retrieved_docs_csv(path, question_ids)
+            if docs is None:
+                return None, list(sub_keys)
+
+            max_docs = max((len(d) for d in docs), default=0)
+            self._shared_precomputed_docs[sub_key] = docs
+            self._shared_precomputed_depths[sub_key] = max_docs
+            if max_docs < required_depth:
+                insufficient.append(sub_key)
+            precomputed[sub_key] = docs
+        return precomputed, insufficient
+
+    def _upgrade_sub_backend(
+        self,
+        sub_key: str,
+        required_depth: int,
+        questions: list[str],
+        question_ids: list[str],
+        popularities: list[float],
+        backend_by_key: dict[str, RetrievalBackend],
+        loaded_services: dict[str, object],
+    ) -> list[list[Document]]:
+        """Re-retrieve a sub-backend at a deeper depth and overwrite its CSV.
+
+        Used when an existing CSV has fewer docs than needed for RRF fusion.
+
+        Args:
+            sub_key: Sub-backend key to upgrade.
+            required_depth: Target number of docs per question.
+            questions: All question texts.
+            question_ids: All question IDs.
+            popularities: Per-question popularity scores.
+            backend_by_key: Mapping from backend key to declaration.
+            loaded_services: Cache of loaded services.
+
+        Returns:
+            The deeper retrieval results as ``list[list[Document]]``.
+        """
+        sub_backend = backend_by_key.get(sub_key)
+        if sub_backend is None:
+            raise ValueError(f"Sub-backend '{sub_key}' not found in config")
+
+        old_path = self._output_folder / f"retrieved_docs_{sub_key}.csv"
+        old_count = 0
+        if old_path.exists():
+            old_docs = load_retrieved_docs_csv(old_path, question_ids)
+            if old_docs:
+                old_count = max((len(d) for d in old_docs), default=0)
+
+        logger.info(
+            "♻ [%s] Auto-upgrading CSV: depth %d → %d (needed for RRF fusion)",
+            sub_key, old_count, required_depth,
+        )
+
+        # Delete old checkpoint so it's fully re-retrieved (not appended)
+        if old_path.exists():
+            old_path.unlink()
+
+        retrieved, latencies_ms = self.retrieve_for_backend(
+            sub_backend, questions, question_ids,
+            popularities=popularities,
+            loaded_services=loaded_services,
+            override_top_k=required_depth,
+        )
+
+        save_retrieved_docs_csv(retrieved, question_ids, old_path)
+        logger.info(
+            "✓ [%s] Upgraded CSV saved (%d questions × %d docs) → %s",
+            sub_key, len(retrieved), required_depth, old_path,
+        )
+
+        latency_path = self._output_folder / f"latency_retrieval_{sub_key}.json"
+        save_latency(
+            path=latency_path,
+            backend_key=sub_key,
+            stage="retrieval",
+            question_ids=question_ids,
+            latencies_ms=latencies_ms,
+        )
+        self._shared_precomputed_docs[sub_key] = retrieved
+        self._shared_precomputed_depths[sub_key] = required_depth
+        return retrieved
+
+    def _release_precomputed_for_backend(self, backend_key: str) -> None:
+        """Release shared pre-computed data once no remaining backend needs it."""
+        precomputed = self._precomputed_cache.pop(backend_key, None)
+        if precomputed is None:
+            return
+
+        freed_any = False
+        for sub_key in precomputed:
+            remaining = self._shared_precomputed_refcounts.get(sub_key, 0) - 1
+            if remaining > 0:
+                self._shared_precomputed_refcounts[sub_key] = remaining
+                continue
+            self._shared_precomputed_refcounts.pop(sub_key, None)
+            if self._shared_precomputed_docs.pop(sub_key, None) is not None:
+                freed_any = True
+            self._shared_precomputed_depths.pop(sub_key, None)
+
+        if freed_any:
+            gc.collect()
+
+    def _prepare_precomputed(
+        self,
+        composite_backends: list[RetrievalBackend],
+        questions: list[str],
+        question_ids: list[str],
+        popularities: list[float],
+        backend_by_key: dict[str, RetrievalBackend],
+        loaded_services: dict[str, object],
+    ) -> set[str]:
+        """Check and prepare pre-computed results for composite backends.
+
+        For each composite backend, tries to load sub-backend CSVs. If CSVs
+        exist with sufficient depth, stores them in ``self._precomputed_cache``.
+        If depth is insufficient, auto-upgrades the sub-backend CSV. If CSVs
+        are missing entirely, adds the sub-keys to a set for live loading.
+
+        Args:
+            composite_backends: Composite backends that will run.
+            questions: All question texts.
+            question_ids: All question IDs.
+            popularities: Per-question popularity scores.
+            backend_by_key: Mapping from backend key to declaration.
+            loaded_services: Cache of loaded services.
+
+        Returns:
+            Set of sub-backend keys that need live loading (no CSVs available).
+        """
+        needs_live: set[str] = set()
+        progress = tqdm(
+            composite_backends,
+            total=len(composite_backends),
+            desc="Preparing composite caches",
+            unit="backend",
+            dynamic_ncols=True,
+        )
+
+        for cb in progress:
+            progress.set_postfix_str(cb.key)
+            required_depth = self._compute_required_depth(cb)
+            precomputed, insufficient = self._try_load_precomputed(
+                cb.router_sub_keys, question_ids, required_depth,
+            )
+
+            if precomputed is None:
+                # CSVs missing — need live sub-backends
+                needs_live.update(cb.router_sub_keys)
+                continue
+
+            # Auto-upgrade insufficient sub-backends
+            for sub_key in insufficient:
+                upgraded = self._upgrade_sub_backend(
+                    sub_key, required_depth,
+                    questions, question_ids, popularities,
+                    backend_by_key, loaded_services,
+                )
+                precomputed[sub_key] = upgraded
+
+            self._precomputed_cache[cb.key] = precomputed
+            for sub_key in precomputed:
+                self._shared_precomputed_refcounts[sub_key] = (
+                    self._shared_precomputed_refcounts.get(sub_key, 0) + 1
+                )
+            logger.info(
+                "⚡ [%s] Pre-computed sub-backend results ready (depth=%d) — "
+                "will skip live %s retrieval",
+                cb.key, required_depth, list(cb.router_sub_keys),
+            )
+
+        progress.close()
+        return needs_live
 
     # ── Main run ──────────────────────────────────────────────────────────────
 
@@ -1104,19 +1397,23 @@ class RetrievalRunner:
         # without loading them a second time.
         loaded_services: dict[str, object] = {}
 
-        # Pre-load any sub-backends required by a router or hybrid_faiss or neural_router backend
-        # that is being run, even if those sub-backends are not in --only-keys themselves.
-        router_backends_to_run = [
+        # ── Determine which composite backends will run ─────────────────────
+        backend_by_key = {b.key: b for b in self.cfg.backends}
+        composite_backends_to_run = [
             b for b in self.cfg.backends
             if b.type in ("router", "hybrid_faiss", "neural_router")
             and (not self.cfg.only_keys or b.key in self.cfg.only_keys)
         ]
-        required_sub_keys: set[str] = set()
-        for rb in router_backends_to_run:
-            required_sub_keys.update(rb.router_sub_keys)
 
-        backend_by_key = {b.key: b for b in self.cfg.backends}
-        for sub_key in required_sub_keys:
+        # ── Prepare pre-computed sub-backend results (auto-upgrade if needed) ──
+        needs_live = self._prepare_precomputed(
+            composite_backends_to_run,
+            questions, question_ids, popularities,
+            backend_by_key, loaded_services,
+        )
+
+        # ── Pre-load live sub-backends for composite backends without CSVs ──
+        for sub_key in needs_live:
             if sub_key in loaded_services:
                 continue
             sub_backend = backend_by_key.get(sub_key)
@@ -1128,7 +1425,17 @@ class RetrievalRunner:
             except Exception as e:
                 logger.error("[%s] Failed to pre-load router sub-backend: %s", sub_key, e, exc_info=True)
 
-        for backend in self.cfg.backends:
+        total_backends = len(self.cfg.backends)
+        progress = tqdm(
+            self.cfg.backends,
+            total=total_backends,
+            desc="Stage 1 backends",
+            unit="backend",
+            dynamic_ncols=True,
+        )
+
+        for backend in progress:
+            progress.set_postfix_str(backend.key)
             if self.cfg.only_keys and backend.key not in self.cfg.only_keys:
                 logger.info("⏭ [%s] %s — skipped (not in --only-keys)", backend.key, backend.label)
                 continue
@@ -1151,6 +1458,7 @@ class RetrievalRunner:
 
                 if not missing_ids:
                     logger.info("✓ [%s] %s — all %d questions done, skipping", backend.key, backend.label, len(question_ids))
+                    self._release_precomputed_for_backend(backend.key)
                     # Ensure service is cached so a later router backend can reference it
                     if backend.type not in ("zero_shot", "router", "hybrid_faiss", "neural_router") and backend.key not in loaded_services:
                         try:
@@ -1192,14 +1500,7 @@ class RetrievalRunner:
                 logger.info("✓ [%s] Saved %d results → %s", backend.key, len(retrieved), checkpoint)
 
             # Cache non-router services for potential later router use
-            if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
-                try:
-                    loaded_services[backend.key] = self._load_service(backend, loaded_services)
-                except Exception as e:
-                    logger.warning("[%s] Could not cache service for router: %s", backend.key, e)
-
-            # Cache non-router services for potential later router use
-            if backend.type not in ("zero_shot", "router", "hybrid_faiss") and backend.key not in loaded_services:
+            if backend.type not in ("zero_shot", "router", "hybrid_faiss", "neural_router") and backend.key not in loaded_services:
                 try:
                     loaded_services[backend.key] = self._load_service(backend, loaded_services)
                 except Exception as e:
@@ -1213,6 +1514,9 @@ class RetrievalRunner:
                 question_ids=question_ids,
                 latencies_ms=latencies_ms,
             )
+            self._release_precomputed_for_backend(backend.key)
+
+        progress.close()
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
