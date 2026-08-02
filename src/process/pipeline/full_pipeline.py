@@ -13,22 +13,22 @@ Usage
 ::
 
     # Full run (skip stages whose outputs already exist)
-    python scripts/run_pipeline.py
+    python -m src.process.pipeline.full_pipeline
 
     # Wipe and redo everything
-    python scripts/run_pipeline.py --restart
+    python -m src.process.pipeline.full_pipeline --restart
 
     # Only redo retrieval for specific backends, keep generation + eval
-    python scripts/run_pipeline.py --restart-retrieval-keys bm25_plus faiss_hybrid
+    python -m src.process.pipeline.full_pipeline --restart-retrieval-keys bm25_plus faiss_hybrid
 
     # Skip retrieval entirely (use existing CSVs), redo generation + eval
-    python scripts/run_pipeline.py --skip-retrieval --restart-generation --restart-eval
+    python -m src.process.pipeline.full_pipeline --skip-retrieval --restart-generation --restart-eval
 
     # Run only a subset of backends end-to-end
-    python scripts/run_pipeline.py --only-keys bm25_plus ivfpq_high faiss_hybrid
+    python -m src.process.pipeline.full_pipeline --only-keys bm25_plus ivfpq_high faiss_hybrid
 
     # Restrict to one LLM
-    python scripts/run_pipeline.py --models neo
+    python -m src.process.pipeline.full_pipeline --models neo
 """
 
 from __future__ import annotations

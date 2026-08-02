@@ -13,7 +13,7 @@ Every trained router in ``models/<name>.pt`` is described by a single entry in
 - **Notes** — free-form, hand-editable string for hypotheses and observations.
 
 For models trained *before* this module existed, run
-``python scripts/backfill_router_metadata.py`` to retroactively populate
+``python -m src.process.migrations.backfill_router_metadata`` to retroactively populate
 their entries from the ``.pt`` contents and filename conventions. Such
 backfilled entries carry ``"backfilled": true`` and list every field that
 had to be guessed in ``"inferred_fields"``.
@@ -44,7 +44,7 @@ SCHEMA_VERSION: int = 1
 METADATA_PATH: Path = ROOT_DIR / "models" / "metadata.json"
 
 # Fields that are always inferred during backfill (cannot be recovered from
-# the .pt file alone). Used by ``scripts/backfill_router_metadata.py``.
+# the .pt file alone). Used by the router metadata migration.
 BACKFILL_INFERRED_FIELDS: tuple[str, ...] = (
     "collection_name",
     "dataset_dir",

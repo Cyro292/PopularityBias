@@ -54,10 +54,10 @@ pytest
 pytest -m "not integration"
 
 # Run a single test file
-pytest tests/bm25_parquet_vs_es.py
+pytest tests/test_bm25_analysis.py
 
 # Run a single test by name
-pytest tests/bm25_parquet_vs_es.py::test_function_name
+pytest tests/test_bm25_analysis.py::test_compute_per_query_retrieval_metrics
 
 # Verbose output
 pytest -v
@@ -74,26 +74,23 @@ and valid API keys in `.env`.
 
 ---
 
-## Key Scripts
+## Key Workflows
 
 ```bash
-# Build / index a corpus into Elasticsearch
-python scripts/run_indexing.py
-python scripts/run_indexing.py --jobs data/jobs/job1.json
-python scripts/run_indexing.py -c wiki_full_l -s 4025000   # resume at row offset
+# Build local or Elasticsearch indices
+python -m src.process.indexing.run_bm25 --help
+python -m src.process.indexing.run_faiss --help
+python -m src.process.indexing.run_es --jobs data/jobs/job1.json
 
 # Prepare a balanced QA evaluation dataset
-python scripts/prepare_qa_dataset.py \
+python -m src.process.qa_datasets.prepare_qa \
     --qa-datasets natural_questions hotpot_qa \
     --corpus data/wiki_full/wiki_corpus.parquet \
     --output data/wiki_full/all_qa_8k.parquet \
     --balance --target-per-decile 800
 
 # Deploy Modal GPU embedding service
-modal deploy rag/ModalEmbedding.py
-
-# Analyse indexing log files
-python log_analyser.py
+modal deploy src/embeddings/modal_embedding.py
 ```
 
 ---
@@ -238,7 +235,7 @@ OOM in long-running indexing scripts.
   `BaseRateLimiter`, batch retrieval helpers. Import from here rather than duplicating.
 - **`config.py`**: Single source of truth for paths (`ROOT_DIR`, `DATA_DIR`) and environment
   variables. Always import paths from here, never hard-code.
-- **`helpers/decile_utils.py`**: Popularity decile logic. `COL_POPULARITY` constant defines
+- **`src/metrics/decile_utils.py`**: Popularity decile logic. `COL_POPULARITY` constant defines
   the canonical column name used across the pipeline.
 - Data files (parquet, indices, caches) live under `data/` which is gitignored.
 - Notebooks under the root are for experimentation; production logic belongs in `.py` modules.

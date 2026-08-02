@@ -13,7 +13,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from config import DATA_DIR, CACHE_DIR, SYTHETNIC_QA_PROMPT_PATH
+from config import CACHE_DIR, DATA_DIR, SYNTHETIC_QA_PROMPT_PATH
 from src.metrics.decile_utils import (
     compute_corpus_boundaries as _compute_corpus_boundaries,
     assign_decile,
@@ -399,7 +399,7 @@ def generate_synthetic(
     """Generate synthetic questions for underrepresented deciles."""
     
     # Load prompt
-    prompt_path = prompt_path or SYTHETNIC_QA_PROMPT_PATH
+    prompt_path = prompt_path or SYNTHETIC_QA_PROMPT_PATH
     if not prompt_path.exists():
         raise FileNotFoundError(f"Prompt not found: {prompt_path}")
     

@@ -455,3 +455,163 @@ class AnalysisDatasetHandler(CorpusHandler):
         
         logger.info(f"Computed {metric}@{k}: {len(result):,} questions × {len(backends)} backends")
         return result
+
+    # ── Fusion Training Data ─────────────────────────────────────────────────
+
+    def build_fusion_training_data(
+        self,
+        backends: list[str] | None = None,
+        rrf_depth: int = 60,
+        split: Literal["train", "test"] | None = None,
+        exclude_datasets: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Build training data for the learnable query-conditioned RRF fusion model.
+
+        Loads the CSV retrieval checkpoints (``retrieved_docs_<backend>.csv``)
+        for each backend to get the top-``rrf_depth`` doc IDs in rank order.
+        Merges with the analysis dataset for question metadata and ground-truth
+        ``wikipedia_id``.
+
+        Each row represents one question with both backends' ranked doc lists,
+        enabling on-the-fly RRF fusion simulation with learned alpha/beta weights.
+
+        Args:
+            backends: Backend keys to include (default: ``['bm25_plus', 'ivfpq_high']``).
+            rrf_depth: Maximum retrieval depth per backend (matches ``rrf_depth``
+                used at retrieval time). CSVs must have at least this many docs
+                per question.
+            split: Optional split filter (``'train'`` or ``'test'``).
+            exclude_datasets: Dataset names to drop (e.g. ``['fever']``).
+
+        Returns:
+            DataFrame with one row per question and columns:
+
+            ============  ==============  =========================================
+            Column        Type            Description
+            ============  ==============  =========================================
+            question_id   str             Unique question identifier
+            question_text str             The question string
+            wikipedia_id  str             Ground-truth Wikipedia article ID
+            popularity    float           Pageview popularity score
+            decile        int             Popularity decile (0–9)
+            dataset       str             Source QA dataset name
+            split         str             ``'train'`` or ``'test'``
+            <backend>_doc_ids   list[str]  Top-``rrf_depth`` doc IDs in rank order
+            ============  ==============  =========================================
+
+        Raises:
+            FileNotFoundError: If a required CSV checkpoint is missing.
+            ValueError: If no questions have data for all requested backends.
+        """
+        if backends is None:
+            backends = ["bm25_plus", "ivfpq_high"]
+        if exclude_datasets is None:
+            exclude_datasets = []
+
+        analysis_df = self.load_analysis_dataset()
+        analysis_df = analysis_df[analysis_df["backend"].isin(backends)]
+
+        if split:
+            analysis_df = analysis_df[analysis_df["split"] == split]
+        if exclude_datasets:
+            analysis_df = analysis_df[~analysis_df["dataset"].isin(exclude_datasets)]
+
+        meta = (
+            analysis_df.groupby("question_id")
+            .agg(
+                {
+                    "question_text": "first",
+                    "popularity": "first",
+                    "dataset": "first",
+                    "split": "first",
+                    "decile": "first",
+                    "wikipedia_id": "first",
+                }
+            )
+            .reset_index()
+        )
+
+        questions_with_all = set()
+        for backend in backends:
+            backend_qids = set(
+                analysis_df[analysis_df["backend"] == backend]["question_id"].unique()
+            )
+            if not questions_with_all:
+                questions_with_all = backend_qids
+            else:
+                questions_with_all &= backend_qids
+
+        meta = meta[meta["question_id"].isin(questions_with_all)].reset_index(drop=True)
+        logger.info(
+            f"Questions with all {len(backends)} backends: {len(meta):,}"
+        )
+
+        question_ids = meta["question_id"].tolist()
+
+        for backend in backends:
+            csv_path = self.dataset_path / f"retrieved_docs_{backend}.csv"
+            if not csv_path.exists():
+                raise FileNotFoundError(
+                    f"Retrieval checkpoint not found: {csv_path}. "
+                    f"Run retrieval with top_k={rrf_depth} for backend '{backend}' first."
+                )
+
+            logger.info(f"Loading {backend} from {csv_path}...")
+            csv_df = pd.read_csv(csv_path, dtype={"question_id": str})
+
+            csv_df = csv_df[csv_df["question_id"].isin(questions_with_all)]
+            csv_df = csv_df.sort_values(["question_id", "doc_rank"])
+            csv_df = csv_df.drop_duplicates(subset=["question_id", "doc_rank"], keep="first")
+            csv_df = csv_df.groupby("question_id", group_keys=False).head(rrf_depth)
+
+            csv_df["metadata_wikipedia_id"] = csv_df["metadata_wikipedia_id"].astype(str)
+
+            if "metadata_score" in csv_df.columns:
+                grouped = csv_df.groupby("question_id").agg(
+                    doc_ids=("metadata_wikipedia_id", list),
+                    scores=("metadata_score", list),
+                )
+            else:
+                grouped = csv_df.groupby("question_id").agg(
+                    doc_ids=("metadata_wikipedia_id", list),
+                )
+
+            id_to_doc_ids = grouped["doc_ids"].to_dict()
+
+            if "metadata_score" in csv_df.columns:
+                id_to_scores = grouped["scores"].to_dict()
+
+            col_doc_ids = f"{backend}_doc_ids"
+            meta[col_doc_ids] = meta["question_id"].map(id_to_doc_ids)
+
+            if "metadata_score" in csv_df.columns:
+                col_scores = f"{backend}_scores"
+                meta[col_scores] = meta["question_id"].map(id_to_scores)
+
+            missing = meta[col_doc_ids].isna().sum()
+            if missing:
+                logger.warning(
+                    f"{backend}: {missing} questions have no retrieval data"
+                )
+
+            valid = meta[col_doc_ids].dropna()
+            if len(valid) > 0:
+                lens = valid.apply(len)
+                logger.info(
+                    f"{backend}: docs per question — "
+                    f"min={lens.min()}, max={lens.max()}, mean={lens.mean():.1f}"
+                )
+
+        meta["wikipedia_id"] = meta["wikipedia_id"].astype(str)
+
+        before = len(meta)
+        meta = meta.dropna(
+            subset=[f"{b}_doc_ids" for b in backends]
+        ).reset_index(drop=True)
+        if len(meta) < before:
+            logger.info(
+                f"Dropped {before - len(meta)} questions with missing retrieval data"
+            )
+
+        logger.info(f"Final fusion training data: {len(meta):,} questions")
+        return meta

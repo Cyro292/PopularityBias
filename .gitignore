@@ -1,4 +1,13 @@
 /.env
+/.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.claude/settings.local.json
+logs/
+notebooks/**/.cache/
+elastic-start-local/.env
 /chunk-b-g1.png
 /chunk-b-g2.png
 /chunk-s-g1.png
@@ -8,6 +17,7 @@
 /venv
 .venv/
 venv/
-ElasticSearchDisk_key.pem
+*.pem
 .opencode
 /models
+/paper_figures

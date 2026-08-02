@@ -770,12 +770,63 @@ class BM25RagService(RagService):
         ):
             batch = queries[i : i + batch_size]
             query_tokens = bm25s.tokenize(batch, stopwords="en", stemmer=_stemmer)
-            results, scores = retriever.retrieve(query_tokens, k=k)
+            results, scores = retriever.retrieve(query_tokens, k=k, show_progress=progress_bar)
             for q_idx in range(len(batch)):
                 per_q_results = results[q_idx : q_idx + 1]
                 per_q_scores  = scores[q_idx : q_idx + 1]
                 output.append(self._results_to_docs(per_q_results, per_q_scores, top_k))
 
+        return output
+
+    def batch_retrieve_metadata_with_scores(
+        self,
+        queries: list[str],
+        *,
+        top_k: int = 5,
+        progress_bar: bool = True,
+        batch_size: int = 124,
+        **kwargs: Any,
+    ) -> list[list[tuple[dict[str, Any], float]]]:
+        """Retrieve document metadata and BM25 scores without materializing text.
+
+        This is suitable for analyses that need ranked document identifiers and
+        scores but do not need ``Document.page_content``. Avoiding ``Document``
+        creation substantially reduces memory and CPU use for large top-k runs.
+
+        Args:
+            queries: Query strings to retrieve for.
+            top_k: Maximum number of ranked documents returned per query.
+            progress_bar: Whether to render retrieval progress.
+            batch_size: Number of queries sent to bm25s at once.
+            **kwargs: Ignored compatibility arguments.
+
+        Returns:
+            One ranked list of ``(metadata, score)`` pairs per query.
+        """
+        import bm25s
+
+        retriever = self._require_retriever()
+        k = min(top_k, self.get_doc_count())
+        output: list[list[tuple[dict[str, Any], float]]] = []
+
+        for i in tqdm(
+            range(0, len(queries), batch_size),
+            desc="Retrieving metadata (bm25s)",
+            disable=not progress_bar,
+        ):
+            batch = queries[i : i + batch_size]
+            query_tokens = bm25s.tokenize(batch, stopwords="en", stemmer=_stemmer)
+            results, scores = retriever.retrieve(query_tokens, k=k, show_progress=progress_bar)
+            for result_row, score_row in zip(results, scores):
+                output.append([
+                    (
+                        {key: value for key, value in entry.items() if key != "text"}
+                        if isinstance(entry, dict)
+                        else {},
+                        float(score),
+                    )
+                    for entry, score in zip(result_row[:top_k], score_row[:top_k])
+                ])
         return output
 
     # ── Inspection ────────────────────────────────────────────────────────────

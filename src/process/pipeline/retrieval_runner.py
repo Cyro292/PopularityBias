@@ -155,7 +155,7 @@ class RetrievalBackend:
 
     key:            str
     label:          str
-    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot", "router", "hybrid_faiss", "neural_router"]
+    type:           Literal["elasticsearch", "faiss", "bm25", "zero_shot", "router", "hybrid_faiss", "neural_router", "fusion"]
     index_path:     Path | None = None
     es_index:       str | None  = None
     es_strategy:    str         = "approximation"
@@ -587,6 +587,43 @@ class RetrievalConfig:
                 "strict": False,
                 "rrf_k": 60,
                 "rrf_depth": 60,
+            },
+        ),
+        # ── Learnable Fusion Weight Predictor ───────────────────────────────
+        RetrievalBackend(
+            key             = "fusion_v1",
+            label           = "Fusion v1 (with popularity)",
+            type            = "fusion",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/fusion_v1.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "fusion_v1_60k",
+            label           = "Fusion v1 60k (no popularity)",
+            type            = "fusion",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/fusion_v1_60k.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "rrf_k": 60,
+                "rrf_depth": 60,
+            },
+        ),
+        RetrievalBackend(
+            key             = "fusion_v4",
+            label           = "Fusion v4 (Approach A, no popularity)",
+            type            = "fusion",
+            router_sub_keys = ("bm25_plus", "ivfpq_high"),
+            service_kwargs  = {
+                "model_path": "models/fusion_v4.pt",
+                "backend_order": ["bm25_plus", "ivfpq_high"],
+                "rrf_k": 60,
+                "rrf_depth": 10,
             },
         ),
     ])
@@ -1030,6 +1067,62 @@ class RetrievalRunner:
                 **kwargs,  # Remaining: strict, rrf_k, rrf_depth, predict_batch_size, device
             )
 
+        if backend.type == "fusion":
+            if not backend.router_sub_keys or len(backend.router_sub_keys) < 2:
+                raise ValueError(
+                    f"[{backend.key}] router_sub_keys must have 2+ entries for fusion"
+                )
+
+            kwargs = dict(backend.service_kwargs)
+            model_path = kwargs.pop("model_path", None)
+            backend_order = kwargs.pop("backend_order", None)
+
+            if model_path is None:
+                raise ValueError(
+                    f"[{backend.key}] service_kwargs must include 'model_path' for fusion"
+                )
+            if backend_order is None:
+                raise ValueError(
+                    f"[{backend.key}] service_kwargs must include 'backend_order' for fusion"
+                )
+
+            precomputed = self._precomputed_cache.get(backend.key)
+            if precomputed is not None:
+                logger.info("⚡ [%s] Using pre-computed sub-backend results", backend.key)
+                from src.rag.fusion_rag_service import FusionRagService
+                service = FusionRagService(
+                    backends={},
+                    backend_order=backend_order,
+                    model_path=model_path,
+                    **kwargs,
+                )
+                service.set_precomputed_results(precomputed)
+                return service
+
+            if loaded_services is None:
+                raise ValueError(
+                    f"[{backend.key}] loaded_services dict is required for type='fusion'"
+                )
+
+            backends_dict = {}
+            for sub_key in backend.router_sub_keys:
+                svc = loaded_services.get(sub_key)
+                if svc is None:
+                    raise ValueError(
+                        f"[{backend.key}] fusion sub-backend '{sub_key}' not found. "
+                        "Make sure it appears before fusion in RetrievalConfig.backends."
+                    )
+                backends_dict[sub_key] = svc
+
+            from src.rag.fusion_rag_service import FusionRagService
+
+            return FusionRagService(
+                backends=backends_dict,
+                backend_order=backend_order,
+                model_path=model_path,
+                **kwargs,
+            )
+
         raise ValueError(f"Unknown backend type: {backend.type!r}")
 
     # ── Per-backend retrieval ─────────────────────────────────────────────────
@@ -1082,7 +1175,7 @@ class RetrievalRunner:
             )
             return [[] for _ in questions], [0.0] * len(questions)
 
-        if backend.type in ("router", "neural_router"):
+        if backend.type in ("router", "neural_router", "fusion"):
             if not popularities or len(popularities) != len(questions):
                 raise ValueError(
                     f"[{backend.key}] popularities must be provided for router backends "
@@ -1114,7 +1207,17 @@ class RetrievalRunner:
                 _ids,
             )
 
-        return [[doc for doc, _ in docs] for docs in scored], latencies_ms
+        # Preserve retrieval scores in checkpoints so post-hoc analyses can
+        # measure margins and near-ties rather than infer competition indirectly.
+        docs_with_scores: list[list[Document]] = []
+        for scored_docs in scored:
+            query_docs: list[Document] = []
+            for doc, score in scored_docs:
+                doc.metadata["score"] = float(score)
+                query_docs.append(doc)
+            docs_with_scores.append(query_docs)
+
+        return docs_with_scores, latencies_ms
 
     # ── Pre-computed sub-backend reuse helpers ─────────────────────────────────
 
@@ -1137,6 +1240,9 @@ class RetrievalRunner:
                 rrf_depth = backend.service_kwargs.get("rrf_depth", 60)
                 return max(rrf_depth, top_k)
         elif backend.type == "hybrid_faiss":
+            rrf_depth = backend.service_kwargs.get("rrf_depth", 60)
+            return max(rrf_depth, top_k)
+        elif backend.type == "fusion":
             rrf_depth = backend.service_kwargs.get("rrf_depth", 60)
             return max(rrf_depth, top_k)
         # router (popularity) and strict neural_router only need top_k
@@ -1401,7 +1507,7 @@ class RetrievalRunner:
         backend_by_key = {b.key: b for b in self.cfg.backends}
         composite_backends_to_run = [
             b for b in self.cfg.backends
-            if b.type in ("router", "hybrid_faiss", "neural_router")
+            if b.type in ("router", "hybrid_faiss", "neural_router", "fusion")
             and (not self.cfg.only_keys or b.key in self.cfg.only_keys)
         ]
 

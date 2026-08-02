@@ -1168,6 +1168,56 @@ class FaissRagService(RagService):
             )
         ]
 
+    def batch_retrieve_metadata_with_scores(
+        self,
+        queries: list[str],
+        *,
+        top_k: int = 5,
+        progress_bar: bool = True,
+        **kwargs: Any,
+    ) -> list[list[tuple[dict[str, Any], float]]]:
+        """Retrieve scored metadata without materializing chunk text.
+
+        Query embeddings and FAISS searches are batched, making this method
+        appropriate for analyses of large scored neighborhoods.
+
+        Args:
+            queries: Query strings to retrieve for.
+            top_k: Maximum number of ranked documents returned per query.
+            progress_bar: Whether to show embedding/retrieval progress.
+            **kwargs: Ignored compatibility arguments.
+
+        Returns:
+            One ranked list of ``(metadata, score)`` pairs per query.
+        """
+        if not queries:
+            return []
+        store = self._require_store()
+        prepared_queries = [self._prepare_query(query) for query in queries]
+        embeddings = store.embedding_function.embed_documents(prepared_queries)
+        vectors = np.asarray(embeddings, dtype=np.float32)
+        if store._normalize_L2:
+            faiss.normalize_L2(vectors)
+        fetch_k = top_k * 2 + 256
+        scores, indices = store.index.search(vectors, fetch_k)
+        output: list[list[tuple[dict[str, Any], float]]] = []
+        for score_row, index_row in zip(scores, indices):
+            ranked: list[tuple[dict[str, Any], float]] = []
+            for score, index in zip(score_row, index_row):
+                if index == -1:
+                    continue
+                uid = store.index_to_docstore_id.get(int(index))
+                if uid is None:
+                    continue
+                document = store.docstore.search(uid)
+                if not isinstance(document, Document):
+                    continue
+                ranked.append((document.metadata, float(score)))
+                if len(ranked) >= top_k:
+                    break
+            output.append(ranked)
+        return output
+
     # ── Inspection ────────────────────────────────────────────────────────
 
     def get_doc_count(self) -> int:
