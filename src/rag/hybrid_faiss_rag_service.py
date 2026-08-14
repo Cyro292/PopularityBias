@@ -20,7 +20,7 @@ Example::
     faiss_svc.load_index("data/wiki_full_bil/faiss_high/faiss")
 
     bm25_svc = BM25RagService()
-    bm25_svc.load_index("data/wiki_full_bil/bm25_bm25plus")
+    bm25_svc.load_index("data/wiki_full_bil/bm25_bm25plus_recursive")
 
     hybrid = HybridFaissRagService(dense_service=faiss_svc, sparse_service=bm25_svc)
     docs = hybrid.retrieve_documents("Who wrote Hamlet?", top_k=10)

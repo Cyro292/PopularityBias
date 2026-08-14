@@ -149,7 +149,11 @@ def main() -> None:
         type=Path,
         default=DATA_DIR / "wiki_full_bil" / "all_qa_60k_balanced" / "cyro_qa_cache.parquet",
     )
-    parser.add_argument("--bm25-index-path", type=Path, default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus")
+    parser.add_argument(
+        "--bm25-index-path",
+        type=Path,
+        default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus_recursive",
+    )
     parser.add_argument("--faiss-index-path", type=Path, default=DATA_DIR / "wiki_full_bil" / "faiss_high")
     parser.add_argument("--metadata-path", type=Path, default=DATA_DIR / "wiki_full_bil" / "metadata.json")
     parser.add_argument("--sample-per-decile", type=int, default=250)

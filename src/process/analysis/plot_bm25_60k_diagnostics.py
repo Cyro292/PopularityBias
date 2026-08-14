@@ -323,12 +323,12 @@ def main() -> None:
     parser.add_argument(
         "--index-path",
         type=Path,
-        default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus",
+        default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus_recursive",
     )
     parser.add_argument(
         "--corpus-path",
         type=Path,
-        default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus" / "corpus.jsonl",
+        default=DATA_DIR / "wiki_full_bil" / "bm25_bm25plus_recursive" / "corpus.jsonl",
     )
     parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "paper_figures")
     parser.add_argument(

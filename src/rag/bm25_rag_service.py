@@ -476,15 +476,6 @@ def _build_streaming_index(
                 pass
 
 
-# ── Fast chunker (no LangChain overhead) ──────────────────────────────────────
-
-def _chunk(text: str, chunk_size: int, overlap: int) -> list[str]:
-    if not text:
-        return [""]
-    step = max(1, chunk_size - overlap)
-    return [text[i : i + chunk_size] for i in range(0, len(text), step)]
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # BM25RagService
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -512,6 +503,11 @@ class BM25RagService(RagService):
         b: float = 0.75,
         method: str = "lucene",
     ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be non-negative and smaller than chunk_size")
+
         self.chunk = chunk
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -520,6 +516,16 @@ class BM25RagService(RagService):
         self.method = method
         self._retriever: Any = None
         self._index_dir: Path | None = None
+
+        if chunk:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+            self._text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+        else:
+            self._text_splitter = None
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -633,8 +639,8 @@ class BM25RagService(RagService):
                 for i, text in enumerate(texts_raw):
                     meta = {f: meta_cols[f][i] for f in meta_cols}
                     chunks = (
-                        _chunk(text, self.chunk_size, self.chunk_overlap)
-                        if self.chunk
+                        self._text_splitter.split_text(text)
+                        if self._text_splitter is not None
                         else [text]
                     )
                     for c in chunks:

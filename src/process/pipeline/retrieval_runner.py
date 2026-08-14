@@ -323,7 +323,7 @@ class RetrievalConfig:
             key        = "bm25_plus",
             label      = "Sparse Retrieval (BM25 plus)",
             type       = "bm25",
-            index_path = DATA_DIR / "wiki_full_bil" / "bm25_bm25plus",
+            index_path = DATA_DIR / "wiki_full_bil" / "bm25_bm25plus_recursive",
         ),
         RetrievalBackend(
             key        = "bm25_plus_nolen",

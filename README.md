@@ -46,62 +46,130 @@ cp .env.example .env
 Fill only the credentials needed by the backend you use. Local BM25 and FAISS
 analysis does not require Elasticsearch credentials.
 
-## Core Workflows
+## Reproduce the Retrieval Study
 
-Build local retrieval indices:
+Run all commands from the repository root. The main study expects this artifact
+layout:
+
+```text
+data/wiki_full_bil/
+├── wiki_corpus.parquet
+├── metadata.json
+├── bm25_bm25plus_recursive/
+├── faiss_high/
+└── all_qa_60k_balanced/
+    └── cyro_qa_cache.parquet
+```
+
+`wiki_corpus.parquet` must contain `text`, `wikipedia_id`,
+`wikipedia_title`, and `popularity_avg`. The checked 60k cohort should be
+treated as an immutable input: rebuilding a balanced cohort can select a
+different set of questions when source datasets or cache state change.
+
+### 1. Build BM25+
+
+BM25 and FAISS now use the same LangChain `RecursiveCharacterTextSplitter`
+configuration. The current paper configuration is 1,000 characters with 100
+characters of overlap:
 
 ```bash
-python -m src.process.indexing.run_bm25 \
-  --parquet data/wiki_full_bil/wiki_corpus.parquet \
-  --output-dir data/wiki_full_bil/bm25_bm25plus \
-  --method bm25+
+venv/bin/python -m src.process.indexing.run_bm25 \
+  --collection wiki_full_bil \
+  --output-dir data/wiki_full_bil/bm25_bm25plus_recursive \
+  --method bm25+ \
+  --chunk-size 1000 \
+  --chunk-overlap 100
+```
 
-python -m src.process.indexing.run_faiss \
+The full corpus build is expensive. It writes `corpus.jsonl`, an mmap index,
+and index parameters under `bm25_bm25plus_recursive/`. A completed build can
+be loaded without rebuilding.
+
+### 2. Build FAISS
+
+To create a fresh local IVF-PQ index with matching chunk boundaries:
+
+```bash
+venv/bin/python -m src.process.indexing.run_faiss \
+  --collection wiki_full_bil \
   --parquet data/wiki_full_bil/wiki_corpus.parquet \
   --output-dir data/wiki_full_bil/faiss_high \
   --strategy ivfpq \
-  --distance cosine
+  --distance cosine \
+  --chunk-size 1000 \
+  --chunk-overlap 100
 ```
 
-Prepare a balanced QA cohort:
+The existing `faiss_high` study artifact was migrated from Elasticsearch and
+contains IVF training-vector mappings in addition to document mappings.
+Consequently, FAISS `index.ntotal` is not directly comparable to the unique
+document count in `docstore.sqlite`. Use the document store when auditing
+corpus chunk counts. Migration and resume details are in
+[`docs/pipeline.md`](docs/pipeline.md).
+
+### 3. Generate Retrieval Checkpoints
+
+Use the local QA file to preserve the exact cohort. Always specify
+`--only-keys`; otherwise the runner attempts every configured experimental
+backend.
 
 ```bash
-python -m src.process.qa_datasets.prepare_qa \
-  --qa-datasets natural_questions hotpot_qa trivia_qa pop_qa fever trex \
-  --corpus data/wiki_full_bil/wiki_corpus.parquet \
-  --output data/wiki_full_bil/all_qa_8k.parquet \
-  --balance \
-  --target-per-decile 800
-```
-
-Run retrieval, generation, and evaluation:
-
-```bash
-python -m src.process.pipeline.full_pipeline \
+venv/bin/python -m src.process.pipeline.retrieval_runner \
   --collection wiki_full_bil \
-  --output-dir all_qa_8k \
-  --only-keys bm25_plus ivfpq_high faiss_hybrid \
-  --models neo qwen \
-  --context-sizes 3 \
+  --output-dir all_qa_60k_balanced \
+  --qa-file data/wiki_full_bil/all_qa_60k_balanced/cyro_qa_cache.parquet \
+  --only-keys bm25_plus ivfpq_high \
   --top-k 10
 ```
 
-Build the flat analysis dataset consumed by router training and notebooks:
+Outputs:
 
-```bash
-python -m src.process.analysis.build_analysis_dataset \
-  --results-dir data/wiki_full_bil/all_qa_8k \
-  --qa-parquet data/wiki_full_bil/all_qa_8k/cyro_qa_cache.parquet \
-  --output data/wiki_full_bil/all_qa_8k/analysis_dataset.parquet
+```text
+data/wiki_full_bil/all_qa_60k_balanced/
+├── retrieved_docs_bm25_plus.csv
+├── retrieved_docs_ivfpq_high.csv
+├── latency_retrieval_bm25_plus.json
+└── latency_retrieval_ivfpq_high.json
 ```
 
-See [`docs/pipeline.md`](docs/pipeline.md) for stage-specific commands,
-checkpoint behavior, indexing, and router training.
+Existing checkpoints resume by missing question ID. To overwrite one backend
+after rebuilding its index, add `--restart-keys bm25_plus` or
+`--restart-keys ivfpq_high`.
 
-## Generate Figures
+### 4. Evaluate Answer Containment
 
-The commands below use the current 60k balanced cohort and write directly to
-`paper_figures/`. Run them from the repository root.
+Gold-answer substring metrics are computed separately from gold-document ID
+metrics:
+
+```bash
+venv/bin/python -m src.process.pipeline.retrieval_answer_eval_runner \
+  --collection wiki_full_bil \
+  --output-dir all_qa_60k_balanced \
+  --qa-path data/wiki_full_bil/all_qa_60k_balanced/cyro_qa_cache.parquet \
+  --only-keys bm25_plus ivfpq_high \
+  --k-values 1 3 5 10 \
+  --restart
+```
+
+This writes `retrieval_answer_eval_<backend>.parquet` and
+`retrieval_answer_eval_summary.csv`. Substring recall means that any answer
+alias occurs literally in a retrieved chunk; it does not require the chunk to
+come from the annotated article and is sensitive to common answer strings.
+
+### 5. Build the Analysis Dataset
+
+```bash
+venv/bin/python -m src.process.analysis.build_analysis_dataset \
+  --results-dir data/wiki_full_bil/all_qa_60k_balanced \
+  --qa-parquet data/wiki_full_bil/all_qa_60k_balanced/cyro_qa_cache.parquet \
+  --output data/wiki_full_bil/all_qa_60k_balanced/analysis_dataset.parquet
+```
+
+## Generate Paper Figures
+
+The following commands use the 60k cohort. Most write to `paper_figures/`; the
+gold-document versus substring comparison writes to the cohort's
+`answer_eval_results/` directory.
 
 Retrieval Recall@10 overview:
 
@@ -113,6 +181,38 @@ python -m src.process.analysis.plot_dataset_recall_by_decile \
   --cohort-label "60k Balanced Question Pool" \
   --exclude-datasets hotpot_qa \
   --output-path paper_figures/recall10_pop.png
+```
+
+Gold-document versus answer-substring Recall@5 and Recall@10:
+
+```bash
+venv/bin/python -m src.process.analysis.compare_gold_and_substring_recall
+```
+
+Outputs:
+
+```text
+data/wiki_full_bil/all_qa_60k_balanced/answer_eval_results/
+├── gold_document_vs_substring_disagreement_by_decile.csv
+├── gold_document_vs_substring_disagreement_by_decile.png
+├── gold_document_vs_substring_recall_by_decile.csv
+└── gold_document_vs_substring_recall_by_decile.png
+```
+
+The matching reproducible notebook is
+[`notebooks/retrieval_answer_eval/06_gold_document_vs_substring_recall.ipynb`](notebooks/retrieval_answer_eval/06_gold_document_vs_substring_recall.ipynb).
+
+Answer-containment Recall or MRR by dataset and decile:
+
+```bash
+venv/bin/python -m src.process.analysis.plot_answer_retrieval_by_decile \
+  --results-dir data/wiki_full_bil/all_qa_60k_balanced \
+  --output-dir paper_figures \
+  --backends bm25_plus ivfpq_high \
+  --metric recall --k 10 \
+  --decile-col pop_decile_unweighted \
+  --exclude-datasets fever hotpot_qa trex trivia_qa \
+  --cohort-label "60k Balanced Question Pool"
 ```
 
 BM25+ and FAISS-high MRR, plus the FAISS-minus-BM25 delta:
@@ -160,8 +260,18 @@ after both corpora have matching BM25 and FAISS indices with:
 python -m src.process.analysis.build_analogue_similarity_scores
 ```
 
-Figure provenance, required inputs, and output filenames are documented in
-[`paper_figures/README.md`](paper_figures/README.md).
+Some diagnostics have expensive producer stages. In particular,
+`analyse_retrieval_neighborhood_density` performs live top-100 retrieval, and
+`build_analogue_similarity_scores` requires matching indices for both corpus
+versions. Existing parquet checkpoints are reused where supported.
+
+## Optional Generation
+
+Generation is not required for retrieval recall, MRR, gold-document recall, or
+answer-substring recall. It requires the configured Modal/API model services.
+See [`docs/pipeline.md`](docs/pipeline.md) before running
+`src.process.pipeline.full_pipeline`; the orchestrator loads the cached cohort
+from the selected output directory and does not accept `--qa-file`.
 
 ## Tests
 
