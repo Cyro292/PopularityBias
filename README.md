@@ -284,6 +284,9 @@ Integration tests require the corresponding external services and credentials.
 
 ## Additional Documentation
 
+- [`docs/indexing.md`](docs/indexing.md): canonical BM25 and FAISS index commands
+- [`docs/evaluation.md`](docs/evaluation.md): immutable cohort, retrieval, and relevance metrics
+- [`docs/figures.md`](docs/figures.md): complete thesis figure manifest and synchronization
 - [`docs/pipeline.md`](docs/pipeline.md): complete pipeline and indexing guide
 - [`docs/router_training.md`](docs/router_training.md): recorded router experiments
 - [`docs/popularity_enriched_qa.md`](docs/popularity_enriched_qa.md): legacy enriched QA dataset notes
